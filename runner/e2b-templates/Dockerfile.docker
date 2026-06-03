@@ -1,0 +1,50 @@
+# mcpolis E2B template — docker (docker-run-distributed MCPs).
+#
+# Shared across every mcpolis-docker-cpu*-ram* template. CPU and RAM
+# are enforced at template build time via the e2b.toml `[resources]`
+# block — this Dockerfile is identical for all 8 docker templates.
+#
+# The image carries the full Docker engine (dockerd + CLI + containerd)
+# so an MCP distributed as a container can be launched with
+# `docker run -i --rm <image>`. Unlike the node / python templates,
+# this one needs a running daemon BEFORE the MCP command executes, so
+# `build_grid.py` attaches a `set_start_cmd` that launches `dockerd` at
+# sandbox boot and a `wait_for_port` ready probe — the sandbox isn't
+# reported ready until the daemon answers. Don't add an ENTRYPOINT/CMD
+# here; boot is driven entirely by the template's start command.
+#
+# Base + install follow E2B's published Docker template recipe
+# (https://e2b.dev/docs/template/examples/docker): Ubuntu 24.04 + the
+# official get.docker.com convenience script, which pulls in the engine,
+# CLI, containerd, and the compose plugin.
+#
+# Sizing note: E2B's documented floor for Docker is 2 vCPU / 2 GB and
+# dockerd alone costs ~150-250 MB. The two 1-vCPU docker templates exist
+# only to keep the grid a clean cross-product; the dashboard warns when
+# docker is paired with a 1-vCPU size, and real images will likely OOM
+# there.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ca-certificates + curl to fetch the install script; the script itself
+# installs docker-ce, the CLI, containerd, and the compose plugin. RUN
+# executes as root during build, so the script's internal sudo is a
+# no-op (sudo isn't present in the base image — install it too so the
+# runtime start command can `sudo dockerd`).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates curl sudo \
+ && curl -fsSL https://get.docker.com | sh \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+# Image layers / containers pulled by `docker run` land in
+# /var/lib/docker on the sandbox's default writable filesystem. Large
+# MCP images cold-pull at create time and consume sandbox disk — there's
+# no build-time pre-warm because dockerd isn't running during the build.
+
+# E2B sets WORKDIR / USER itself when it spawns the sandbox; don't
+# override. dockerd is launched at boot via the template's start command
+# (see build_grid.py: DOCKER_START_CMD), not via an ENTRYPOINT.

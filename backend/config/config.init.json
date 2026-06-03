@@ -1,0 +1,22 @@
+{
+  "upstreams": {},
+  "roles": {
+    "admin": {
+      "is_admin": true,
+      "settings": {
+        "mcp_access": {
+          "auto_enable_new": true
+        }
+      }
+    },
+    "user": {
+      "is_default": true,
+      "settings": {
+        "mcp_access": {
+          "auto_enable_new": true
+        }
+      }
+    }
+  },
+  "users": {}
+}

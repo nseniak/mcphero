@@ -1,0 +1,211 @@
+# MCP Hero — Docker Compose
+#
+# Profiles:
+#
+#   --profile dev          Mongo + Redis only (for native backend dev)
+#   --profile standalone   Single backend container, file-backed storage
+#   --profile cloud        nginx + backend(s) + Mongo + Redis, SaaS mode
+#   --profile test         Isolated Mongo (27018) + Redis (6380) for the
+#                          E2E orchestrator. Runs alongside the dev
+#                          stack without touching its data — tests can
+#                          drop databases freely without disturbing
+#                          local dev work.
+#
+# Usage:
+#
+#   docker compose --profile dev up -d
+#   docker compose --profile standalone up --build
+#   docker compose --profile cloud up --build
+#   docker compose --profile cloud up --build --scale backend=2
+
+# Project name — fixes the default image / container prefixes to
+# ``mcpolis-`` regardless of the directory the repo is cloned into.
+# Without this, Compose falls back to the directory name for the
+# ``backend`` and ``nginx`` services (which have no explicit
+# container_name), so a clone into ``mcp-hero/`` ends up building
+# ``mcp-hero-backend`` images.
+name: mcpolis
+
+services:
+
+  # ---- Infrastructure (dev + cloud) ----
+
+  mongo:
+    image: mongo:7
+    profiles: [dev, cloud]
+    container_name: mcpolis-mongo
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mcpolis-mongo:/data/db
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    profiles: [dev, cloud]
+    container_name: mcpolis-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    restart: unless-stopped
+
+  # ---- Test isolation infra (E2E orchestrator) ----
+  #
+  # Lives on non-default ports so a developer running ``start.sh`` on
+  # 27017/6379 can keep working while tests run. No persistent volume
+  # — every test run starts on a clean slate (the orchestrator drops
+  # per-shard databases anyway, and tmpfs storage shaves seconds off
+  # container startup).
+
+  mongo-test:
+    image: mongo:7
+    profiles: [test]
+    container_name: mcpolis-mongo-test
+    ports:
+      - "127.0.0.1:27018:27017"
+    tmpfs:
+      - /data/db
+    command: ["mongod", "--bind_ip_all", "--noauth"]
+    restart: "no"
+
+  redis-test:
+    image: redis:7-alpine
+    profiles: [test]
+    container_name: mcpolis-redis-test
+    ports:
+      - "127.0.0.1:6380:6379"
+    restart: "no"
+
+  # ---- Standalone: single backend, serves frontend, file storage ----
+
+  standalone:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        VITE_SENTRY_DSN: ${MCPOLIS_FRONTEND_SENTRY_DSN:-}
+        VITE_SENTRY_TRACES_SAMPLE_RATE: ${MCPOLIS_FRONTEND_SENTRY_TRACES_SAMPLE_RATE:-0.1}
+        VITE_MIXPANEL_TOKEN: ${MCPOLIS_FRONTEND_MIXPANEL_TOKEN:-}
+        VITE_MIXPANEL_API_HOST: ${MCPOLIS_FRONTEND_MIXPANEL_API_HOST:-}
+        VITE_RELEASE: ${MCPOLIS_RELEASE:-}
+        VITE_SITE_URL: ${MCPOLIS_FRONTEND_SITE_URL:-}
+        VITE_GATEWAY_URL: ${MCPOLIS_FRONTEND_GATEWAY_URL:-}
+        VITE_CONTACT_EMAIL: ${MCPOLIS_FRONTEND_CONTACT_EMAIL:-}
+        VITE_PRIVACY_EMAIL: ${MCPOLIS_FRONTEND_PRIVACY_EMAIL:-}
+        VITE_SECURITY_EMAIL: ${MCPOLIS_FRONTEND_SECURITY_EMAIL:-}
+        VITE_SUPPORT_EMAIL: ${MCPOLIS_FRONTEND_SUPPORT_EMAIL:-}
+    profiles: [standalone]
+    ports:
+      - "8080:8080"
+    volumes:
+      - mcpolis-config:/app/config
+      - mcpolis-data:/app/data
+    restart: unless-stopped
+
+  # ---- Cloud: backend behind nginx, Mongo + Redis ----
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    profiles: [cloud]
+    # Stable name so the vector sidecar's `include_containers`
+    # filter matches reliably across redeploys (and matches replicas
+    # like ``mcpolis-backend-1`` by prefix).
+    container_name: mcpolis-backend
+    expose:
+      - "8080"
+    env_file:
+      - .env.cloud.docker.prod
+    environment:
+      MCPOLIS_MODE: cloud
+      MCPOLIS_MONGO_URI: mongodb://mongo:27017
+      MCPOLIS_REDIS_URL: redis://redis:6379
+    depends_on:
+      mongo:
+        condition: service_started
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    # Cap the default json-file driver so a runaway log loop can't
+    # fill the host disk before the vector sidecar can throttle it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.nginx
+      args:
+        VITE_SENTRY_DSN: ${MCPOLIS_FRONTEND_SENTRY_DSN:-}
+        VITE_SENTRY_TRACES_SAMPLE_RATE: ${MCPOLIS_FRONTEND_SENTRY_TRACES_SAMPLE_RATE:-0.1}
+        VITE_MIXPANEL_TOKEN: ${MCPOLIS_FRONTEND_MIXPANEL_TOKEN:-}
+        VITE_MIXPANEL_API_HOST: ${MCPOLIS_FRONTEND_MIXPANEL_API_HOST:-}
+        VITE_RELEASE: ${MCPOLIS_RELEASE:-}
+        VITE_SITE_URL: ${MCPOLIS_FRONTEND_SITE_URL:-}
+        VITE_GATEWAY_URL: ${MCPOLIS_FRONTEND_GATEWAY_URL:-}
+        VITE_CONTACT_EMAIL: ${MCPOLIS_FRONTEND_CONTACT_EMAIL:-}
+        VITE_PRIVACY_EMAIL: ${MCPOLIS_FRONTEND_PRIVACY_EMAIL:-}
+        VITE_SECURITY_EMAIL: ${MCPOLIS_FRONTEND_SECURITY_EMAIL:-}
+        VITE_SUPPORT_EMAIL: ${MCPOLIS_FRONTEND_SUPPORT_EMAIL:-}
+    profiles: [cloud]
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- Cloud: log-forwarding sidecar (Vector → Elastic Cloud) ----
+  #
+  # Tails the backend container's stdout via the Docker API, parses
+  # the structlog JSON, drops noisy events, throttles a runaway-cost
+  # worst case, and ships to an Elastic Cloud Serverless data stream
+  # (logs-mcpolis-prod). See compose/vector/vector.toml for the
+  # pipeline and CLAUDE.md for the API-key minting runbook.
+  #
+  # No-op when MCPOLIS_ELASTIC_API_KEY / MCPOLIS_ELASTIC_ENDPOINT are
+  # unset — Vector exits early on env-var template failures, which
+  # surfaces as a single error in `docker compose logs vector` and
+  # leaves the rest of the stack alone.
+
+  vector:
+    image: timberio/vector:0.55.0-debian
+    profiles: [cloud]
+    container_name: mcpolis-vector
+    env_file:
+      - .env.cloud.docker.prod
+    # Vector's default config path is /etc/vector/vector.yaml; without
+    # this command it falls back to the built-in demo source (fake
+    # syslog) and ignores our TOML. `--watch-config` makes vector
+    # hot-reload the config when its file changes.
+    #
+    # IMPORTANT: we bind-mount the whole compose/vector/ DIRECTORY,
+    # not the single vector.toml file. Single-file bind mounts pin
+    # to an inode — when git pull rewrites the file (rename-over),
+    # the host gets a new inode but the container keeps reading the
+    # old (orphaned) one. Mounting the directory tracks the path,
+    # so file replacements show up immediately.
+    command: ["--config", "/etc/vector/vector.toml", "--watch-config"]
+    volumes:
+      - ./compose/vector:/etc/vector:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - mcpolis-vector-buffer:/var/lib/vector
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  mcpolis-mongo:
+  mcpolis-config:
+  mcpolis-data:
+  mcpolis-vector-buffer:

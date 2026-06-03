@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "notion": {
+      "url": "https://mcp.notion.com/mcp"
+    },
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/"
+    },
+    "mongo-local": {
+      "command": "npx",
+      "args": ["-y", "@sourabhshegane/mongodb-mcp-that-works@latest"],
+      "env": {
+        "MONGODB_URI": "mongodb://localhost:27017/",
+        "MONGODB_DATABASE": "db"
+      }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+# mcpolis E2B template — node (npx-distributed MCPs).
+#
+# Shared across every mcpolis-node-cpu*-ram* template. CPU and RAM
+# are enforced at template build time via the e2b.toml `[resources]`
+# block — this Dockerfile is identical for all 8 node templates.
+#
+# The image carries Node 22 LTS so npx pulls don't re-install it on
+# every cold start. Caches (~/.npm) live on the E2B sandbox's
+# default writable filesystem; the runner doesn't need to mount
+# anything special.
+#
+# Compared to runner/images/mcp-base-node (the curated image used
+# by the self-hosted Tier-3 sandbox), this E2B variant is the same
+# stack with the rootless-podman quirks dropped — E2B controls user
+# / permissions itself, so we don't have to dance around chown
+# restrictions.
+
+FROM node:22-bookworm-slim
+
+ENV NPM_CONFIG_LOGLEVEL=warn \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_PROGRESS=false
+
+# Pre-warm npx caches for known MCP servers we expect to see most
+# often. Cuts ~15s off first-spawn latency for the popular ones; the
+# rest cold-pull at create time as before.
+RUN npm install -g \
+        @modelcontextprotocol/server-everything \
+        @modelcontextprotocol/server-filesystem \
+        @modelcontextprotocol/server-memory \
+ && npm cache clean --force
+
+# E2B sets the working directory and user when it spawns the sandbox.
+# Don't fight it — leave WORKDIR / USER unset so E2B's defaults
+# apply.

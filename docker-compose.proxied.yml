@@ -1,0 +1,36 @@
+# MCP Hero — overlay for "behind external reverse proxy" deployments
+#
+# Use this when an external proxy (Caddy, nginx, ALB, Traefik, ...) on
+# the same host or a different host fronts mcpolis. The bundled nginx
+# container still serves the React SPA and reverse-proxies API/MCP
+# traffic to the backend(s) — it just doesn't bind host port 80, and
+# joins a shared external Docker network so the external proxy can
+# reach it by container name.
+#
+# Prerequisite (one-time per host):
+#   docker network create web
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.proxied.yml \
+#                  --profile cloud up -d --build
+#
+# The external proxy then targets `mcpolis-nginx-1:80` on the `web`
+# network (or whatever container name compose assigns based on the
+# project name).
+#
+# This overlay is provider-agnostic. Same file works for Caddy on a
+# Lightsail VM, nginx-ingress on K3s, Traefik on Hetzner, an ALB
+# pointing at the host port, etc. The bundled `--profile cloud`
+# (without this overlay) keeps working unchanged for self-contained
+# single-box deploys.
+
+services:
+  nginx:
+    ports: !reset []
+    networks:
+      - default
+      - web
+
+networks:
+  web:
+    external: true

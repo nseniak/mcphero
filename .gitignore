@@ -1,0 +1,65 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.python-version
+.venv/
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Local env/config
+.env
+.env.*
+# ...but always track *.example templates (placeholders only, no secrets)
+!.env*.example
+
+# Local dev-env activation hook (operator-specific; sourced by run-in-env.sh)
+run-in-env.local.sh
+
+# Runtime data
+*.sqlite3
+*.db
+data/
+
+# Runtime config (may contain tokens/secrets) — only commit *.init.* templates and examples
+backend/config/*
+!backend/config/*.init.*
+!backend/config/*.example.*
+
+# Locally-generated mTLS material for the sandbox runner
+runner/dev-certs/out/
+
+# Certificates / private keys (safety net — none are tracked today; this
+# stops an accidental cert/key drop from ever being committed).
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.crt
+*.cer
+
+# Claude Code per-user overrides. Team-shared rules live in
+# `.claude/settings.json` and `.claude/skills/*.md` (both committed).
+.claude/settings.local.json
+
+.playwright-mcp
+
+# JetBrains IDEs
+.idea/
+
+# Local-only Playwright storage state for internal/scripts/prod-smoke.sh
+internal/scripts/.smoke-auth/
+# Symlink the prod-smoke wrapper creates to reach tests/e2e/node_modules
+# (the global node_modules/ rule is dir-only and misses this symlink).
+internal/scripts/node_modules
+
+# Playwright e2e run artifacts (traces, screenshots, error-context.md)
+tests/e2e/test-results/

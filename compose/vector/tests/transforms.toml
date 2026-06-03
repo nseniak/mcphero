@@ -1,0 +1,424 @@
+# Vector unit tests for the mcpolis log-forwarding pipeline.
+#
+# Run with:
+#
+#   vector test compose/vector/vector.toml compose/vector/tests/transforms.toml
+#
+# Vector treats multiple files as a single combined config, so the
+# transforms defined in vector.toml are referenced here by name.
+
+# ---- parse: structlog JSON → flat event with @timestamp ----
+
+[[tests]]
+name = "parse: structlog record renames timestamp to @timestamp"
+
+[[tests.inputs]]
+insert_at = "parse"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "mcpolis-backend"
+container_id = "abc123"
+stream = "stdout"
+message = '{"event":"app.startup","level":"info","timestamp":"2026-05-02T10:00:00Z","org_id":"org-1"}'
+
+[[tests.outputs]]
+extract_from = "parse"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.event, "app.startup", "event passed through unchanged")
+  assert_eq!(.level, "info", "level passed through unchanged")
+  assert_eq!(.org_id, "org-1", "structured fields passed through unchanged")
+  assert_eq!(."@timestamp", "2026-05-02T10:00:00Z", "timestamp renamed to @timestamp")
+  assert!(!exists(.timestamp), "original timestamp field removed")
+  assert_eq!(.service, "mcpolis-backend", "service tag added")
+  assert_eq!(.container_name, "mcpolis-backend", "container_name preserved from docker_logs")
+'''
+
+# ---- parse: malformed inner JSON survives without crashing ----
+
+[[tests]]
+name = "parse: non-JSON message passes through with empty event"
+
+[[tests.inputs]]
+insert_at = "parse"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "mcpolis-backend"
+container_id = "abc123"
+stream = "stdout"
+message = "this is not JSON at all — early boot panic before configure_structlog"
+
+[[tests.outputs]]
+extract_from = "parse"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert!(!exists(.event), "no event for non-JSON line")
+  assert_eq!(.service, "mcpolis-backend", "service tag still applied")
+  assert_eq!(.container_name, "mcpolis-backend", "container_name still preserved")
+'''
+
+# ---- reshape_uvicorn_access: collapse high-cardinality access logs ----
+
+[[tests]]
+name = "reshape_uvicorn_access: 405 response gets bucketed"
+
+[[tests.inputs]]
+insert_at = "reshape_uvicorn_access"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "mcpolis-backend"
+service = "mcpolis-backend"
+logger = "uvicorn.access"
+event = '172.20.0.6:36258 - "POST /api/ HTTP/1.1" 405'
+level = "info"
+
+[[tests.outputs]]
+extract_from = "reshape_uvicorn_access"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.event, "http.access.405", "event collapsed to status bucket")
+  assert_eq!(.http_status, 405, "status extracted as int")
+  assert_eq!(.http_method, "POST", "method extracted")
+  assert_eq!(.http_path, "/api/", "path extracted")
+  assert_eq!(.http_peer, "172.20.0.6:36258", "peer preserved as separate field")
+  assert_eq!(.logger, "uvicorn.access", "logger field unchanged")
+'''
+
+[[tests]]
+name = "parse: caddy container_name is tagged service=caddy"
+
+[[tests.inputs]]
+insert_at = "parse"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+container_id = "def456"
+stream = "stdout"
+message = '{"level":"info","ts":1714900000.0,"logger":"http.log.access","msg":"handled request","status":200}'
+
+[[tests.outputs]]
+extract_from = "parse"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.service, "caddy", "caddy container is tagged as caddy service")
+  assert_eq!(.logger, "http.log.access")
+'''
+
+# ---- reshape_caddy_access: collapse caddy access logs ----
+
+[[tests]]
+name = "reshape_caddy_access: 502 access record gets bucketed"
+
+[[tests.inputs]]
+insert_at = "reshape_caddy_access"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+service = "caddy"
+logger = "http.log.access"
+status = 502
+msg = "handled request"
+level = "info"
+[tests.inputs.log_fields.request]
+method = "POST"
+uri = "/api/orgs"
+host = "mcphero.io"
+remote_ip = "203.0.113.42"
+
+[[tests.outputs]]
+extract_from = "reshape_caddy_access"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.event, "caddy.access.502", "event collapsed to status bucket")
+  assert_eq!(.http_status, 502, "status extracted as int")
+  assert_eq!(.http_method, "POST", "method lifted to top-level")
+  assert_eq!(.http_path, "/api/orgs", "path lifted to top-level")
+  assert_eq!(.http_host, "mcphero.io", "host lifted to top-level")
+  assert_eq!(.http_peer, "203.0.113.42", "remote_ip lifted as peer")
+  assert_eq!(.message, "handled request", "msg moved to message")
+  assert!(!exists(.msg), "msg field consumed")
+'''
+
+[[tests]]
+name = "reshape_caddy_access: backend record passes through unchanged"
+
+[[tests.inputs]]
+insert_at = "reshape_caddy_access"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "mcpolis-backend"
+service = "mcpolis-backend"
+logger = "mcpolis.domain.services.org_runtime"
+event = "org.runtime.initialized"
+level = "info"
+
+[[tests.outputs]]
+extract_from = "reshape_caddy_access"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.event, "org.runtime.initialized", "backend event preserved verbatim")
+  assert!(!exists(.http_status))
+'''
+
+[[tests]]
+name = "reshape_uvicorn_access: non-uvicorn record passes through unchanged"
+
+[[tests.inputs]]
+insert_at = "reshape_uvicorn_access"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "mcpolis-backend"
+service = "mcpolis-backend"
+logger = "mcpolis.domain.services.org_runtime"
+event = "org.runtime.initialized"
+level = "info"
+
+[[tests.outputs]]
+extract_from = "reshape_uvicorn_access"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.event, "org.runtime.initialized", "event preserved verbatim")
+  assert!(!exists(.http_status), "no http_* fields on non-uvicorn records")
+  assert!(!exists(.http_method))
+  assert!(!exists(.http_path))
+'''
+
+# ---- drop_noise: high-frequency events are filtered out ----
+
+[[tests]]
+name = "drop_noise: http.response.start is dropped"
+no_outputs_from = ["drop_noise"]
+
+[[tests.inputs]]
+insert_at = "drop_noise"
+type = "log"
+[tests.inputs.log_fields]
+event = "http.response.start"
+level = "debug"
+service = "mcpolis-backend"
+
+[[tests]]
+name = "drop_noise: upstream.health.probe.periodic.completed is dropped"
+no_outputs_from = ["drop_noise"]
+
+[[tests.inputs]]
+insert_at = "drop_noise"
+type = "log"
+[tests.inputs.log_fields]
+event = "upstream.health.probe.periodic.completed"
+level = "info"
+service = "mcpolis-backend"
+
+[[tests]]
+name = "drop_noise: oauth.token.refresh.skipped.not_needed is dropped"
+no_outputs_from = ["drop_noise"]
+
+[[tests.inputs]]
+insert_at = "drop_noise"
+type = "log"
+[tests.inputs.log_fields]
+event = "oauth.token.refresh.skipped.not_needed"
+level = "info"
+service = "mcpolis-backend"
+
+# ---- drop_noise: actionable variants of "noisy" event families are KEPT ----
+
+[[tests]]
+name = "drop_noise: upstream.health.probe.timeout is kept (only .ok / .periodic.* are noise)"
+
+[[tests.inputs]]
+insert_at = "drop_noise"
+type = "log"
+[tests.inputs.log_fields]
+event = "upstream.health.probe.timeout"
+level = "warning"
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "drop_noise"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.event, "upstream.health.probe.timeout")
+  assert_eq!(.level, "warning")
+'''
+
+[[tests]]
+name = "drop_noise: oauth.token.refresh.failed is kept"
+
+[[tests.inputs]]
+insert_at = "drop_noise"
+type = "log"
+[tests.inputs.log_fields]
+event = "oauth.token.refresh.failed"
+level = "error"
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "drop_noise"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.event, "oauth.token.refresh.failed")
+  assert_eq!(.level, "error")
+'''
+
+[[tests]]
+name = "drop_noise: app.startup is kept"
+
+[[tests.inputs]]
+insert_at = "drop_noise"
+type = "log"
+[tests.inputs.log_fields]
+event = "app.startup"
+level = "info"
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "drop_noise"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.event, "app.startup")
+'''
+
+# ---- redact_secrets: Layer 2 of the F-02 fix ----
+#
+# Catches what Layer 1 (the structlog processor) can't see: uvicorn
+# access lines, third-party stdout that bypasses structlog, and
+# Caddy headers. Top-level secret-shaped keys get masked to
+# `[REDACTED]`; the explicit Caddy header deletes live in
+# `reshape_caddy_access`.
+
+[[tests]]
+name = "redact_secrets: top-level password is masked"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+event = "demo"
+password = "hunter2"
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.password, "[REDACTED]", "password value masked")
+  assert_eq!(.event, "demo", "non-secret fields untouched")
+'''
+
+[[tests]]
+name = "redact_secrets: top-level Authorization is masked"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+event = "demo"
+Authorization = "Bearer xyz"
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.Authorization, "[REDACTED]", "Authorization header value masked")
+  assert_eq!(.event, "demo")
+'''
+
+[[tests]]
+name = "redact_secrets: api_key, token, client_secret, cookie all masked"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+event = "demo"
+api_key = "sk-abc"
+token = "tok-xyz"
+client_secret = "cs-123"
+cookie = "session=abc"
+user = "alice"
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.api_key, "[REDACTED]")
+  assert_eq!(.token, "[REDACTED]")
+  assert_eq!(.client_secret, "[REDACTED]")
+  assert_eq!(.cookie, "[REDACTED]")
+  assert_eq!(.user, "alice", "non-secret value untouched")
+'''
+
+[[tests]]
+name = "redact_secrets: non-secret records pass through unchanged"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+event = "app.startup"
+level = "info"
+org_id = "org-1"
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.event, "app.startup")
+  assert_eq!(.org_id, "org-1")
+'''
+
+# ---- reshape_caddy_access: Cookie/Authorization/Set-Cookie are deleted ----
+
+[[tests]]
+name = "reshape_caddy_access: request.headers.Cookie is deleted"
+
+[[tests.inputs]]
+insert_at = "reshape_caddy_access"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+service = "caddy"
+logger = "http.log.access"
+status = 200
+msg = "handled request"
+level = "info"
+[tests.inputs.log_fields.request]
+method = "GET"
+uri = "/dashboard"
+host = "mcphero.io"
+remote_ip = "203.0.113.42"
+[tests.inputs.log_fields.request.headers]
+Cookie = ["session=abc123"]
+Authorization = ["Bearer xyz"]
+"Set-Cookie" = ["s=1; HttpOnly"]
+"User-Agent" = ["curl/8"]
+
+[[tests.outputs]]
+extract_from = "reshape_caddy_access"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert!(!exists(.request.headers.Cookie), "Cookie header deleted")
+  assert!(!exists(.request.headers.Authorization), "Authorization header deleted")
+  assert!(!exists(.request.headers."Set-Cookie"), "Set-Cookie header deleted")
+  assert_eq!(.user_agent, "curl/8", "User-Agent still lifted to top-level")
+  assert_eq!(.event, "caddy.access.200")
+'''

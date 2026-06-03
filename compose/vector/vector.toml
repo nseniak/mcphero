@@ -1,0 +1,291 @@
+# Vector — log-forwarding sidecar for the mcpolis backend.
+#
+# Tails the backend container's stdout via the Docker API, parses
+# the inner structlog JSON, drops known-noisy events, throttles a
+# worst-case cost burn, and bulk-indexes into an Elastic Cloud
+# Serverless data stream (logs-mcpolis-prod).
+#
+# Operator setup:
+#
+#   1. Sign up for Elastic Cloud, create a Serverless Observability
+#      project (EU region recommended).
+#   2. In Kibana → Stack Management → API Keys, mint an API key with:
+#         cluster:  manage_own_api_key, monitor
+#         indices:  ["logs-mcpolis-*"]  privs ["create_doc", "auto_configure"]
+#      Copy the *encoded* key (the base64 id:api_key string).
+#   3. Set MCPOLIS_ELASTIC_ENDPOINT and MCPOLIS_ELASTIC_API_KEY in
+#      .env.cloud.docker.prod.
+#   4. Configure a billing budget alert in the Elastic Cloud Console
+#      at ~3x expected monthly spend as a runaway-cost guard.
+
+# ---- Source: tap docker logs via the Docker API ----
+#
+# `include_containers` matches by container name prefix, so this
+# captures `mcpolis-backend` as well as `mcpolis-backend-1` /
+# `mcpolis-backend-2` when the cloud profile is scaled. We also
+# include `caddy` so the host's reverse proxy lands in the same
+# index — without it, a 5xx between Caddy and uvicorn (e.g. backend
+# OOM, slow request, container restart) is invisible to Discover and
+# only surfaces by reading docker logs by hand on the host. Caddy
+# lives in a sibling repo (~/Projects/cooking) but runs on the same
+# Docker daemon; it just needs to keep `caddy` as the container-name
+# prefix for this filter to match. If the prefix changes, update it
+# here.
+#
+# Why not the file source: json-file paths are
+# /var/lib/docker/containers/<id>/<id>-json.log — the directory is
+# the container *ID*, not the name, so a path-glob filter can't
+# isolate the backend container.
+#
+# Required compose mount: /var/run/docker.sock:/var/run/docker.sock:ro
+
+[sources.backend_logs]
+type = "docker_logs"
+include_containers = ["mcpolis-backend", "caddy"]
+auto_partial_merge = true
+
+# ---- Transform: parse the structlog JSON line ----
+#
+# `docker_logs` already unwraps Docker's json-file envelope, so
+# `.message` is the original stdout line emitted by structlog.
+# Parse it; on garbage (non-JSON early-boot lines, panics that
+# escape the formatter) keep the record with .service set so it
+# still surfaces in Discover — those are exactly the records you
+# want to see when something is wrong.
+
+[transforms.parse]
+type = "remap"
+inputs = ["backend_logs"]
+source = '''
+  raw = strip_whitespace(string!(.message))
+  container_name = .container_name
+  container_id = .container_id
+  stream = .stream
+  parsed = parse_json(raw) ?? {}
+  . = parsed
+  .stream = stream
+  .container_name = container_name
+  .container_id = container_id
+  # Service tag drives the per-source reshape below and the Discover
+  # facet operators use to scope a search to one tier.
+  if starts_with(string!(container_name), "caddy") {
+    .service = "caddy"
+  } else {
+    .service = "mcpolis-backend"
+  }
+  if exists(.timestamp) {
+    ."@timestamp" = del(.timestamp)
+  }
+  if exists(.exception) && length(string!(.exception)) > 30000 {
+    .exception = slice!(string!(.exception), 0, 30000) + "...[truncated]"
+  }
+'''
+
+# ---- Transform: reshape uvicorn.access records ----
+#
+# Uvicorn's stdlib access logger emits a single message string per
+# request: ``<peer> - "<method> <path> <proto>" <status>``. Routed
+# through structlog's foreign_pre_chain that whole string lands in
+# ``event``, with the peer's ephemeral source port making every
+# record unique → unusable for "top events" aggregations.
+#
+# We rewrite ``event`` to a low-cardinality bucket
+# (``http.access.<status>``) and break the variable parts out into
+# dedicated fields you can facet on in Kibana.
+
+[transforms.reshape_uvicorn_access]
+type = "remap"
+inputs = ["parse"]
+source = '''
+  if exists(.logger) && .logger == "uvicorn.access" {
+    msg = string(.event) ?? ""
+    parts = parse_regex(msg, r'^(?P<peer>\S+)\s-\s"(?P<method>\w+)\s(?P<path>\S+)\s(?P<proto>[^"]+)"\s(?P<status>\d+)') ?? {}
+    if exists(parts.status) {
+      status_code = string!(parts.status)
+      .http_peer = parts.peer
+      .http_method = parts.method
+      .http_path = parts.path
+      .http_status = to_int(status_code) ?? 0
+      .event = "http.access." + status_code
+    } else {
+      .event = "http.access.unparsed"
+    }
+  }
+'''
+
+# ---- Transform: reshape Caddy access logs ----
+#
+# Caddy's structured JSON access logs land here as a top-level object
+# with `logger="http.log.access"`, a `request` sub-object, and a
+# numeric `status`. We rewrite `event` to a low-cardinality bucket
+# (`caddy.access.<status>`) and lift method/path/host/status into
+# top-level fields — same shape the uvicorn reshape produces, so a
+# single Discover query (`event:caddy.access.5*` or
+# `event:http.access.5*`) can compare the two tiers side by side. A
+# 502 from Caddy that never reached uvicorn is the exact failure
+# mode the athena-decision investigation couldn't see; this is what
+# closes that gap.
+
+[transforms.reshape_caddy_access]
+type = "remap"
+inputs = ["reshape_uvicorn_access"]
+source = '''
+  if exists(.logger) && (string!(.logger) == "http.log.access" || starts_with(string!(.logger), "http.log.access.")) {
+    if exists(.status) {
+      status_code = to_string!(.status)
+      .http_status = to_int(status_code) ?? 0
+      .event = "caddy.access." + status_code
+    } else {
+      .event = "caddy.access.unparsed"
+    }
+    if exists(.request) {
+      req = object!(.request)
+      if exists(req.method) { .http_method = req.method }
+      if exists(req.uri) { .http_path = req.uri }
+      if exists(req.host) { .http_host = req.host }
+      if exists(req.remote_ip) { .http_peer = req.remote_ip }
+      if exists(req.headers) {
+        hdrs = object!(req.headers)
+        if exists(hdrs."User-Agent") {
+          ua = array!(hdrs."User-Agent")
+          if length(ua) > 0 { .user_agent = ua[0] }
+        }
+      }
+      # F-02 Layer 2: drop request headers that frequently carry
+      # session credentials. The structlog processor never sees Caddy
+      # records, so this is the only line of defense for them.
+      del(.request.headers.Cookie)
+      del(.request.headers.Authorization)
+      del(.request.headers."Set-Cookie")
+    }
+    # Move the original Caddy `msg` to `message` so it doesn't shadow
+    # `event` after the rewrite.
+    if exists(.msg) {
+      .message = del(.msg)
+    }
+  }
+'''
+
+# ---- Transform: drop high-frequency, low-value events ----
+#
+# These are the periodic loop / heartbeat / cache-hit events whose
+# rate matters but whose individual records don't. Keep them out of
+# Elastic to control storage cost and noise in Discover. Add to this
+# list as new noisy events show up in dashboards.
+
+[transforms.drop_noise]
+type = "filter"
+inputs = ["reshape_caddy_access"]
+condition = '''
+  !includes([
+    "http.response.start",
+    "http.response.body",
+    "upstream.health.probe.periodic.started",
+    "upstream.health.probe.periodic.completed",
+    "upstream.health.probe.ok",
+    "upstream.health_email.disabled_flag_skipped_tick",
+    "oauth.token.refresh.skipped.not_needed",
+    "oauth.token.refresh.skipped.locked",
+    "oauth.token.refresh.unchanged",
+    "sandbox.reconcile.skipped",
+    "audit.entry.logged"
+  ], .event)
+'''
+
+# ---- Transform: per-event-name throttle (runaway-cost guard) ----
+#
+# At ~1 KB/event, 5000 events/min/event-name caps spend at roughly
+# 7 GB/day worst case (~$$0.50/day at $$0.07/GB ingest) per distinct
+# event name. Pair with the Elastic Cloud billing budget alert as
+# the upper bound across the whole pipeline.
+
+[transforms.throttle]
+type = "throttle"
+inputs = ["drop_noise"]
+threshold = 5000
+window_secs = 60
+key_field = "{{ event }}"
+
+# ---- Transform: redact values at secret-shaped keys ----
+#
+# Layer 2 of the F-02 fix. The backend structlog chain has its own
+# recursive walker (Layer 1) that catches deep nested config dicts,
+# but it can't see records that bypass structlog: uvicorn access
+# lines, Caddy access lines, third-party libraries that print
+# directly to stdout, or anything emitted before
+# `configure_structlog` runs. This transform is the catch-all.
+#
+# Limitation: VRL's `for_each` is top-level only. Deep nesting must
+# be handled by Layer 1; this catches the flat shapes that matter
+# in practice (uvicorn / Caddy reshape outputs, third-party JSON).
+
+[transforms.redact_secrets]
+type = "remap"
+inputs = ["throttle"]
+source = '''
+  secret_re = r'(?i)(password|secret|token|api_?key|api-key|authorization|cookie|client_secret|client-secret|bearer|signing_key|signing-key|access_key|access-key)'
+  for_each(.) -> |k, _v| {
+    if match(downcase(k), secret_re) {
+      . = set!(., [k], "[REDACTED]")
+    }
+  }
+'''
+
+# ---- Sink: Elastic Cloud Serverless data stream ----
+#
+# `mode = "data_stream"` activates the modern Elastic ingest path —
+# data lands in `logs-mcpolis-prod`, which auto-creates with ILM /
+# tier-aware storage on Serverless without any manual index template.
+#
+# The Elasticsearch sink doesn't expose `auth.strategy = "api_key"`,
+# so we inject the `Authorization: ApiKey <encoded>` header manually
+# via `request.headers`. The encoded form is the base64 `id:api_key`
+# string Kibana shows when you mint the key.
+
+[sinks.elastic]
+type = "elasticsearch"
+inputs = ["redact_secrets"]
+endpoints = ["${MCPOLIS_ELASTIC_ENDPOINT}"]
+mode = "data_stream"
+compression = "gzip"
+# Skip Vector's startup healthcheck. Elastic Cloud Serverless returns
+# 410 Gone on the classic cluster-info endpoint Vector probes (the
+# concept doesn't apply on Serverless). Real `_bulk` writes still
+# surface errors via the regular sink-failure metrics, so we don't
+# lose any signal.
+healthcheck.enabled = false
+
+[sinks.elastic.request]
+retry_attempts = 5
+retry_initial_backoff_secs = 2
+headers.Authorization = "ApiKey ${MCPOLIS_ELASTIC_API_KEY}"
+
+[sinks.elastic.data_stream]
+type = "logs"
+dataset = "mcpolis"
+namespace = "prod"
+
+[sinks.elastic.batch]
+max_bytes = 5242880
+timeout_secs = 5
+
+[sinks.elastic.buffer]
+type = "disk"
+max_size = 268435488   # Vector 0.55 floor: 256 MiB + 32 B overhead
+when_full = "drop_newest"
+
+# ---- Self-observability: prometheus metrics on 127.0.0.1:9598 ----
+#
+# Bound to localhost so the metrics port doesn't leak through nginx.
+# Useful series:
+#   vector_component_errors_total       — forwarder hitting Elastic 4xx/5xx
+#   vector_buffer_byte_size              — disk buffer pressure
+#   vector_events_in_total{component_id} — per-stage throughput
+
+[sources.vector_metrics]
+type = "internal_metrics"
+
+[sinks.prom]
+type = "prometheus_exporter"
+inputs = ["vector_metrics"]
+address = "127.0.0.1:9598"

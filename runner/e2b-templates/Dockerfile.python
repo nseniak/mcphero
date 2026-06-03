@@ -1,0 +1,35 @@
+# mcpolis E2B template — python (uvx-distributed MCPs).
+#
+# Shared across every mcpolis-python-cpu*-ram* template. CPU and RAM
+# are enforced at template build time via the e2b.toml `[resources]`
+# block — this Dockerfile is identical for all 8 python templates.
+#
+# Python 3.12 + uv pre-installed so `uvx <pkg>` calls don't pay a
+# uv-bootstrap cost on every cold start. uv's cache lives at
+# ~/.cache/uv on the E2B sandbox's default writable filesystem.
+#
+# Compared to runner/images/mcp-base-python (the curated image used
+# by the self-hosted Tier-3 sandbox), this E2B variant is the same
+# stack with the rootless-podman quirks dropped.
+
+FROM python:3.12-slim-bookworm
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_NO_PROGRESS=1 \
+    UV_VERSION=0.4.26
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates curl \
+ && curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
+        | env UV_INSTALL_DIR=/usr/local sh \
+ && rm -rf /var/lib/apt/lists/*
+
+# Pre-warm uvx caches for known MCP servers we expect to see most
+# often. Cuts cold-start latency for the popular ones; the rest
+# cold-pull at create time.
+RUN uvx --from mcp-server-time mcp-server-time --help >/dev/null 2>&1 || true \
+ && uvx --from mcp-server-fetch mcp-server-fetch --help >/dev/null 2>&1 || true
+
+# E2B sets WORKDIR / USER itself when it spawns; don't override.

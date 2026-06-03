@@ -1,0 +1,46 @@
+# gitleaks config for mcpolis / MCP Hero.
+#
+# The repo ships a *product feature* that detects secret-shaped values in
+# user-supplied MCP configs (frontend/src/lib/secret-detection.ts). Its
+# tests necessarily contain deliberately fake, real-looking literals
+# (AKIA…, sk_live_…, ghp_…, xoxb-…). Those are NOT leaks — they are test
+# fixtures — but a secret scanner will flag them and could block the
+# first public push.
+#
+# We allowlist by PATH (not by fingerprint): fingerprints embed a commit
+# SHA, and the public repo is a snapshot stream with its own commits, so
+# fingerprints wouldn't survive a publish. Path rules are
+# commit-independent. Keep the allowlist NARROW so a real secret in
+# normal source still trips the scanner.
+#
+# Note: this configures gitleaks. GitHub's own push-protection scanner is
+# separate and is handled in the repo's security settings at publish time.
+
+title = "mcpolis gitleaks config"
+
+[extend]
+# Keep all of gitleaks' built-in rules; only add the allowlist below.
+useDefault = true
+
+[allowlist]
+description = "Deliberate fake secrets in specific test fixtures"
+# Keep this list NARROW, anchored, and additive: enumerate the EXACT
+# files that legitimately contain fake, real-looking credentials. A
+# broad rule like `(^|/)tests?/` would blind gitleaks to a real secret
+# accidentally committed in any other test file. Each entry below was
+# confirmed (via a no-allowlist gitleaks run) to contain only fake
+# fixtures (AKIAABCDEFGHIJKLMNOP, ghp_abcdef…, sk_live_abcdef…,
+# xoxb-123456789012-…, e2b_invalid_key_…).
+#
+# When gitleaks flags a NEW file at publish time: verify the value is a
+# fake fixture, then add that exact file here (`^…$`). Do not widen to a
+# directory.
+paths = [
+  '''^frontend/src/lib/secret-detection\.test\.ts$''',
+  '''^backend/tests/unit/test_secret_scanner\.py$''',
+  '''^backend/tests/unit/test_mcp_token_storage\.py$''',
+  '''^backend/tests/unit/test_template_var_last_four\.py$''',
+  '''^backend/tests/unit/test_upstream_config_service_template_vars\.py$''',
+  '''^backend/tests/integration/test_e2b_sandbox_service_real_sdk\.py$''',
+  '''^backend/tests/integration/e2b_real_e2e\.py$''',
+]

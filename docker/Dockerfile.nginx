@@ -1,0 +1,54 @@
+# MCP Hero — nginx reverse proxy + frontend static files
+#
+# Builds the React SPA independently, then serves it via nginx.
+# In cloud mode, nginx also reverse-proxies API/MCP traffic to
+# the backend service(s) with sticky session routing.
+
+FROM node:20-slim AS frontend-build
+WORKDIR /build
+
+# Install Debian's chromium so the prerender plugin's puppeteer
+# integration has a working browser binary on aarch64. See the
+# matching block in docker/Dockerfile for the full rationale.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      chromium fonts-freefont-ttf \
+    && rm -rf /var/lib/apt/lists/*
+ENV PUPPETEER_SKIP_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
+ARG VITE_SENTRY_DSN=""
+ARG VITE_SENTRY_TRACES_SAMPLE_RATE="0.1"
+ARG VITE_MIXPANEL_TOKEN=""
+ARG VITE_MIXPANEL_API_HOST=""
+ARG VITE_RELEASE=""
+ARG VITE_SITE_URL=""
+ARG VITE_GATEWAY_URL=""
+ARG VITE_CONTACT_EMAIL=""
+ARG VITE_PRIVACY_EMAIL=""
+ARG VITE_SECURITY_EMAIL=""
+ARG VITE_SUPPORT_EMAIL=""
+ENV VITE_SENTRY_DSN=$VITE_SENTRY_DSN \
+    VITE_SENTRY_TRACES_SAMPLE_RATE=$VITE_SENTRY_TRACES_SAMPLE_RATE \
+    VITE_MIXPANEL_TOKEN=$VITE_MIXPANEL_TOKEN \
+    VITE_MIXPANEL_API_HOST=$VITE_MIXPANEL_API_HOST \
+    VITE_RELEASE=$VITE_RELEASE \
+    VITE_SITE_URL=$VITE_SITE_URL \
+    VITE_GATEWAY_URL=$VITE_GATEWAY_URL \
+    VITE_CONTACT_EMAIL=$VITE_CONTACT_EMAIL \
+    VITE_PRIVACY_EMAIL=$VITE_PRIVACY_EMAIL \
+    VITE_SECURITY_EMAIL=$VITE_SECURITY_EMAIL \
+    VITE_SUPPORT_EMAIL=$VITE_SUPPORT_EMAIL
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+# DocsPage.tsx bundles markdown via `import.meta.glob("../../../../docs/*.md")`.
+# Four levels up from src/pages/marketing/ resolves to /docs/ inside the
+# container (WORKDIR is /build), so the repo-root docs/ has to land there.
+COPY docs/ /docs/
+RUN npm run build
+
+FROM nginx:1-alpine
+COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+RUN rm -f /etc/nginx/conf.d/default.conf.bak
+COPY --from=frontend-build /build/dist/ /usr/share/nginx/html/
+EXPOSE 80

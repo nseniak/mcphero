@@ -1,0 +1,47 @@
+# Dependabot config for mcpolis.
+#
+# Strategy: SECURITY UPDATES ONLY — no routine version-bump churn.
+# `open-pull-requests-limit: 0` disables version-update PRs but
+# preserves security-update PRs (Dependabot creates those whenever a
+# dependency you use has a published CVE). Routine version bumps are
+# done manually on a quarterly cadence (see
+# internal/documents/starter-pack-patterns.md §6 "Dependency security").
+#
+# This file only tells Dependabot WHERE to look. The "Dependabot
+# alerts" + "Dependabot security updates" toggles must also be on in
+# the repo's Settings → Code security page (one-time operator action).
+#
+# Adding a new ecosystem? Mirror the shape below: declare the
+# directory, set a daily cadence, keep the limit at 0, label the PRs
+# so they stand out in the queue.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/backend"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 0
+    labels:
+      - "security"
+      - "dependencies"
+      - "backend"
+
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 0
+    labels:
+      - "security"
+      - "dependencies"
+      - "frontend"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    labels:
+      - "security"
+      - "dependencies"
+      - "ci"

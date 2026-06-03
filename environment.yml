@@ -1,0 +1,10 @@
+name: mcpolis
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - nodejs>=20
+  - poetry>=1.8
+  - openssl
+  - shellcheck

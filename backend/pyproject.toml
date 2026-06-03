@@ -1,0 +1,123 @@
+[tool.poetry]
+name = "mcpolis"
+version = "0.1.0"
+description = "MCP gateway aggregating upstream MCP servers with OAuth, policies, and audit logging."
+authors = ["Nitsan Seniak"]
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+packages = [{ include = "mcpolis", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.13"
+pydantic = "^2.7.0"
+pydantic-settings = "^2.3.0"
+fastapi = "^0.121.0"
+# Pinned for CVE-2025-62727 (Range-header DoS in FileResponse). FastAPI
+# 0.121.x is the smallest minor whose own pin admits starlette 0.49.x.
+starlette = ">=0.49.1"
+uvicorn = { version = ">=0.30.0", extras = ["standard"] }
+authlib = "^1.6.11"
+# MCP Python SDK (Anthropic). Install name can vary; adjust if needed.
+mcp = "^1.27.0"
+cryptography = "^46.0.6"
+python-json-logger = "^4.1.0"
+# Structured logging: every log record is a JSON object with the event
+# name as a stable key and all placeholders as top-level fields.
+# Enables field-level search + alerting in downstream log backends.
+structlog = "^25.1.0"
+# Pinned for CVE-2026-42561 (multipart parser DoS). Transitive via
+# starlette/FastAPI; explicit pin documents intent and prevents a
+# future poetry-lock regen from sliding back below 0.0.27.
+python-multipart = ">=0.0.27"
+# Async MongoDB driver used by the Phase 2c cloud-mode storage backend.
+# Standalone mode never imports it at runtime — the file repositories
+# stay the default — but ``motor`` must be available for ``create_app``
+# to construct the Mongo adapters when ``MCPOLIS_MODE=cloud``.
+motor = "^3.7.0"
+# Async Redis client used by the Phase 2d cloud-mode infra adapters
+# (event stream pub/sub + sliding-window rate limiter). Standalone
+# mode never imports it at runtime. We use coredis (not redis-py)
+# because coredis ships full, strict-pyright-clean type annotations
+# on all commands, pub/sub, and the connection pool — redis-py's
+# async surface still returns ``Awaitable[T] | T`` unions that
+# strict mode won't swallow.
+coredis = "^5.7.0"
+sentry-sdk = {version = "^2.20.0", extras = ["fastapi"]}
+mixpanel = "^4.10.0"
+# E2B Python SDK — used when ``MCPOLIS_SANDBOX_PROVIDER=e2b``. The
+# real-SDK adapter at ``adapters/sandbox_e2b/real_client.py`` imports
+# this lazily so deployments running on ``own-runner`` /
+# ``local-subprocess`` don't pay an import cost.
+e2b = "^2.20.0"
+# Async SMTP client for the transactional-email adapter
+# (``adapters/email/smtp_email_sender.py``). Used only when
+# ``MCPOLIS_SMTP_HOST`` is set; the stub sender needs no SMTP lib.
+aiosmtplib = "^5.1.0"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.6.0"
+pyright = "^1.1.0"
+# pytest 9.0.3 fixes CVE-2025-71176 (shared /tmp/pytest-of-{user} local DoS).
+# Repo conventions (top-level test functions, no fixtures) make the 8→9
+# break surface minimal.
+pytest = "^9.0.3"
+pytest-asyncio = "^1.0.0"
+# Parallelism for the unit + integration suites. ``--dist loadfile``
+# keeps every test in one file on the same worker so interleaved
+# stdout stays attributable.
+pytest-xdist = "^3.8.0"
+# Machine-readable test outcomes. Used by run-*-tests.sh and the
+# Python e2e orchestrator to surface pass/fail without parsing the
+# console stream.
+pytest-json-report = "^1.5.0"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+pythonPlatform = "All"
+include = ["src", "tests"]
+# `tests.unit.factories` is imported as a top-level package by test modules;
+# add the backend dir so pyright can resolve it alongside `src/mcpolis`.
+extraPaths = ["."]
+# The mcpolis package ships its own type annotations (see src/mcpolis/py.typed),
+# so the "missing stubs" strict-mode default is pure noise here.
+reportMissingTypeStubs = "none"
+
+# Tests legitimately break encapsulation to inject fakes and observe
+# internal state. Relax the rules that would otherwise force us to
+# either scatter per-line pragmas or grow a test-only public API on
+# every production class. Strict mode still applies to src/.
+#
+# The relaxed rules below all stem from heavy ``unittest.mock`` /
+# ``MagicMock`` usage — pyright can't see through dynamic attribute
+# creation, so mock-bound variables propagate ``Unknown`` types
+# everywhere they touch. Pinning every mock with explicit casts
+# would be ~100s of LOC of pure ceremony with no signal value
+# (runtime assertions are what catch test bugs, not the type system).
+# The src/ tree keeps the full strict ruleset.
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+reportPrivateUsage = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownParameterType = "none"
+reportMissingParameterType = "none"
+reportUnknownLambdaType = "none"
+reportUnknownArgumentType = "none"
+reportAttributeAccessIssue = "none"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
