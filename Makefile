@@ -8,7 +8,7 @@
 #   conda activate mcpolis
 #   make <target>
 
-.PHONY: help og-image app-icon
+.PHONY: help og-image app-icon github-social
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -18,3 +18,6 @@ og-image: ## Re-render frontend/public/og-image.png from frontend/scripts/og-car
 
 app-icon: ## Re-render frontend/public/apple-touch-icon.png (transparent) from frontend/public/favicon.svg
 	cd frontend && node scripts/generate-app-icon.mjs
+
+github-social: ## Re-render frontend/public/github-social-preview.png (1280x640) from scripts/og-card.svg for the GitHub repo "Social preview"
+	cd frontend && node scripts/generate-github-social.mjs
