@@ -13,6 +13,10 @@
 
 Hosted version: **[mcphero.io](https://mcphero.io)** · or self-host with this repo.
 
+<p align="center">
+  <a href="https://mcphero.io"><img src="docs/images/dashboard-upstreams.png" alt="MCP Hero dashboard — many MCP servers behind one endpoint, with transport, per-user auth, and live status at a glance" width="900"></a>
+</p>
+
 ---
 
 ## What is MCP Hero?
@@ -42,7 +46,25 @@ docker compose --profile standalone up --build
 
 Then open **http://localhost:8080**. On first launch you'll see an email picker (standalone uses a no-login dev auth by default); pick any email and you become the admin of the default org. Config and data persist in Docker volumes (`mcpolis-config`, `mcpolis-data`), so your setup survives restarts.
 
-That's the whole install. To add your first MCP server, use **Upstreams → Add** in the dashboard.
+That's the whole install. Now add your first MCP server.
+
+### Adding your first MCP
+
+Open **Upstream MCPs → Add MCP** in the dashboard. There are two kinds of server you can mount:
+
+**Remote HTTP MCP** — a server you reach over a URL (GitHub, Notion, Linear, …). Paste its URL, then choose how users authenticate: **Per-user** (each person signs in with their own account via OAuth), **Shared** (one admin connection the whole team uses), or **None** (no auth, or credentials baked into the config).
+
+<p align="center">
+  <img src="docs/images/add-mcp-http.png" alt="Adding a Remote HTTP MCP: paste the server URL and choose the per-user, shared, or none authentication mode" width="760">
+</p>
+
+**Hosted stdio MCP** — a `command:`-style server (e.g. `npx …`) that MCP Hero runs for you — by default as a local subprocess, or in an isolated remote sandbox when you configure one. Switch to the **JSON** tab and paste its config (command, args, env). Secrets are stored safely whether you write them inline or pull them into reusable `${VARIABLE}` placeholders — config lives in local files in standalone mode and is encrypted in the database in cloud.
+
+<p align="center">
+  <img src="docs/images/add-mcp-stdio.png" alt="Adding a Hosted stdio MCP: paste a command/args JSON config on the JSON tab, with ${VARIABLE} placeholders for secrets" width="760">
+</p>
+
+Hit **Add**, then **Start** to connect — the server's tools light up in the list and become reachable through your single gateway URL.
 
 > Standalone defaults to a **no-real-auth** email picker, which is perfect on your own machine. If you expose the dashboard to a network, turn on real Google sign-in — see below.
 

@@ -118,7 +118,12 @@ services:
       - .env.cloud.docker.prod
     environment:
       MCPOLIS_MODE: cloud
-      MCPOLIS_MONGO_URI: mongodb://mongo:27017
+      # Defaults to the open in-network URI for dev/native runs (no
+      # --env-file). In the cloud stack the credentialed app URI is
+      # interpolated from .env.cloud.docker.prod (compose reads ${...}
+      # from the --env-file passed by seniak-infra's MCPOLIS_COMPOSE),
+      # so prod Mongo runs with --auth. See docker-compose.proxied.yml.
+      MCPOLIS_MONGO_URI: ${MCPOLIS_MONGO_URI:-mongodb://mongo:27017}
       MCPOLIS_REDIS_URL: redis://redis:6379
     depends_on:
       mongo:

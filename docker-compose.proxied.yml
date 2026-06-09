@@ -31,6 +31,15 @@ services:
       - default
       - web
 
+  # Cloud-only: turn on Mongo authentication. The base compose runs a
+  # plain `mongod` (no auth) for dev/native/test; we enable --auth only
+  # here so dev and the --noauth mongo-test service stay password-free.
+  # Users (root / mcpolis_app[readWrite] / mcpolis_ro[read]) live in the
+  # admin db; the backend connects with the credentialed MCPOLIS_MONGO_URI
+  # from .env.cloud.docker.prod (?authSource=admin).
+  mongo:
+    command: ["mongod", "--auth", "--bind_ip_all"]
+
 networks:
   web:
     external: true

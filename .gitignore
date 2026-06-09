@@ -20,6 +20,9 @@ dist/
 # ...but always track *.example templates (placeholders only, no secrets)
 !.env*.example
 
+# Plaintext secret bundle from internal/scripts/backup-secrets.sh — never commit
+mcpolis_secrets.zip
+
 # Local dev-env activation hook (operator-specific; sourced by run-in-env.sh)
 run-in-env.local.sh
 
@@ -57,6 +60,9 @@ runner/dev-certs/out/
 
 # Local-only Playwright storage state for internal/scripts/prod-smoke.sh
 internal/scripts/.smoke-auth/
+# Filled credential file for the README hero-screenshot staging set
+# (the *.example.json template stays tracked; the real one never is)
+internal/screenshots/hero-mcps.json
 # Symlink the prod-smoke wrapper creates to reach tests/e2e/node_modules
 # (the global node_modules/ rule is dir-only and misses this symlink).
 internal/scripts/node_modules
