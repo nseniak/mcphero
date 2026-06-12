@@ -66,6 +66,7 @@ export const en = {
   "sidebar.team": "Team",
   "sidebar.access": "Roles & Permissions",
   "sidebar.gateway": "Gateway MCP",
+  "sidebar.serviceTokens": "Service Tokens",
   "sidebar.connect": "Connect AI Assistant",
   "sidebar.adminMcp": "Admin MCP",
   "sidebar.myMcps": "My Tools",
@@ -301,6 +302,37 @@ export const en = {
   "gateway.disconnected": "Disconnected",
   "gateway.disconnect": "Disconnect",
   "gateway.disconnecting": "Disconnecting…",
+
+  // Service tokens page (admin)
+  "serviceTokens.title": "Service tokens",
+  "serviceTokens.titleCount": "Service tokens ({{count}})",
+  "serviceTokens.description":
+    "Bearer tokens for calling the gateway MCP from agents and automations, without OAuth sign-in. Each token gets the access of the role you choose.",
+  "serviceTokens.createButton": "New token",
+  "serviceTokens.formLabel": "Name",
+  "serviceTokens.placeholderLabel": "e.g. ci-bot",
+  "serviceTokens.invalidLabel":
+    "Lowercase letters, digits, '-' or '_' only (max 64), starting with a letter or digit.",
+  "serviceTokens.formRole": "Role",
+  "serviceTokens.selectRole": "Select a role…",
+  "serviceTokens.failedToCreate": "Failed to create token",
+  "serviceTokens.headerLabel": "Name",
+  "serviceTokens.headerRole": "Role",
+  "serviceTokens.headerCreated": "Created",
+  "serviceTokens.headerLastUsed": "Last used",
+  "serviceTokens.neverUsed": "Never",
+  "serviceTokens.noTokens":
+    "No service tokens yet. Create one to let an agent connect to the gateway.",
+  "serviceTokens.confirmRevoke": "Revoke service token \"{{label}}\"?",
+  "serviceTokens.revoke": "Revoke",
+  "serviceTokens.createdTitle": "Token created",
+  "serviceTokens.shownOnce":
+    "Copy this token now — it is shown only once and cannot be recovered. To rotate it later, revoke and create a new one.",
+  "serviceTokens.tokenValue": "Token",
+  "serviceTokens.snippetTitle": "MCP JSON configuration for your agent",
+  "serviceTokens.auditNote":
+    "Calls made with this token appear in the audit log as svc:{{label}}.",
+  "serviceTokens.done": "Done",
 
   // Admin MCP page
   "adminMcp.title": "Admin MCP",

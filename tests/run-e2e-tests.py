@@ -100,14 +100,22 @@ RUN_TOKEN = secrets.token_hex(3)
 # Commandline fragments that identify a process as one of *our* e2e
 # children. Used by the pre-flight reaper to distinguish a leaked
 # orphan (safe to kill) from an unrelated process that merely happens
-# to hold a port in our range. Deliberately specific: the dev stack
-# (``python -m mcpolis`` on 8080, ``vite`` with no ``--port 15``) does
-# NOT match, so the reaper can never touch it.
+# to hold a port in our range. The dev stack stays untouchable through
+# the reaper's port-band guard: the dev backend (``python -m mcpolis``
+# on 8080) and dev Vite (5173) never listen inside the 1xxxx e2e band,
+# so they are never even candidates — markers are only consulted for
+# in-band listeners.
 _E2E_PROCESS_MARKERS = (
     "tests/e2e/test_mcp_server.py",
     "tests/e2e/oauth_test_mcp_server.py",
     "vite --port 15",
     "run-e2e-tests.py",
+    # The e2e backend. Matches the dev backend's commandline too, but
+    # the port-band guard (e2e backends listen on 18xxx, dev on 8080)
+    # keeps the dev stack out of reach. Without this marker an
+    # orphaned e2e backend squats 18xxx forever and every later run
+    # spills.
+    "-m mcpolis",
 )
 
 
@@ -125,19 +133,37 @@ def _port_is_free(port: int) -> bool:
             return False
 
 
+# Every port handed out by ``_find_free_port`` this run. Probing alone
+# can't prevent double-assignment: a port is only *bound* when the child
+# process starts, long after allocation, so "free right now" holds for
+# the same port across two consecutive probes. With the demo/OAuth MCP
+# bases only 1 apart (19999 / 19998), a squatter on both once made the
+# two probes spill onto the SAME port — the OAuth fake won the bind race
+# and answered the demo URL with 401s, poisoning the seeded upstreams.
+# Reserving allocations here makes that cross-wire structurally
+# impossible within a run.
+_allocated_ports: set[int] = set()
+
+
 def _find_free_port(preferred: int, span: int = 400) -> int:
     """Return ``preferred`` if free, else the next free port above it.
 
     Scans ``[preferred, preferred + span)`` so a spilled shard stays
     within a recognisable band (e.g. backend ports remain ~18xxx).
+    Skips ports already handed out this run (see ``_allocated_ports``).
     Falls back to an OS-assigned ephemeral port if the whole band is
     occupied (pathological — hundreds of stale listeners)."""
     for candidate in range(preferred, preferred + span):
+        if candidate in _allocated_ports:
+            continue
         if _port_is_free(candidate):
+            _allocated_ports.add(candidate)
             return candidate
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+        port = int(sock.getsockname()[1])
+    _allocated_ports.add(port)
+    return port
 
 
 # ─── Shard configuration ──────────────────────────────────────────────
@@ -173,12 +199,14 @@ class ShardConfig:
 
 
 def make_shard(index: int, total: int) -> ShardConfig:
-    # Probe upward from each preferred base for a free port. The four
-    # bases are >=10 apart, so a lone run lands on the historic
-    # 18080/15173/19999/19998+index*10 numbers; a run sharing the host
-    # with a leftover/concurrent run spills to the next free port
-    # rather than colliding. Log paths stay index-keyed (stable for
-    # grep) regardless of which ports get chosen.
+    # Probe upward from each preferred base for a free port. A lone run
+    # lands on the historic 18080/15173/19999/19998+index*10 numbers; a
+    # run sharing the host with a leftover/concurrent run spills to the
+    # next free port rather than colliding. The demo/OAuth bases are
+    # only 1 apart, so a spill from one can land in the other's band —
+    # ``_allocated_ports`` guarantees the spilled ports are still
+    # distinct. Log paths stay index-keyed (stable for grep) regardless
+    # of which ports get chosen.
     return ShardConfig(
         index=index,
         total=total,
@@ -488,6 +516,120 @@ def wait_for_port_free(port: int, timeout: float = 10) -> None:
             return
 
 
+# ─── Bootstrap identity guards ────────────────────────────────────────
+#
+# ``wait_for_url`` proves *something* HTTP-shaped answers the port — but
+# a squatter answering for a dead child passes that test (the incident:
+# the OAuth fake answered the demo MCP's URL with 401, and every spec
+# using the seeded test-tools upstream failed with a confusing
+# lazy-connect 401). These guards run right after wait_for_url and turn
+# that into a single loud bootstrap failure.
+
+
+def assert_port_owned_by(
+    label: str, port: int, proc: subprocess.Popen[bytes],
+) -> None:
+    """Fail fast unless the TCP listener on ``port`` is ``proc`` itself.
+
+    Only valid for children that bind in-process (the python test MCP
+    fakes, the backend uvicorn) — NOT the frontend, where the listener
+    is a grandchild of the ``npm`` Popen. Best-effort: if ``lsof`` is
+    unavailable the check is skipped (wait_for_url + the identity probes
+    still hold)."""
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return
+    pids = {int(tok) for tok in out.split() if tok.strip().isdigit()}
+    if not pids or proc.pid in pids:
+        return
+    squatters = ", ".join(
+        f"pid={pid} cmd={_proc_ppid_and_cmd(pid)[1][:80]!r}"
+        for pid in sorted(pids)
+    )
+    raise RuntimeError(
+        f"{label}: port {port} is served by another process, not our "
+        f"child (pid={proc.pid}). Squatter(s): {squatters}. A leftover "
+        f"run is squatting this port — re-run after it exits, or reap "
+        f"it manually.",
+    )
+
+
+def assert_demo_mcp_identity(url: str, label: str) -> None:
+    """The demo MCP must answer an unauthenticated MCP ``initialize``
+    with HTTP 200. A 401/403 here means an auth-gated impostor (e.g.
+    the OAuth fake) holds the port — abort the shard with a clear
+    message instead of letting every spec fail on lazy-connect."""
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "e2e-bootstrap-probe", "version": "0"},
+        },
+    }).encode()
+    req = urllib.request.Request(
+        f"{url}/mcp", data=body, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(
+            f"{label}: identity probe against {url}/mcp failed at the "
+            f"network level: {e}",
+        ) from e
+    if status != 200:
+        raise RuntimeError(
+            f"{label}: unauthenticated MCP initialize against {url}/mcp "
+            f"returned HTTP {status}, expected 200. Something other "
+            f"than the demo MCP is answering this port (a 401 means an "
+            f"auth-gated squatter, likely an OAuth test fake from "
+            f"another run).",
+        )
+
+
+def assert_oauth_mcp_identity(url: str, label: str) -> None:
+    """The OAuth fake must serve its protected-resource metadata with
+    HTTP 200 AND advertise a ``resource`` on this very port — another
+    run's OAuth fake would answer 200 with a different port baked in."""
+    probe = f"{url}/.well-known/oauth-protected-resource"
+    try:
+        with urllib.request.urlopen(probe, timeout=5) as resp:
+            status = resp.status
+            payload = resp.read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"{label}: {probe} returned HTTP {e.code}, expected 200. "
+            f"Something other than the OAuth test fake is answering "
+            f"this port.",
+        ) from e
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(
+            f"{label}: identity probe against {probe} failed at the "
+            f"network level: {e}",
+        ) from e
+    try:
+        resource = str(json.loads(payload).get("resource", ""))
+    except (ValueError, AttributeError):
+        resource = ""
+    if not resource.startswith(f"{url}/"):
+        raise RuntimeError(
+            f"{label}: OAuth fake on {url} advertises resource "
+            f"{resource!r} — a fake from a different run (different "
+            f"port) is squatting this port.",
+        )
+
+
 # ─── Shard bootstrap ──────────────────────────────────────────────────
 
 
@@ -652,6 +794,23 @@ def start_shard(shard: ShardConfig) -> ShardProcesses:
         label=f"shard{shard.index} oauth MCP",
         proc=oauth_mcp,
     )
+    # wait_for_url proves the port answers; these prove the answerer is
+    # OUR child and behaves like the service the seeded upstream URLs
+    # will assume. A squatter (e.g. another run's OAuth fake answering
+    # the demo URL with 401s) aborts the shard here, loudly, instead of
+    # surfacing as N confusing spec failures.
+    assert_port_owned_by(
+        f"shard{shard.index} demo MCP", shard.demo_mcp_port, demo_mcp,
+    )
+    assert_port_owned_by(
+        f"shard{shard.index} oauth MCP", shard.oauth_mcp_port, oauth_mcp,
+    )
+    assert_demo_mcp_identity(
+        shard.demo_mcp_url, f"shard{shard.index} demo MCP",
+    )
+    assert_oauth_mcp_identity(
+        shard.oauth_mcp_url, f"shard{shard.index} oauth MCP",
+    )
 
     backend = _spawn(
         f"shard{shard.index}/backend",
@@ -661,6 +820,9 @@ def start_shard(shard: ShardConfig) -> ShardProcesses:
     )
     wait_for_url(f"{shard.backend_url}/health", timeout=30,
                  label=f"shard{shard.index} backend", proc=backend)
+    assert_port_owned_by(
+        f"shard{shard.index} backend", shard.backend_port, backend,
+    )
 
     frontend = _spawn(
         f"shard{shard.index}/frontend",

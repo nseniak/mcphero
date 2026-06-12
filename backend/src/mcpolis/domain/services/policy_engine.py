@@ -8,7 +8,11 @@ from mcpolis.domain.model.settings import (
     SettingsConfig,
     ToolAccessConfig,
 )
-from mcpolis.domain.services.settings_resolver import ResolvedSettings, resolve_settings
+from mcpolis.domain.services.settings_resolver import (
+    ResolvedSettings,
+    resolve_settings,
+    resolve_settings_for_role,
+)
 
 
 @dataclass(frozen=True)
@@ -68,7 +72,12 @@ class PolicyEngine:
 
     @property
     def is_empty(self) -> bool:
-        """True when no roles are configured (permissive mode)."""
+        """True when no roles are configured.
+
+        Carries no access semantics: a zero-roles org denies every
+        identity (no role resolves → ``_EMPTY`` → no upstreams, no
+        tools), exactly like a role-less user in a roled org.
+        """
         return len(self._config.roles) == 0
 
     def get_user_roles(self, user_id: str) -> list[str]:
@@ -136,12 +145,36 @@ class PolicyEngine:
                 return name
         return None
 
-    def get_allowed_upstreams(self, user_id: str) -> set[str] | None:
-        """Return set of upstream IDs the user can access, or None if all allowed."""
-        if self.is_empty:
-            return None
+    def _resolve(
+        self, user_id: str, boundary_role: str | None
+    ) -> ResolvedSettings:
+        """Resolve settings for a request identity.
 
-        resolved = resolve_settings(self._config, user_id)
+        ``boundary_role`` carries a role established at the auth
+        boundary (service tokens); when present it wins over the
+        ``config.users`` lookup — the identity (``svc:<label>``) has
+        no users entry by design.
+        """
+        if boundary_role is not None:
+            return resolve_settings_for_role(self._config, boundary_role)
+        return resolve_settings(self._config, user_id)
+
+    def get_allowed_upstreams(
+        self,
+        user_id: str,
+        *,
+        boundary_role: str | None = None,
+    ) -> set[str]:
+        """Return the set of upstream IDs the identity can access.
+
+        An identity that resolves to no role — unknown user, deleted
+        role, or an org with zero roles configured — gets the empty
+        set. There is no permissive fallback: org membership on
+        ``/mcp/{slug}`` is enforced by policy, so an allow-all path
+        here would open a zero-roles org to any authenticated user
+        of the platform.
+        """
+        resolved = self._resolve(user_id, boundary_role)
         if not resolved.role_name:
             return set()
 
@@ -154,12 +187,15 @@ class PolicyEngine:
         self,
         user_id: str,
         tools: list[tuple[str, str, dict[str, bool]]],
+        *,
+        boundary_role: str | None = None,
     ) -> list[tuple[str, str, dict[str, bool]]]:
-        """Filter (upstream_id, tool_name, annotation_flags) triples by policy."""
-        if self.is_empty:
-            return tools
+        """Filter (upstream_id, tool_name, annotation_flags) triples by policy.
 
-        resolved = resolve_settings(self._config, user_id)
+        No-role identities (including every identity in a zero-roles
+        org) get an empty list; see ``get_allowed_upstreams``.
+        """
+        resolved = self._resolve(user_id, boundary_role)
         if not resolved.role_name:
             return []
 
@@ -179,12 +215,15 @@ class PolicyEngine:
         tool_name: str,
         arguments: dict[str, object],
         tool_annotations: dict[str, bool] | None = None,
+        *,
+        boundary_role: str | None = None,
     ) -> PolicyDecision:
-        """Evaluate whether a user can call a specific tool with given arguments."""
-        if self.is_empty:
-            return PolicyDecision(allowed=True, reason="no_policy_configured")
+        """Evaluate whether a user can call a specific tool with given arguments.
 
-        resolved = resolve_settings(self._config, user_id)
+        No-role identities (including every identity in a zero-roles
+        org) are denied; see ``get_allowed_upstreams``.
+        """
+        resolved = self._resolve(user_id, boundary_role)
         if not resolved.role_name:
             return PolicyDecision(allowed=False, reason="user_not_in_any_role")
 

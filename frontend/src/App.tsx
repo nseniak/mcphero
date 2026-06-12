@@ -17,6 +17,7 @@ import { UsersPage } from "./pages/admin/UsersPage";
 import { UserDetailPage } from "./pages/admin/UserDetailPage";
 import { AccessPage } from "./pages/admin/AccessPage";
 import { GatewayPage } from "./pages/admin/GatewayPage";
+import { ServiceTokensPage } from "./pages/admin/ServiceTokensPage";
 import { AdminMcpPage } from "./pages/admin/AdminMcpPage";
 import { ConnectPage } from "./pages/user/ConnectPage";
 import { UserMcpsPage } from "./pages/user/UserMcpsPage";
@@ -150,6 +151,7 @@ function App() {
                 <Route path="admin/team/:email" element={<UserDetailPage />} />
                 <Route path="admin/permissions" element={<AccessPage />} />
                 <Route path="admin/gateway" element={<GatewayPage />} />
+                <Route path="admin/service-tokens" element={<ServiceTokensPage />} />
                 <Route path="connect" element={<ConnectPage />} />
                 <Route path="my-tools" element={<UserMcpsPage />} />
               </Route>

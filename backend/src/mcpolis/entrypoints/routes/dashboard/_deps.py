@@ -47,6 +47,9 @@ from mcpolis.entrypoints.controllers.gateway_controller import current_org_id
 
 if TYPE_CHECKING:
     from mcpolis.domain.services.org_runtime import OrgRuntime
+    from mcpolis.domain.services.service_token_service import (
+        ServiceTokenService,
+    )
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
@@ -86,6 +89,7 @@ class DashboardDeps:
     is_cloud_mode: bool
     template_var_repo: TemplateVarRepository
     sandbox_file_repo: SandboxFileRepository | None = None
+    service_token_service: ServiceTokenService | None = None
 
 
 def sse_encode(text: str) -> str:

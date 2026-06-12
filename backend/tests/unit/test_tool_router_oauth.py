@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
+import anyio
 import mcp.types as mcp_types
 import pytest
+from mcp.client.session import ClientSession
 
 from mcpolis.adapters.repositories.connection_store import (
     ConnectionStore,
@@ -17,6 +21,7 @@ from mcpolis.adapters.upstream_clients.client_manager import (
 )
 from mcpolis.domain.model.policy import AuthMode, UpstreamAuthConfig
 from mcpolis.domain.model.settings import SettingsConfig
+from mcpolis.domain.model.upstream import ToolAnnotations
 from mcpolis.adapters.repositories.file_audit_repository import FileAuditRepository
 from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
@@ -81,6 +86,7 @@ def make_oauth_tool_router(
     upstream_id: str = "slack",
     auth_mode: AuthMode = AuthMode.admin_oauth,
     admin_emails: list[str] | None = None,
+    annotations: ToolAnnotations | None = None,
 ) -> tuple[ToolRouter, UpstreamClientManager, ConnectionStore]:
     auth = make_upstream_auth_oauth(mode=auth_mode)
     upstream = make_upstream_definition(id=upstream_id, auth=auth)
@@ -92,6 +98,7 @@ def make_oauth_tool_router(
         make_discovered_tool(
             upstream_id=upstream_id,
             original_name="send_message",
+            annotations=annotations,
         ),
     ]
 
@@ -641,3 +648,310 @@ async def test_per_user_oauth_two_users_each_use_their_own_session(
     bob_args = bob_session.call_tool.await_args
     assert alice_args.args[1] == {"text": "from alice"}  # type: ignore[union-attr]
     assert bob_args.args[1] == {"text": "from bob"}  # type: ignore[union-attr]
+
+
+# --- OAuth: transport stall recovery ---
+#
+# Prod incident 2026-06-12 (Sentry MCPOLIS-BACKEND-R/-S): a per-user
+# OAuth session over streamable HTTP died during a 14-minute idle gap
+# (server closed the connection; the SDK task group exited and closed
+# the in-memory streams), but the dead ClientSession stayed cached.
+# ``acquire_upstream_session`` short-circuits to the cache whenever an
+# entry exists — membership only, no liveness — so the stall retry got
+# the SAME dead session back and every call failed with
+# ``anyio.ClosedResourceError`` until the idle sweep evicted it 31
+# minutes later. The recovery contract pinned here: a transport stall
+# on an OAuth session evicts it, so the retry (or, for non-idempotent
+# tools, the next call) reconnects from stored tokens.
+
+
+def make_dead_session() -> AsyncMock:
+    """A cached session whose transport is gone — ``call_tool`` raises
+    the exact exception the prod incident produced."""
+    session = AsyncMock()
+    session.call_tool = AsyncMock(side_effect=anyio.ClosedResourceError())
+    return session
+
+
+def make_real_dead_client_session() -> ClientSession:
+    """A REAL ``mcp.ClientSession`` over genuinely closed anyio memory
+    streams — not a mock raising the exception we assume. ``call_tool``
+    must die inside ``send_request``'s write exactly like prod
+    (``anyio.streams.memory.send_nowait`` → ``ClosedResourceError``)."""
+    client_to_server_send, _ = anyio.create_memory_object_stream[Any](10)
+    _, server_to_client_recv = anyio.create_memory_object_stream[Any](10)
+    session = ClientSession(server_to_client_recv, client_to_server_send)
+    client_to_server_send.close()
+    return session
+
+
+def install_session(
+    client_manager: UpstreamClientManager,
+    user_id: str,
+    upstream_id: str,
+    session: Any,
+) -> None:
+    key = (user_id, upstream_id)
+    client_manager._user_sessions[key] = session
+    client_manager._user_session_last_used[key] = 0.0
+
+
+def install_fake_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    client_manager: UpstreamClientManager,
+    upstream_id: str,
+    session_factory: Callable[[], Any],
+) -> list[str]:
+    """Patch ``reconnect_with_stored_tokens`` to act like a successful
+    stored-token reconnect: install a fresh session for the effective
+    user. Returns the list of effective users it was called with."""
+    reconnects: list[str] = []
+
+    async def fake_reconnect(**kwargs: Any) -> DisconnectReason | None:
+        effective_user = kwargs["effective_user"]
+        reconnects.append(effective_user)
+        install_session(
+            client_manager, effective_user, upstream_id, session_factory(),
+        )
+        return None
+
+    monkeypatch.setattr(
+        ucs_module, "reconnect_with_stored_tokens", fake_reconnect
+    )
+    return reconnects
+
+
+@pytest.mark.asyncio
+async def test_per_user_oauth_stall_evicts_dead_session_and_retry_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prod incident, replayed: dead cached session + idempotent
+    tool. The stall must evict the dead session so the in-call retry
+    reconnects from stored tokens and returns the real result — not the
+    opaque error antoine got."""
+    router, client_manager, _ = make_oauth_tool_router(
+        tmp_path, auth_mode=AuthMode.per_user_oauth,
+        annotations=ToolAnnotations(idempotentHint=True),
+    )
+    install_session(client_manager, "alice@co.com", "slack", make_dead_session())
+    fresh_session = make_mock_session()
+    reconnects = install_fake_reconnect(
+        monkeypatch, client_manager, "slack", lambda: fresh_session,
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID,
+        prefixed_name="slack__send_message",
+        arguments={"text": "hi"},
+        user_id="alice@co.com",
+        session_id=None,
+    )
+
+    assert not result.isError, "retry must land on a fresh transport"
+    assert reconnects == ["alice@co.com"]
+    fresh_session.call_tool.assert_awaited_once_with(
+        "send_message", {"text": "hi"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_per_user_oauth_stall_recovery_with_real_closed_streams(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same as above but the dead session is a REAL ClientSession over
+    closed anyio memory streams — pins recovery against the genuine
+    SDK/anyio failure path rather than a mocked exception."""
+    router, client_manager, _ = make_oauth_tool_router(
+        tmp_path, auth_mode=AuthMode.per_user_oauth,
+        annotations=ToolAnnotations(readOnlyHint=True),
+    )
+    install_session(
+        client_manager, "alice@co.com", "slack",
+        make_real_dead_client_session(),
+    )
+    fresh_session = make_mock_session()
+    reconnects = install_fake_reconnect(
+        monkeypatch, client_manager, "slack", lambda: fresh_session,
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID,
+        prefixed_name="slack__send_message",
+        arguments={},
+        user_id="alice@co.com",
+        session_id=None,
+    )
+
+    assert not result.isError
+    assert reconnects == ["alice@co.com"]
+    fresh_session.call_tool.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_per_user_oauth_non_idempotent_stall_heals_for_next_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-idempotent tool must NOT be retried in-call (it may have
+    side effects) — the caller gets the opaque error — but the dead
+    session must still be evicted so the user's NEXT call reconnects
+    and succeeds instead of inheriting the poisoned session for the
+    rest of the idle-sweep window."""
+    router, client_manager, _ = make_oauth_tool_router(
+        tmp_path, auth_mode=AuthMode.per_user_oauth,
+        annotations=None,
+    )
+    dead_session = make_dead_session()
+    install_session(client_manager, "alice@co.com", "slack", dead_session)
+    fresh_session = make_mock_session()
+    reconnects = install_fake_reconnect(
+        monkeypatch, client_manager, "slack", lambda: fresh_session,
+    )
+
+    first = await router.route_call(
+        org_id=DEFAULT_ORG_ID,
+        prefixed_name="slack__send_message",
+        arguments={},
+        user_id="alice@co.com",
+        session_id=None,
+    )
+    assert first.isError, "non-idempotent stall is not retried in-call"
+    assert dead_session.call_tool.await_count == 1
+    assert not client_manager.has_user_session("slack", "alice@co.com") or (
+        client_manager._user_sessions[("alice@co.com", "slack")]
+        is not dead_session
+    ), "the dead session must be evicted on stall"
+
+    second = await router.route_call(
+        org_id=DEFAULT_ORG_ID,
+        prefixed_name="slack__send_message",
+        arguments={},
+        user_id="alice@co.com",
+        session_id=None,
+    )
+    assert not second.isError, "the next call must recover via reconnect"
+    assert reconnects == ["alice@co.com"]
+    fresh_session.call_tool.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_oauth_stall_evicts_owner_session_and_retry_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """admin_oauth: the session that stalls belongs to the pool owner,
+    not the caller — eviction + reconnect must be keyed by the owner's
+    email so a non-admin caller's retry rides the restored owner
+    session."""
+    from datetime import UTC, datetime
+
+    router, client_manager, connection_store = make_oauth_tool_router(
+        tmp_path, auth_mode=AuthMode.admin_oauth,
+        admin_emails=["admin@co.com"],
+        annotations=ToolAnnotations(idempotentHint=True),
+    )
+
+    async def _resolve_token(
+        org: str, user: str, upstream: str,
+    ) -> InternalOAuthToken | None:
+        if user == "admin@co.com":
+            return InternalOAuthToken(
+                access_token="x",
+                refresh_token=None,
+                expires_at=None,
+                scopes=[],
+                refresh_token_created_at=datetime.now(UTC),
+            )
+        return None
+
+    connection_store.get_user_token.side_effect = _resolve_token  # type: ignore[attr-defined]
+
+    install_session(client_manager, "admin@co.com", "slack", make_dead_session())
+    fresh_session = make_mock_session()
+    reconnects = install_fake_reconnect(
+        monkeypatch, client_manager, "slack", lambda: fresh_session,
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID,
+        prefixed_name="slack__send_message",
+        arguments={},
+        user_id="alice@co.com",  # non-admin caller
+        session_id=None,
+    )
+
+    assert not result.isError
+    assert reconnects == ["admin@co.com"], (
+        "eviction + reconnect must target the pool owner's session"
+    )
+    fresh_session.call_tool.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_per_user_oauth_ordinary_error_does_not_evict(
+    tmp_path: Path,
+) -> None:
+    """A normal server-side error (the transport answered — it is
+    fine) must NOT evict the session: evicting on every error would
+    turn each upstream hiccup into a reconnect storm."""
+    router, client_manager, _ = make_oauth_tool_router(
+        tmp_path, auth_mode=AuthMode.per_user_oauth,
+        annotations=ToolAnnotations(idempotentHint=True),
+    )
+    session = make_mock_session()
+    session.call_tool = AsyncMock(side_effect=RuntimeError("server said no"))
+    install_session(client_manager, "alice@co.com", "slack", session)
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID,
+        prefixed_name="slack__send_message",
+        arguments={},
+        user_id="alice@co.com",
+        session_id=None,
+    )
+
+    assert result.isError
+    assert (
+        client_manager._user_sessions[("alice@co.com", "slack")] is session
+    ), "an ordinary error must leave the cached session alone"
+    assert session.call_tool.await_count == 1, (
+        "an ordinary error must not be retried"
+    )
+
+
+@pytest.mark.asyncio
+async def test_per_user_oauth_stall_on_both_attempts_returns_opaque_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the reconnected session stalls too, the caller gets the
+    opaque correlation-id error (never a raw exception), and the
+    second dead session is evicted as well so a later call starts
+    clean."""
+    router, client_manager, _ = make_oauth_tool_router(
+        tmp_path, auth_mode=AuthMode.per_user_oauth,
+        annotations=ToolAnnotations(idempotentHint=True),
+    )
+    install_session(client_manager, "alice@co.com", "slack", make_dead_session())
+    reconnects = install_fake_reconnect(
+        monkeypatch, client_manager, "slack", make_dead_session,
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID,
+        prefixed_name="slack__send_message",
+        arguments={},
+        user_id="alice@co.com",
+        session_id=None,
+    )
+
+    assert result.isError
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "Upstream tool call failed" in text
+    assert "Reference:" in text
+    assert reconnects == ["alice@co.com"], "exactly one in-call retry"
+    assert not client_manager.has_user_session("slack", "alice@co.com"), (
+        "the second dead session must be evicted too"
+    )

@@ -66,6 +66,9 @@ internal/screenshots/hero-mcps.json
 # Symlink the prod-smoke wrapper creates to reach tests/e2e/node_modules
 # (the global node_modules/ rule is dir-only and misses this symlink).
 internal/scripts/node_modules
+# Same symlink for the screenshot-capture script (internal/screenshots/capture.mjs)
+internal/screenshots/node_modules
 
 # Playwright e2e run artifacts (traces, screenshots, error-context.md)
 tests/e2e/test-results/
+.firecrawl/

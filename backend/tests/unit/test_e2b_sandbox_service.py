@@ -1994,3 +1994,111 @@ async def test_poll_docker_ready_stable_from_the_start() -> None:
 
     assert attempts == 3
     assert handle.info_calls == 3
+
+
+class _ScriptedDaemonStartHandle:
+    """Sandbox-handle stand-in for the full ``_start_docker_daemon`` flow.
+
+    Classifies each ``run_command`` by its argv into a label, records the
+    label sequence for assertions, and scripts the exit codes of the
+    ``docker info`` probes and the boot-daemon-pending probe."""
+
+    def __init__(
+        self, *, info_exit_codes: list[int], pending_exit_code: int,
+    ) -> None:
+        self._info_codes = list(info_exit_codes)
+        self._pending_code = pending_exit_code
+        self.calls: list[str] = []
+
+    def _classify(self, argv: list[str]) -> tuple[str, int]:
+        joined = " ".join(argv)
+        if argv[:2] == ["docker", "info"]:
+            idx = sum(1 for c in self.calls if c == "info")
+            code = (
+                self._info_codes[idx]
+                if idx < len(self._info_codes) else 1
+            )
+            return "info", code
+        if "pgrep -x dockerd" in joined:
+            return "pending_probe", self._pending_code
+        if "systemctl stop" in joined:
+            return "stop_engine", 0
+        if "nohup sudo dockerd" in joined:
+            return "launch", 0
+        if argv[:2] == ["sudo", "chmod"]:
+            return "chmod", 0
+        if "[ -S /var/run/docker.sock ]" in joined:
+            return "chmod_early", 0
+        if argv[:1] == ["cat"]:
+            return "read_log", 0
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    async def run_command(
+        self,
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        on_stdout: Callable[[bytes], Awaitable[None] | None],
+        on_stderr: Callable[[bytes], Awaitable[None] | None],
+    ) -> _ScriptedDockerProc:
+        label, code = self._classify(argv)
+        self.calls.append(label)
+        return _ScriptedDockerProc(code)
+
+
+@pytest.mark.asyncio
+async def test_start_docker_daemon_already_serving_skips_launch() -> None:
+    # Daemon answers the very first probe (boot-managed dockerd is up):
+    # nothing gets stopped or launched, only the socket perms are fixed.
+    service, _client = make_e2b_service()
+    handle = _ScriptedDaemonStartHandle(
+        info_exit_codes=[0], pending_exit_code=1,
+    )
+
+    await service._start_docker_daemon(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, handle),
+    )
+
+    assert "launch" not in handle.calls
+    assert "stop_engine" not in handle.calls
+    assert handle.calls[-1] == "chmod"
+
+
+@pytest.mark.asyncio
+async def test_start_docker_daemon_adopts_pending_boot_daemon() -> None:
+    # Not serving yet, but a boot-managed daemon is mid-startup (pending
+    # probe exits 0). The method must ADOPT it — poll until stable — and
+    # never launch a competing dockerd (which would unlink the systemd
+    # socket path and die on the volume-store flock).
+    service, _client = make_e2b_service()
+    handle = _ScriptedDaemonStartHandle(
+        info_exit_codes=[1, 0, 0, 0], pending_exit_code=0,
+    )
+
+    await service._start_docker_daemon(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, handle),
+    )
+
+    assert "launch" not in handle.calls
+    assert "stop_engine" not in handle.calls
+    assert handle.calls[-1] == "chmod"
+    assert sum(1 for c in handle.calls if c == "info") == 4
+
+
+@pytest.mark.asyncio
+async def test_start_docker_daemon_stops_engine_before_manual_launch() -> None:
+    # No daemon serving and none pending: the systemd engine must be
+    # stopped (freeing the flock + socket path) BEFORE the manual launch.
+    service, _client = make_e2b_service()
+    handle = _ScriptedDaemonStartHandle(
+        info_exit_codes=[1, 0, 0, 0], pending_exit_code=1,
+    )
+
+    await service._start_docker_daemon(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, handle),
+    )
+
+    assert "stop_engine" in handle.calls
+    assert "launch" in handle.calls
+    assert handle.calls.index("stop_engine") < handle.calls.index("launch")
+    assert handle.calls[-1] == "chmod"

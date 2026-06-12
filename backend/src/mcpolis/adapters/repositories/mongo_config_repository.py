@@ -219,6 +219,13 @@ class MongoConfigRepository(ConfigRepository):
                 raise ValueError(
                     f"Cannot delete role '{name}': {len(users_with_role)} user(s) assigned"
                 )
+            if len(config.roles) == 1:
+                # A zero-roles org denies every identity (PolicyEngine
+                # fails closed), so reaching that state is never what
+                # an admin wants — refuse rather than brick the org.
+                raise ValueError(
+                    f"Cannot delete role '{name}': an org must keep at least one role"
+                )
             del config.roles[name]
             await self._write(org_id, config)
             return config

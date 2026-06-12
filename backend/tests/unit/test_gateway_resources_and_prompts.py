@@ -42,6 +42,7 @@ from mcpolis.domain.ports.organization_repository import (
 from mcpolis.domain.services.org_runtime import OrgRuntime, OrgRuntimeManager
 from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
+from tests.unit.factories import make_full_access_config
 from mcpolis.domain.services.uri_wrapping import (
     unwrap_resource_uri,
     wrap_resource_uri,
@@ -145,9 +146,17 @@ def make_runtime_for_org(
             )
             for p in prompts
         ])
+    # Seed a full-access role for both identities these tests run
+    # as: alice (multi-org auth context) and "anonymous" (single-org
+    # tests with no auth context). PolicyEngine fails closed on zero
+    # roles, so an empty config would hide every resource / prompt.
+    policy_config = make_full_access_config(
+        [uid for uid, _, _ in upstream_specs],
+        ["alice@test.com", "anonymous"],
+    )
     return OrgRuntime(
         org_id=org_id,
-        policy_engine=PolicyEngine(SettingsConfig()),
+        policy_engine=PolicyEngine(policy_config),
         tool_registry=registry,
         client_manager=cm,
         tool_router=MagicMock(),

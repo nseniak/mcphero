@@ -15,5 +15,6 @@ If you're brand new, start with **Getting started**. If you know what you're loo
 - **[Running your own MCP code](your-own-mcp-code.md)** — distributing an MCP server you wrote yourself, as a public package or as a private package with a registry credential, plus when to host it as an HTTP MCP instead.
 - **[Team](team.md)** — inviting members, changing roles, removing members.
 - **[Roles and permissions](roles-and-permissions.md)** — the access model: roles, per-MCP and per-tool access, argument checks.
+- **[Service tokens](service-tokens.md)** — connecting headless agents (CI jobs, bots, server-side AI agents) to the gateway with a revocable bearer token bound to a role.
 - **[Audit log](audit-log.md)** — what gets logged, and how to search it.
 - **[Admin MCP](admin-mcp.md)** — managing MCP Hero conversationally from your AI assistant.

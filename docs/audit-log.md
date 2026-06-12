@@ -13,7 +13,7 @@ Denied tool calls are logged too — the policy check happens before the call is
 
 The page shows the most recent entries first, capped at 100 per view. Filter using the controls at the top of the page:
 
-- **User** — autocompleted from emails seen in the log. Shows only entries triggered by that member.
+- **User** — autocompleted from identities seen in the log. Shows only entries triggered by that member. Calls made with a [service token](service-tokens.md) appear here as `svc:<name>` (e.g. `svc:ci-bot`) and can be filtered the same way.
 - **MCP** — autocompleted from upstream MCP IDs. Shows only entries against that upstream.
 - **Tool** — free-text. Substring match against the full tool name (e.g. typing `query` matches `mixpanel__query_events` and `database__run_query`).
 - **Action** — dropdown:

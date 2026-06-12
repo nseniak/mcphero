@@ -178,6 +178,30 @@ class RoleSummary(BaseModel):
     is_admin: bool
     is_default: bool
     user_count: int
+    service_token_count: int = 0
+
+
+# --- Service tokens ---
+
+
+class ServiceTokenInfo(BaseModel):
+    label: str
+    role: str
+    created_by: str
+    created_at: str
+    last_used_at: str | None = None
+
+
+class ServiceTokenCreateRequest(BaseModel):
+    label: str
+    role: str
+
+
+class ServiceTokenCreateResponse(BaseModel):
+    # The raw token — returned exactly once, at mint time. Every
+    # other surface (list, registry, logs) only ever sees the hash.
+    token: str
+    info: ServiceTokenInfo
 
 
 # --- Per-viewer /my-tools listing ---

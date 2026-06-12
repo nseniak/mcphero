@@ -22,6 +22,7 @@ const adminLinks: { path: string; labelKey: TranslationKey; icon: IconComponent 
   { path: "/admin/upstream", labelKey: "sidebar.teamMcps", icon: McpIcon },
   { path: "/admin/gateway", labelKey: "sidebar.gateway", icon: Radio },
   { path: "/admin/team", labelKey: "sidebar.team", icon: Users },
+  { path: "/admin/service-tokens", labelKey: "sidebar.serviceTokens", icon: KeyRound },
   { path: "/admin/permissions", labelKey: "sidebar.access", icon: Shield },
   { path: "/admin/audit", labelKey: "sidebar.auditLog", icon: ScrollText },
   { path: "/admin/admin-mcp", labelKey: "sidebar.adminMcp", icon: Terminal },

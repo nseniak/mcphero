@@ -52,6 +52,7 @@ from mcpolis.dev.demo_mcp_server import (
     build_demo_app,
 )
 from mcpolis.domain.model.policy import AuthMode, UpstreamAuthConfig
+from mcpolis.domain.model.service_token import SVC_IDENTITY_PREFIX
 from mcpolis.domain.model.settings import OAuthAppsConfig
 from mcpolis.domain.model.upstream import (
     HttpTransportConfig,
@@ -65,6 +66,7 @@ from mcpolis.domain.services.org_runtime import OrgRuntimeManager
 from mcpolis.domain.services.plan_policy import PlanLimitExceeded
 from mcpolis.domain.services.org_service import OrgService as OrgServiceCls
 from mcpolis.domain.services.policy_notifier import PolicyNotifier
+from mcpolis.domain.services.service_token_service import ServiceTokenService
 from mcpolis.entrypoints.storage_factory import (
     StorageBundle,
     build_storage,
@@ -297,6 +299,7 @@ def _build_mcp_app_with_oauth(
     runtime_manager: OrgRuntimeManager,
     oauth_state_repo: OAuthStateRepository,
     org_service: OrgServiceCls,
+    service_token_service: ServiceTokenService,
     event_bus: EventStream | None = None,
     session_registry: GatewaySessionRegistry | None = None,
     audit_repo: LegacyAuditRepository | None = None,
@@ -309,6 +312,13 @@ def _build_mcp_app_with_oauth(
     from starlette.middleware.authentication import AuthenticationMiddleware
 
     from mcpolis.adapters.auth.mcp_gateway_oauth_provider import McpGatewayOAuthProvider
+    from mcpolis.adapters.auth.service_token_verifier import (
+        CompositeGatewayTokenVerifier,
+        ServiceTokenVerifier,
+    )
+    from mcpolis.entrypoints.middleware.service_token_pin import (
+        ServiceTokenOrgPinMiddleware,
+    )
     from mcpolis.entrypoints.routes.google_callback import create_google_callback_route
 
     # Gateway OAuth issuer + Google callback live under the gateway's
@@ -334,13 +344,26 @@ def _build_mcp_app_with_oauth(
             raw_mcp_app, session_registry, session_manager, audit_repo=audit_repo,
         )
 
-    # Auth middleware
+    # Auth middleware. The composite verifier dispatches svct_-prefixed
+    # bearers to the service-token registry and everything else to the
+    # OAuth provider; the OAuth routes below keep the raw provider.
     middleware = [
         Middleware(
             AuthenticationMiddleware,
-            backend=BearerAuthBackend(provider),
+            backend=BearerAuthBackend(
+                CompositeGatewayTokenVerifier(
+                    ServiceTokenVerifier(service_token_service),
+                    provider,
+                ),
+            ),
         ),
         Middleware(AuthContextMiddleware),
+        # Org pinning for service tokens. Ordering is load-bearing:
+        # after AuthContextMiddleware (reads auth_context_var), before
+        # the log binder (logs must carry the pinned org, not the
+        # multi-org sentinel) and before the orgs-prefetch middleware
+        # (list_user_orgs must never run for ``svc:`` identities).
+        Middleware(ServiceTokenOrgPinMiddleware),
         # Bind ``user_id`` / ``session_id`` / ``org_id`` into structlog
         # contextvars so every log line emitted during the request —
         # including stdlib SDK / httpx / uvicorn.access — carries them.
@@ -517,6 +540,15 @@ def _build_admin_app_with_oauth(
                 {"error": "Not authenticated"}, status_code=401
             )
         user_email = auth_user.display_name
+        # Belt-and-braces: service tokens are structurally rejected on
+        # /admin-mcp (this app wraps the raw OAuth provider, so a
+        # svct_ bearer never authenticates), but guard explicitly in
+        # case the verifier wiring ever changes.
+        if user_email.startswith(SVC_IDENTITY_PREFIX):
+            return JSONResponse(
+                {"error": "Service tokens are not accepted on the admin MCP"},
+                status_code=403,
+            )
         org_id = current_org_id.get()
         org_runtime = await runtime_manager.get(org_id)
         if not org_runtime.policy_engine.is_admin(user_email):
@@ -965,6 +997,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     org_service = OrgServiceCls(
         org_repo=storage.organization_repo,
         config_repo=storage.config_repo,
+        service_token_repo=storage.service_token_repo,
     )
 
     # Create low-level MCP server (gateway)
@@ -1018,10 +1051,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # The dashboard browser-login path is decoupled — see
     # ``effective_dashboard_provider`` / ``dashboard_oauth_provider``
     # below.
+    service_token_service = ServiceTokenService(storage.service_token_repo)
+
     mcp_app = _build_mcp_app_with_oauth(
         session_manager, settings, runtime_manager,
         storage.oauth_state_repo,
         org_service=org_service,
+        service_token_service=service_token_service,
         event_bus=event_bus, session_registry=session_registry,
         audit_repo=audit_repo,
     )
@@ -1043,6 +1079,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         terminate_gateway_sessions=policy_notifier.terminate_user_sessions,
         allow_stdio_mcp=settings.allow_stdio_mcp,
         org_repo=storage.organization_repo,
+        service_token_service=service_token_service,
     )
     admin_mcp_starlette = admin_mcp.streamable_http_app()
 
@@ -1894,6 +1931,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         is_cloud_mode=settings.mode == "cloud",
         template_var_repo=storage.template_var_repo,
         sandbox_file_repo=storage.sandbox_file_repo,
+        service_token_service=service_token_service,
     )
     app.include_router(dashboard_api_router)
 

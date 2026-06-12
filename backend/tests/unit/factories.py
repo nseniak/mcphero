@@ -14,10 +14,22 @@ from mcpolis.adapters.repositories.file_connection_store import (
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
 from mcpolis.domain.model.audit import AuditEntry
 from mcpolis.domain.model.policy import AuthMode, UpstreamAuthConfig
+from mcpolis.domain.model.service_token import (
+    ServiceTokenRecord,
+    hash_service_token,
+)
+from mcpolis.domain.model.settings import (
+    McpAccessConfig,
+    RoleDefinition,
+    RoleSettings,
+    SettingsConfig,
+    UserDefinition,
+)
 from mcpolis.domain.model.upstream import (
     DiscoveredTool,
     HttpTransportConfig,
     StdioTransportConfig,
+    ToolAnnotations,
     TransportType,
     UpstreamDefinition,
 )
@@ -87,6 +99,7 @@ def make_discovered_tool(
     original_name: str = "do_thing",
     description: str = "Does a thing",
     input_schema: dict[str, Any] | None = None,
+    annotations: ToolAnnotations | None = None,
 ) -> DiscoveredTool:
     return DiscoveredTool(
         upstream_id=upstream_id,
@@ -94,6 +107,34 @@ def make_discovered_tool(
         prefixed_name=f"{upstream_id}__{original_name}",
         description=description,
         input_schema=input_schema or {"type": "object", "properties": {}},
+        annotations=annotations,
+    )
+
+
+def make_full_access_config(
+    upstream_ids: list[str],
+    user_emails: list[str],
+    role_name: str = "default",
+) -> SettingsConfig:
+    """Config granting *user_emails* one role with access to every
+    upstream in *upstream_ids*.
+
+    PolicyEngine has no permissive fallback (zero roles = zero
+    tools), so gateway-plumbing tests that don't exercise policy
+    must seed a role like this rather than an empty config.
+    """
+    return SettingsConfig(
+        roles={
+            role_name: RoleDefinition(
+                is_default=True,
+                settings=RoleSettings(
+                    mcp_access=McpAccessConfig(
+                        mcps={uid: True for uid in upstream_ids},
+                    ),
+                ),
+            ),
+        },
+        users={email: UserDefinition(role=role_name) for email in user_emails},
     )
 
 
@@ -270,6 +311,26 @@ def make_refresh_failure_signature(
         error_code=error_code,
         timestamp=timestamp or datetime.now(UTC),
     )
+
+
+def make_service_token_record(
+    label: str = "test-bot",
+    org_id: str = DEFAULT_ORG_ID,
+    role_name: str = "user",
+    raw_token: str = "svct_test-raw-token",
+    **kwargs: Any,
+) -> ServiceTokenRecord:
+    defaults: dict[str, Any] = {
+        "token_hash": hash_service_token(raw_token),
+        "org_id": org_id,
+        "label": label,
+        "role_name": role_name,
+        "created_by": "admin@example.com",
+        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "last_used_at": None,
+    }
+    defaults.update(kwargs)
+    return ServiceTokenRecord(**defaults)
 
 
 def make_audit_entry(

@@ -35,8 +35,20 @@ def resolve_settings(config: SettingsConfig, email: str) -> ResolvedSettings:
     user_def = config.users.get(email)
     if user_def is None:
         return _EMPTY
+    return resolve_settings_for_role(config, user_def.role)
 
-    role_def = config.roles.get(user_def.role)
+
+def resolve_settings_for_role(
+    config: SettingsConfig, role_name: str
+) -> ResolvedSettings:
+    """Resolve effective settings for a role known a priori.
+
+    Used for identities whose role is established at the auth
+    boundary (service tokens) instead of via ``config.users``. An
+    unknown role — e.g. deleted after a token was minted — fails
+    closed with the same ``_EMPTY`` sentinel a role-less user gets.
+    """
+    role_def = config.roles.get(role_name)
     if role_def is None:
         return _EMPTY
 
@@ -46,6 +58,6 @@ def resolve_settings(config: SettingsConfig, email: str) -> ResolvedSettings:
         tool_access=s.tool_access,
         default_arguments=s.default_arguments,
         argument_constraints=s.argument_constraints,
-        role_name=user_def.role,
+        role_name=role_name,
         is_admin=role_def.is_admin,
     )

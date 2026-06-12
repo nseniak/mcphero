@@ -56,7 +56,7 @@ def create_upstream_user_router(deps: DashboardDeps) -> APIRouter:
 
         results: list[UserMcpInfo] = []
         for u in upstreams:
-            if allowed is not None and u.id not in allowed:
+            if u.id not in allowed:
                 continue
 
             # ``ready`` is the org-level "an admin has authenticated /

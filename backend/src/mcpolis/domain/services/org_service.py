@@ -25,6 +25,7 @@ from mcpolis.domain.ports import (
     Membership,
     Organization,
     OrganizationRepository,
+    ServiceTokenRepository,
 )
 from mcpolis.domain.services.settings_resolver import resolve_settings
 
@@ -104,9 +105,11 @@ class OrgService:
         self,
         org_repo: OrganizationRepository,
         config_repo: ConfigRepository,
+        service_token_repo: ServiceTokenRepository | None = None,
     ) -> None:
         self._org_repo = org_repo
         self._config_repo = config_repo
+        self._service_token_repo = service_token_repo
 
     # --- Creation ---
 
@@ -269,9 +272,22 @@ class OrgService:
         return await self._org_repo.list_memberships(org_id)
 
     async def delete_organization(self, org_id: str) -> None:
-        """Delete an organization and all its memberships."""
+        """Delete an organization, its memberships, and its service tokens.
+
+        The token cascade matters: service tokens bypass membership
+        gating (they carry their org in the credential), so a token
+        surviving its org would keep working through the gateway's
+        org-pin path and be unrevocable — the org's dashboard no
+        longer exists.
+        """
         await self._org_repo.delete_organization(org_id)
+        revoked_tokens = 0
+        if self._service_token_repo is not None:
+            revoked_tokens = await self._service_token_repo.delete_for_org(
+                org_id,
+            )
         logger.info(
             "org.deleted",
             org_id=org_id,
+            revoked_service_tokens=revoked_tokens,
         )

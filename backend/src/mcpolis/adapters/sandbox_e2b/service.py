@@ -110,6 +110,11 @@ _NPM_UV_LOG_DEFAULTS: dict[str, str] = {
 _DOCKER_POLL_INTERVAL = 0.5
 _DOCKER_MAX_POLLS = 120  # 120 × 0.5 s = 60 s budget
 _DOCKER_READY_CONSECUTIVE = 3
+# Budget for adopting a boot-managed daemon (systemd's docker.service,
+# which the template image enables): shorter than the manual-launch
+# budget — systemd brings dockerd up within seconds or it's wedged, and
+# the manual fallback below still gets the full budget afterwards.
+_DOCKER_ADOPT_MAX_POLLS = 60  # 60 × 0.5 s = 30 s budget
 
 
 class E2BSandboxService:
@@ -1058,24 +1063,37 @@ class E2BSandboxService:
         await self._persistence.upsert(ref)
 
     async def _start_docker_daemon(self, sandbox: E2BSandboxHandle) -> None:
-        """Start dockerd inside a docker-language sandbox and wait for it.
+        """Ensure a usable dockerd inside a docker-language sandbox.
 
-        docker-template sandboxes have the Docker engine installed but no
-        running daemon — we can't use E2B's ``set_start_cmd`` for this
-        because E2B validates the start command during the template BUILD in
-        an environment that already runs a Docker daemon (used to build the
-        template image itself). Our ``dockerd`` launch would fail with
-        "process with PID N is still running" and break the build.
+        The template image installs Docker via get.docker.com, which
+        enables ``docker.service`` / ``docker.socket``, and E2B sandboxes
+        boot with systemd as PID 1 — so a daemon is usually already
+        starting (or serving) when the session begins. The flow:
 
-        Starting the daemon here (after the sandbox boots) avoids that
-        constraint entirely. The flow:
-          1. Launch ``dockerd`` as a detached background process.
-          2. Poll ``docker info`` until the daemon answers (≤ 30 s).
-          3. ``chmod 666`` the unix socket so the non-root sandbox ``user``
-             (which E2B uses for ``commands.run``) can reach it without sudo.
+          1. If ``docker info`` already answers, just fix the socket perms.
+          2. If a boot-managed daemon is pending (dockerd process exists,
+             or the systemd units are active/activating), ADOPT it: poll
+             until it serves stably. Racing it with our own launch is
+             destructive — the second dockerd unlinks the systemd socket
+             path, then dies on the volume-store flock ("error while
+             opening volume store metadata database (…metadata.db):
+             timeout"), leaving Docker permanently unreachable in that
+             sandbox.
+          3. Otherwise (or if the boot-managed daemon never stabilizes),
+             stop the systemd engine + kill stragglers so nothing holds
+             the flock or the socket path, launch our own ``dockerd`` as
+             a detached background process, and poll it ready.
+          4. ``chmod 666`` the unix socket so the non-root sandbox
+             ``user`` (which E2B uses for ``commands.run``) can reach it
+             without sudo.
 
-        Raises ``TimeoutError`` if the daemon doesn't become ready within
-        the budget — the caller treats this as a session creation failure.
+        (``set_start_cmd`` is not an option for this: E2B validates the
+        start command during the template BUILD in an environment that
+        already runs a Docker daemon, so a ``dockerd`` start command
+        fails the build with "process with PID N is still running".)
+
+        Raises ``TimeoutError`` if no daemon becomes ready within the
+        budget — the caller treats this as a session creation failure.
         """
         async def _noop(_data: bytes) -> None:
             pass
@@ -1113,22 +1131,78 @@ class E2BSandboxService:
             check_code = 1
         if check_code == 0:
             logger.info("sandbox.e2b.docker.daemon_already_running")
+            await self._chmod_docker_socket(sandbox)
             return
 
-        # Daemon not running — launch it. Flags:
+        # Not serving yet — but a boot-managed daemon may be mid-startup
+        # (systemd's docker.service/docker.socket from the template
+        # image). If so, adopt it rather than racing it (see docstring).
+        pending = await sandbox.run_command(
+            [
+                "sh", "-c",
+                "pgrep -x dockerd >/dev/null 2>&1 && exit 0;"
+                " systemctl is-active docker.service docker.socket"
+                " 2>/dev/null | grep -qx -e active -e activating"
+                " && exit 0;"
+                " exit 1",
+            ],
+            env={},
+            on_stdout=_noop,
+            on_stderr=_noop,
+        )
+        try:
+            pending_code = await asyncio.wait_for(pending.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pending_code = 1
+        if pending_code == 0:
+            attempts = await self._poll_docker_ready(
+                sandbox, max_polls=_DOCKER_ADOPT_MAX_POLLS,
+            )
+            if attempts is not None:
+                logger.info(
+                    "sandbox.e2b.docker.daemon_adopted", attempts=attempts,
+                )
+                await self._chmod_docker_socket(sandbox)
+                return
+            logger.warning(
+                "sandbox.e2b.docker.boot_daemon_never_stabilized",
+                polled_seconds=_DOCKER_ADOPT_MAX_POLLS * _DOCKER_POLL_INTERVAL,
+            )
+
+        # No daemon coming up on its own (or the boot-managed one is
+        # wedged) — launch our own. First free the volume-store flock
+        # and the socket path: stop the systemd engine and kill any
+        # straggler dockerd.
+        stop = await sandbox.run_command(
+            [
+                "sh", "-c",
+                "sudo systemctl stop docker.socket docker.service"
+                " 2>/dev/null;"
+                " sudo pkill -x dockerd 2>/dev/null;"
+                " sleep 1;"
+                " sudo rm -f /var/run/docker.pid /var/run/docker.sock;"
+                " true",
+            ],
+            env={},
+            on_stdout=_noop,
+            on_stderr=_noop,
+        )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=20.0)
+        except asyncio.TimeoutError:
+            pass
+
+        # Launch flags:
         #   --iptables=false  — required in Firecracker microVMs where
         #                       the kernel may not expose iptables; MCP
         #                       containers still run fine with host-network.
         #   --bridge=none     — skip creating the docker0 bridge (also
         #                       needs iptables). stdio MCP containers use
         #                       ``docker run -i`` only, no network needed.
-        # Delete the stale PID file if one was left by a previous failed
-        # start (e.g. a template set_start_cmd that crashed mid-run).
         launch = await sandbox.run_command(
             [
                 "sh", "-c",
-                "sudo rm -f /var/run/docker.pid;"
-                " nohup sudo dockerd"
+                "nohup sudo dockerd"
                 " --iptables=false"
                 " --bridge=none"
                 " -H unix:///var/run/docker.sock"
@@ -1177,16 +1251,24 @@ class E2BSandboxService:
             attempts=attempts,
             required_consecutive=_DOCKER_READY_CONSECUTIVE,
         )
+        await self._chmod_docker_socket(sandbox)
 
-        # Make the socket world-writable so the MCP command can reach
-        # it without sudo. The socket lives inside the isolated microVM.
+    async def _chmod_docker_socket(self, sandbox: E2BSandboxHandle) -> None:
+        """Make the socket world-writable so the MCP command can reach it
+        without sudo. The socket lives inside the isolated microVM."""
+        async def _noop(_data: bytes) -> None:
+            pass
+
         chmod = await sandbox.run_command(
             ["sudo", "chmod", "666", "/var/run/docker.sock"],
             env={},
             on_stdout=_noop,
             on_stderr=_noop,
         )
-        await asyncio.wait_for(chmod.wait(), timeout=5.0)
+        try:
+            await asyncio.wait_for(chmod.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
 
     async def _poll_docker_ready(
         self,

@@ -153,13 +153,16 @@ async def test_docker_mcp_initialize_and_list_tools() -> None:
 
 @pytest.mark.asyncio
 async def test_docker_daemon_socket_accessible_without_sudo() -> None:
-    """Confirm the ``dockerd`` boot sequence left the socket accessible
+    """Confirm ``_start_docker_daemon`` leaves the socket accessible
     to the non-root sandbox user.
 
-    The docker template's start command chmods the socket to 666 once
-    ``dockerd`` creates it. Without that, ``docker run`` from the MCP
-    command (E2B runs it as a non-root ``user``) fails with "permission
-    denied on /var/run/docker.sock".
+    Runs the REAL ``E2BSandboxService._start_docker_daemon`` (not a
+    mirror — an earlier hand-copied version of this test drifted from
+    the adapter and masked the systemd-daemon race) against a raw
+    sandbox, then verifies ``docker info`` works without sudo. E2B runs
+    MCP commands as a non-root ``user``; without the chmod step,
+    ``docker run`` fails with "permission denied on
+    /var/run/docker.sock".
 
     Uses ``RealE2BClient`` directly against the docker template (same
     pattern as ``test_e2b_sandbox_service_real_sdk.py``) so we can run
@@ -169,6 +172,7 @@ async def test_docker_daemon_socket_accessible_without_sudo() -> None:
     """
     assert E2B_API_KEY is not None
     client = RealE2BClient(api_key=E2B_API_KEY)
+    service = make_test_service()
     # Use the smallest docker template at or above the recommended floor.
     template = "mcpolis-docker-cpu2-ram2048"
     sandbox_id: str | None = None
@@ -193,76 +197,15 @@ async def test_docker_daemon_socket_accessible_without_sudo() -> None:
         async def on_stderr(b: bytes) -> None:
             stderr_chunks.append(b)
 
-        # Mirror E2BSandboxService._start_docker_daemon:
-        # 1. chmod the socket if it already exists (template may have started
-        #    dockerd via set_start_cmd but left the socket root-only due to
-        #    a race with the ready probe).
-        chmod_early = await sandbox.run_command(
-            [
-                "sudo", "sh", "-c",
-                "[ -S /var/run/docker.sock ]"
-                " && chmod 666 /var/run/docker.sock || true",
-            ],
-            env={}, on_stdout=on_stdout, on_stderr=on_stderr,
+        # The exact daemon-bringup path docker MCP sessions use
+        # (adopt the boot-managed systemd daemon, or stop it and
+        # launch our own). Private-method access is deliberate: the
+        # test's subject IS this step.
+        await service._start_docker_daemon(  # pyright: ignore[reportPrivateUsage]
+            sandbox,
         )
-        try:
-            await asyncio.wait_for(chmod_early.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            pass
-
-        # 2. Check if daemon is now accessible.
-        info_check = await sandbox.run_command(
-            ["docker", "info"], env={},
-            on_stdout=on_stdout, on_stderr=on_stderr,
-        )
-        try:
-            check_code = await asyncio.wait_for(info_check.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            check_code = 1
-
-        if check_code != 0:
-            # 3. Daemon not running — delete stale PID file and start it.
-            start_proc = await sandbox.run_command(
-                [
-                    "sh", "-c",
-                    "sudo rm -f /var/run/docker.pid;"
-                    " nohup sudo dockerd --iptables=false --bridge=none"
-                    " -H unix:///var/run/docker.sock > /tmp/dockerd.log 2>&1 &",
-                ],
-                env={}, on_stdout=on_stdout, on_stderr=on_stderr,
-            )
-            await asyncio.wait_for(start_proc.wait(), timeout=10.0)
-
-            for _ in range(120):
-                info_proc = await sandbox.run_command(
-                    ["docker", "info"], env={},
-                    on_stdout=on_stdout, on_stderr=on_stderr,
-                )
-                try:
-                    ec = await asyncio.wait_for(info_proc.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    ec = 1
-                if ec == 0:
-                    break
-                await asyncio.sleep(0.5)
-            else:
-                log_proc = await sandbox.run_command(
-                    ["cat", "/tmp/dockerd.log"], env={},
-                    on_stdout=on_stdout, on_stderr=on_stderr,
-                )
-                await asyncio.wait_for(log_proc.wait(), timeout=5.0)
-                log = b"".join(stdout_chunks).decode("utf-8", errors="replace")
-                pytest.fail(f"dockerd did not start within 60s.\nLog:\n{log}")
-
-            chmod_proc = await sandbox.run_command(
-                ["sudo", "chmod", "666", "/var/run/docker.sock"],
-                env={}, on_stdout=on_stdout, on_stderr=on_stderr,
-            )
-            await asyncio.wait_for(chmod_proc.wait(), timeout=5.0)
 
         # Now verify socket is accessible without sudo.
-        stdout_chunks.clear()
-        stderr_chunks.clear()
         proc = await sandbox.run_command(
             ["docker", "info", "--format", "{{.ServerVersion}}"],
             env={},

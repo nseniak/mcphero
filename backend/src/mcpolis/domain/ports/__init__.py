@@ -16,6 +16,10 @@ from mcpolis.domain.ports.organization_repository import (
     OrganizationRepository,
 )
 from mcpolis.domain.ports.rate_limiter import RateLimiter, RateLimitResult
+from mcpolis.domain.ports.service_token_repository import (
+    DuplicateServiceTokenLabelError,
+    ServiceTokenRepository,
+)
 from mcpolis.domain.ports.tool_catalog_repository import (
     ToolCatalogRepository,
     ToolCatalogSnapshot,
@@ -45,6 +49,7 @@ __all__ = [
     "AuditRepository",
     "ConfigRepository",
     "ConnectionRepository",
+    "DuplicateServiceTokenLabelError",
     "EventStream",
     "Membership",
     "OAuthStateRepository",
@@ -53,6 +58,7 @@ __all__ = [
     "OrganizationRepository",
     "RateLimiter",
     "RateLimitResult",
+    "ServiceTokenRepository",
     "StoredAccessToken",
     "StoredRefreshToken",
     "ToolCatalogRepository",

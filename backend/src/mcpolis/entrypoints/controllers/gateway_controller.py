@@ -13,6 +13,9 @@ from mcp.server.models import InitializationOptions
 from mcp.types import ServerCapabilities
 from pydantic import AnyUrl
 
+from mcpolis.domain.model.service_token import (
+    boundary_role_from_auth_scopes,
+)
 from mcpolis.domain.model.upstream import (
     DiscoveredPrompt,
     DiscoveredResource,
@@ -258,6 +261,20 @@ def _get_current_user() -> str:
     if auth_user is not None:
         return auth_user.display_name
     return current_user_id.get()
+
+
+def _get_boundary_role() -> str | None:
+    """Role established at the auth boundary, or None for human auth.
+
+    Service tokens carry their minted role in the auth scopes (see
+    ``service_token_verifier``); their ``svc:<label>`` identity has no
+    ``config.users`` entry by design, so the policy engine must be
+    handed the role explicitly.
+    """
+    auth_user = auth_context_var.get(None)
+    if auth_user is None:
+        return None
+    return boundary_role_from_auth_scopes(auth_user.access_token.scopes)
 
 
 def create_mcp_server(
@@ -659,32 +676,35 @@ def _discovered_tools_for_user(runtime: OrgRuntime, user_id: str) -> list[Any]:
     """Apply policy filtering to a runtime's discovered tools."""
     tool_registry = runtime.tool_registry
     policy_engine = runtime.policy_engine
+    boundary_role = _get_boundary_role()
 
-    enabled_ids = tool_registry.get_upstream_ids()
-    allowed = policy_engine.get_allowed_upstreams(user_id)
-    if allowed is not None:
-        enabled_ids = [uid for uid in enabled_ids if uid in allowed]
+    allowed = policy_engine.get_allowed_upstreams(
+        user_id, boundary_role=boundary_role,
+    )
+    enabled_ids = [
+        uid for uid in tool_registry.get_upstream_ids() if uid in allowed
+    ]
 
     discovered = tool_registry.get_tools_for_upstreams(enabled_ids)
 
-    if not policy_engine.is_empty:
-        tool_triples = [
-            (
-                t.upstream_id,
-                t.original_name,
-                t.annotations.to_flags() if t.annotations else {},
-            )
-            for t in discovered
-        ]
-        allowed_set = {
-            (uid, name)
-            for uid, name, _ in policy_engine.filter_tools(user_id, tool_triples)
-        }
-        discovered = [
-            t for t in discovered
-            if (t.upstream_id, t.original_name) in allowed_set
-        ]
-    return discovered
+    tool_triples = [
+        (
+            t.upstream_id,
+            t.original_name,
+            t.annotations.to_flags() if t.annotations else {},
+        )
+        for t in discovered
+    ]
+    allowed_set = {
+        (uid, name)
+        for uid, name, _ in policy_engine.filter_tools(
+            user_id, tool_triples, boundary_role=boundary_role,
+        )
+    }
+    return [
+        t for t in discovered
+        if (t.upstream_id, t.original_name) in allowed_set
+    ]
 
 
 async def _call_tool_single_org(
@@ -909,12 +929,13 @@ def _check_upstream_and_tool_policy(
         return None
 
     target_upstream, tool_name = parts
+    boundary_role = _get_boundary_role()
 
     all_ids = tool_registry.get_upstream_ids()
-    allowed = policy_engine.get_allowed_upstreams(user_id)
-    enabled_ids = (
-        all_ids if allowed is None else [uid for uid in all_ids if uid in allowed]
+    allowed = policy_engine.get_allowed_upstreams(
+        user_id, boundary_role=boundary_role,
     )
+    enabled_ids = [uid for uid in all_ids if uid in allowed]
 
     if target_upstream not in enabled_ids:
         return _access_denied(
@@ -928,6 +949,7 @@ def _check_upstream_and_tool_policy(
     decision = policy_engine.decide_tool_call(
         user_id, target_upstream, tool_name, arguments,
         tool_annotations=tool_annotations,
+        boundary_role=boundary_role,
     )
     if not decision.allowed:
         return _access_denied(f"Access denied: {decision.reason}")
@@ -951,11 +973,13 @@ def _allowed_upstream_ids(runtime: OrgRuntime, user_id: str) -> list[str]:
     and prompts use the same gating: an upstream the user can't reach
     via tools shouldn't expose its resources / prompts either.
     """
-    enabled_ids = runtime.tool_registry.get_upstream_ids()
-    allowed = runtime.policy_engine.get_allowed_upstreams(user_id)
-    if allowed is not None:
-        enabled_ids = [uid for uid in enabled_ids if uid in allowed]
-    return enabled_ids
+    allowed = runtime.policy_engine.get_allowed_upstreams(
+        user_id, boundary_role=_get_boundary_role(),
+    )
+    return [
+        uid for uid in runtime.tool_registry.get_upstream_ids()
+        if uid in allowed
+    ]
 
 
 def _build_resource(

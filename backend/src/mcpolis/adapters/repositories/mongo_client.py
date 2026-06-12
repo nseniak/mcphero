@@ -53,6 +53,10 @@ COLL_TOOL_CATALOG = "tool_catalog"
 COLL_SANDBOX_REFS = "sandbox_refs"
 COLL_TEMPLATE_VARS = "mcp_template_vars"
 COLL_SANDBOX_FILES = "mcp_sandbox_files"
+# No ENCRYPTED_FIELDS entry: only the sha256 hash of the token is
+# stored (preimage-resistant over 256-bit random input), and the
+# metadata matches the sensitivity of ``config.users``.
+COLL_SERVICE_TOKENS = "service_tokens"
 
 # Per-collection encrypted field allowlist. Each list entry is a dotted
 # path inside a document. Anything not listed here is stored in plain
@@ -450,6 +454,19 @@ async def create_indexes(
         ],
         unique=True,
         name="uniq_org_upstream_name",
+    )
+
+    # Service tokens: hash is the global verify-path lookup key;
+    # (org_id, label) is the admin-facing identity key.
+    await db[COLL_SERVICE_TOKENS].create_index(
+        [("token_hash", ASCENDING)],
+        unique=True,
+        name="uniq_token_hash",
+    )
+    await db[COLL_SERVICE_TOKENS].create_index(
+        [("org_id", ASCENDING), ("label", ASCENDING)],
+        unique=True,
+        name="uniq_org_label",
     )
 
     logger.info("mongo.indexes.created")

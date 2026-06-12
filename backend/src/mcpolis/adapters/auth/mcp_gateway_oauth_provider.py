@@ -250,7 +250,14 @@ class McpGatewayOAuthProvider:
         Legacy / standalone (no OrgService): fall back to the
         runtime-policy check on the cached default-org runtime — the
         provider was previously constructed without an org service and
-        many tests rely on this path. Empty policy = open.
+        many tests rely on this path. Empty policy = open to
+        authenticate. This is deliberately NOT tied to the
+        PolicyEngine's access semantics (where zero roles now means
+        zero tools): this method gates who may complete the OAuth
+        flow, not what they can reach afterwards. An identity that
+        authenticates against an empty-policy runtime still resolves
+        to no role and gets an empty tool list, so the open
+        authentication grants no access.
         """
         if self._org_service is not None:
             orgs = await self._org_service.list_user_orgs(email)

@@ -250,6 +250,7 @@ export interface RoleSummary {
   is_admin: boolean;
   is_default: boolean;
   user_count: number;
+  service_token_count: number;
 }
 
 export interface McpAccessConfig {

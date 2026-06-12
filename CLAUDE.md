@@ -27,6 +27,17 @@ persistence formats or APIs. Don't add migration or compatibility
 shims for old data/config formats unless explicitly asked — prefer the
 clean change.
 
+Multiple agent sessions may work in this repo concurrently, and they
+share the git index. Before staging anything, check that
+`git diff --cached` is empty — staged content you didn't put there
+belongs to another session; stop and tell the operator instead of
+committing or unstaging it. Stage and commit as one uninterrupted
+step (no gates or long commands between `git add` and `git commit`),
+and re-verify `git log -1` immediately before amending or rewriting
+anything. (Learned 2026-06-12: two sessions raced the index and
+produced a union commit with a lost hunk; it took three repairs to
+untangle.)
+
 When a flow depends on the OAuth callback origin (or any other
 host-aware code path), drive Chrome / Playwright against the same
 origin the app is actually served on, so those paths see what a real
@@ -146,6 +157,35 @@ point it at the e2e test mongo instead (running whenever an
 e2e run hasn't been torn down with `--clean`).
 - Type check: `bash backend/run-pyright.sh src/ tests/`
 
+## Service tokens (gateway auth for headless agents)
+
+Non-interactive bearer credentials for the `/mcp` gateway: `svct_`-prefixed
+random secrets, sha256-hashed in the `service_tokens` registry
+(file-backed in standalone, plain Mongo collection in cloud — nothing
+secret at rest). Minted/revoked by org admins via
+`/api/admin/service-tokens` and the dashboard's Service Tokens page; the
+raw value is returned exactly once at mint.
+
+Key invariants:
+
+- The gateway's `BearerAuthBackend` wraps a composite verifier
+  (`adapters/auth/service_token_verifier.py`): `svct_` bearers go to the
+  registry, everything else to the OAuth provider. `/admin-mcp` keeps the
+  raw OAuth provider, so service tokens are structurally rejected there.
+- Identity is `svc:<label>` — **never** an entry in `config.users`, never
+  on the Team page, never a plan seat. The role is resolved at the auth
+  boundary: the verifier puts `mcpolis:role:<role>` / `mcpolis:org:<org>`
+  scopes on the AccessToken, and the gateway controller passes
+  `boundary_role` into the PolicyEngine calls. A deleted role fails
+  closed (zero tools).
+- Tokens are pinned to one org. `ServiceTokenOrgPinMiddleware` resolves
+  bare `/mcp` to the pinned org and 401s slug mismatches with the
+  anti-enumeration body.
+- Non-expiring + revocable; `last_used_at` updates are throttled to one
+  write per minute per token.
+
+User-facing doc: [docs/service-tokens.md](docs/service-tokens.md).
+
 ## Sandbox provider selection
 
 stdio MCPs run behind a `SandboxService` boundary with two backends:
@@ -168,9 +208,14 @@ Cloud-mode rules enforced by `validate_startup_secrets` in
   `local-subprocess` with a startup warning.
 
 The 24-template grid (node / python / docker × 8 CPU/RAM pairs) is in
-[runner/e2b-templates/](runner/e2b-templates/); docker templates start
-`dockerd` at sandbox boot via `set_start_cmd` so `command: docker` MCPs
-(`docker run -i …`) get a live daemon. Rebuild with
+[runner/e2b-templates/](runner/e2b-templates/); on docker templates,
+`command: docker` MCPs (`docker run -i …`) get a live daemon from
+`E2BSandboxService._start_docker_daemon`, which adopts the systemd-managed
+`dockerd` the image boots with (or stops it and launches its own —
+never both: a second dockerd dies on the volume-store flock and unlinks
+the socket path). `set_start_cmd` can't be used for this; see the note
+in [runner/e2b-templates/build_grid.py](runner/e2b-templates/build_grid.py).
+Rebuild with
 `cd runner/e2b-templates && make build` after any matrix edit, and keep
 [backend/src/mcpolis/adapters/sandbox_e2b/template_grid.py](backend/src/mcpolis/adapters/sandbox_e2b/template_grid.py)
 in sync (tests/test_e2b_template_grid.py guards drift).

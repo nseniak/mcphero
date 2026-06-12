@@ -61,22 +61,35 @@ LIST_PROMPTS_TIMEOUT = 15.0
 
 
 def is_transport_stall(exc: BaseException) -> bool:
-    """True when *exc* means "the session's transport is unusable", as
-    opposed to a normal server-side error response.
+    """True when *exc* means "the session is unusable", as opposed to a
+    normal server-side error response.
 
-    Recoverable by reconnecting on a fresh transport: a per-call timeout
-    (no response at all), a closed/broken in-memory stream, or the MCP
-    SDK's ``CONNECTION_CLOSED`` (read loop ended). A plain ``McpError``
-    with any other code means the server *answered* with an error — the
-    transport is fine, so we don't reconnect (and ``MethodNotFound`` for
-    an unsupported list method is swallowed as "empty" by the callers).
+    Recoverable by reconnecting on a fresh session: a per-call timeout
+    (no response at all), a closed/broken in-memory stream, the MCP
+    SDK's ``CONNECTION_CLOSED`` (read loop ended), or streamable HTTP's
+    "Session terminated" (the server no longer recognizes our session
+    id — e.g. it restarted — and 404s every request on it; the SDK
+    surfaces that as ``McpError`` code 32600). A plain ``McpError``
+    with any other code means the server *answered* with an error on a
+    session it still honors — the session is fine, so we don't
+    reconnect (and ``MethodNotFound`` for an unsupported list method is
+    swallowed as "empty" by the callers).
     """
     if isinstance(exc, asyncio.TimeoutError):
         return True
     if isinstance(exc, (anyio.BrokenResourceError, anyio.ClosedResourceError)):
         return True
     if isinstance(exc, McpError):
-        return exc.error.code == mcp_types.CONNECTION_CLOSED
+        if exc.error.code == mcp_types.CONNECTION_CLOSED:
+            return True
+        # The SDK hardcodes positive 32600 for session-terminated;
+        # accept the JSON-RPC negative spelling defensively, but pin
+        # the message so a server's own INVALID_REQUEST response (a
+        # normal answer) never triggers a reconnect.
+        return (
+            exc.error.code in (32600, -32600)
+            and exc.error.message == "Session terminated"
+        )
     return False
 
 

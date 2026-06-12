@@ -73,12 +73,18 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         user_counts: dict[str, int] = {}
         for user in config.users.values():
             user_counts[user.role] = user_counts.get(user.role, 0) + 1
+        token_counts: dict[str, int] = {}
+        if deps.service_token_service is not None:
+            token_counts = await deps.service_token_service.count_by_role(
+                org_id,
+            )
         return [
             RoleSummary(
                 name=name,
                 is_admin=role.is_admin,
                 is_default=role.is_default,
                 user_count=user_counts.get(name, 0),
+                service_token_count=token_counts.get(name, 0),
             )
             for name, role in config.roles.items()
         ]
@@ -358,6 +364,20 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
     async def delete_role(role_name: str) -> dict[str, str]:
         org_id = current_org_id.get()
         runtime = await deps.runtime_manager.get(org_id)
+        # Service-token guard: the policy store only knows about
+        # config.users; tokens reference roles from their own
+        # registry, so check here before touching the store.
+        if deps.service_token_service is not None:
+            token_counts = await deps.service_token_service.count_by_role(
+                org_id,
+            )
+            in_use = token_counts.get(role_name, 0)
+            if in_use:
+                raise HTTPException(
+                    400,
+                    f"Cannot delete role '{role_name}': {in_use} service "
+                    f"token(s) assigned",
+                )
         try:
             new_config = await deps.policy_store.delete_role(org_id, role_name)
         except ValueError as e:

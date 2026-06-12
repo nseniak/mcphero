@@ -1332,6 +1332,49 @@ async def acquire_upstream_session(
     raise SessionUnavailable(reason)
 
 
+async def heal_stalled_session(
+    *,
+    org_id: str,
+    upstream: UpstreamDefinition,
+    effective_user: str,
+    client_manager: UpstreamClientManager,
+) -> None:
+    """Drop the session whose transport just stalled, so the next
+    acquisition runs on a fresh transport.
+
+    - ``service_account``: drop the shared session and reconnect fresh
+      (the sandbox service fresh-creates rather than reattaching to the
+      same flaky sandbox).
+    - OAuth modes: evict the cached per-user session.
+      ``acquire_upstream_session`` short-circuits to the cache on
+      membership alone — no liveness check — so without eviction a
+      stall retry (and every later call) is handed the same dead
+      session until the idle sweep removes it. Prod incident
+      2026-06-12 (Sentry MCPOLIS-BACKEND-R/-S): a per-user mixpanel
+      session died during an idle gap and the user's calls failed with
+      ``ClosedResourceError`` for the rest of the sweep window.
+      After eviction the next acquisition falls through to
+      ``reconnect_with_stored_tokens`` (no browser interaction).
+    """
+    # Local import mirrors the existing deferral in this module to
+    # avoid a policy↔service cycle.
+    from mcpolis.domain.model.policy import AuthMode
+
+    if upstream.auth.mode == AuthMode.service_account:
+        await client_manager.reconnect_shared_fresh(upstream)
+        return
+    await client_manager.disconnect_user_session(
+        upstream.id, effective_user,
+    )
+    logger.info(
+        "upstream.session.stall_evicted",
+        org_id=org_id,
+        upstream_id=upstream.id,
+        user=effective_user,
+        auth_mode=upstream.auth.mode.value,
+    )
+
+
 async def acquire_and_refresh_with_recovery(
     *,
     org_id: str,
@@ -1350,19 +1393,16 @@ async def acquire_and_refresh_with_recovery(
     stdout stall (a ``commands.connect`` resume that delivers a response
     or two then goes silent). ``refresh_upstream`` raises a transport
     stall (timeout / connection-closed / broken stream) instead of
-    persisting a half-empty catalogue; here we drop the stalled session,
-    reconnect fresh (``reconnect_shared_fresh`` for service_account —
-    drops the live ref so the sandbox service fresh-creates rather than
-    reattaching to the same flaky sandbox), and retry. The operator gets
-    a complete tool/resource/prompt list instead of a partial one or a
-    30s hang.
+    persisting a half-empty catalogue; here we drop the stalled session
+    (``heal_stalled_session``: fresh shared reconnect for
+    service_account, per-user eviction for OAuth), and retry. The
+    operator gets a complete tool/resource/prompt list instead of a
+    partial one or a 30s hang.
 
     Non-stall failures (OAuth not configured, genuine server errors)
     propagate immediately — only a transport stall is retried, and only
     ``max_attempts`` times.
     """
-    from mcpolis.domain.model.policy import AuthMode
-
     last_exc: BaseException | None = None
     for attempt in range(max_attempts):
         await acquire_upstream_session(
@@ -1387,12 +1427,17 @@ async def acquire_and_refresh_with_recovery(
                 attempt=attempt,
                 error=str(exc) or exc.__class__.__name__,
             )
-            # Force a fresh transport for the next attempt. Only the
-            # shared (service_account) session rides the flaky E2B
-            # reattach; for OAuth the next ``acquire_upstream_session``
-            # above re-establishes the user session on its own.
-            if upstream.auth.mode == AuthMode.service_account:
-                await client_manager.reconnect_shared_fresh(upstream)
+            # Force a fresh transport for the next attempt. Dropping
+            # the stalled session is required for OAuth too:
+            # ``acquire_upstream_session`` above short-circuits to the
+            # cached per-user session, dead or not, so without eviction
+            # the retry would refresh over the same closed transport.
+            await heal_stalled_session(
+                org_id=org_id,
+                upstream=upstream,
+                effective_user=effective_user,
+                client_manager=client_manager,
+            )
     # Loop always returns or raises; this satisfies the type checker.
     assert last_exc is not None
     raise last_exc

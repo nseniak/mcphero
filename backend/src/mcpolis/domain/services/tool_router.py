@@ -23,6 +23,7 @@ from mcpolis.domain.services.tool_registry import ToolRegistry, is_transport_sta
 from mcpolis.domain.services.upstream_connection_service import (
     SessionUnavailable,
     acquire_upstream_session,
+    heal_stalled_session,
 )
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
@@ -181,26 +182,32 @@ class ToolRouter:
                     return result
                 except Exception as exc:
                     is_last = attempt + 1 >= max_attempts
-                    # The E2B post-reattach stdout stall poisons the shared
-                    # session: drop it so this retry (and every later call)
-                    # runs on a fresh transport. service_account only — OAuth
-                    # re-establishes from stored tokens on the next attempt.
-                    if (
-                        is_transport_stall(exc)
-                        and upstream.auth.mode == AuthMode.service_account
-                    ):
-                        await self._client_manager.reconnect_shared_fresh(
-                            upstream
-                        )
-                    if is_transport_stall(exc) and not is_last:
-                        logger.warning(
-                            "tool.call.transport_stall_retry",
+                    # A transport stall poisons the cached session (the
+                    # E2B post-reattach stdout stall for the shared
+                    # service_account session; an idle-closed HTTP
+                    # connection for a per-user OAuth session). Drop it
+                    # so this retry — and every later call — runs on a
+                    # fresh transport instead of inheriting the dead one
+                    # until the idle sweep. Healing happens even when
+                    # the tool isn't retry-safe (max_attempts == 1):
+                    # the current call still errors, but the next one
+                    # recovers.
+                    if is_transport_stall(exc):
+                        await heal_stalled_session(
                             org_id=org_id,
-                            upstream_id=upstream_id,
-                            tool=prefixed_name,
-                            attempt=attempt,
+                            upstream=upstream,
+                            effective_user=session_result.effective_user,
+                            client_manager=self._client_manager,
                         )
-                        continue
+                        if not is_last:
+                            logger.warning(
+                                "tool.call.transport_stall_retry",
+                                org_id=org_id,
+                                upstream_id=upstream_id,
+                                tool=prefixed_name,
+                                attempt=attempt,
+                            )
+                            continue
                     response_status = "error"
                     # Don't leak internal exception content (URLs, hostnames,
                     # stack detail, library versions) to MCP clients. Log the
@@ -512,21 +519,30 @@ class ToolRouter:
                 f"{upstream.auth.mode.value}:"
                 f"{upstream.id}:{effective_user}"
             ),
+            effective_user=effective_user,
         )
 
 
 class _SessionResult:
-    """Result of session resolution."""
+    """Result of session resolution.
+
+    ``effective_user`` is the per-user session key the session was
+    resolved under (the caller for per_user_oauth, the pool owner for
+    admin_oauth, ``""`` for service_account's shared session). The
+    stall-recovery path needs it to evict the right cached session.
+    """
 
     def __init__(
         self,
         session: Any | None = None,
         error: mcp_types.CallToolResult | None = None,
         auth_identity: str | None = None,
+        effective_user: str = "",
     ) -> None:
         self.session = session
         self.error = error
         self.auth_identity = auth_identity
+        self.effective_user = effective_user
 
 
 class UpstreamRouterError(Exception):

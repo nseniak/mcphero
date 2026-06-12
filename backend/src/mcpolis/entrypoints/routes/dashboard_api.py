@@ -29,6 +29,7 @@ from mcpolis.domain.ports.sandbox_file_repository import SandboxFileRepository
 from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
 from mcpolis.domain.ports.organization_repository import OrganizationRepository
 from mcpolis.domain.services.org_runtime import OrgRuntimeManager
+from mcpolis.domain.services.service_token_service import ServiceTokenService
 from mcpolis.entrypoints.routes.dashboard._deps import DashboardDeps
 from mcpolis.entrypoints.routes.dashboard.audit import create_audit_router
 from mcpolis.entrypoints.routes.dashboard.auth_connect import (
@@ -54,6 +55,9 @@ from mcpolis.entrypoints.routes.dashboard.upstream_admin import (
 )
 from mcpolis.entrypoints.routes.dashboard.upstream_user import (
     create_upstream_user_router,
+)
+from mcpolis.entrypoints.routes.dashboard.service_tokens_admin import (
+    create_service_tokens_admin_router,
 )
 from mcpolis.entrypoints.routes.dashboard.users_admin import (
     create_users_admin_router,
@@ -87,11 +91,16 @@ def create_dashboard_api_router(
     template_var_repo: TemplateVarRepository | None = None,
     sandbox_file_repo: SandboxFileRepository | None = None,
     gateway_url: str | None = None,
+    service_token_service: ServiceTokenService | None = None,
 ) -> APIRouter:
     if template_var_repo is None:
         raise RuntimeError(
             "create_dashboard_api_router requires template_var_repo "
             "(per-MCP env-var store)"
+        )
+    if service_token_service is None:
+        raise RuntimeError(
+            "create_dashboard_api_router requires service_token_service"
         )
     deps = DashboardDeps(
         runtime_manager=runtime_manager,
@@ -114,6 +123,7 @@ def create_dashboard_api_router(
         is_cloud_mode=is_cloud_mode,
         template_var_repo=template_var_repo,
         sandbox_file_repo=sandbox_file_repo,
+        service_token_service=service_token_service,
     )
 
     combined = APIRouter()
@@ -128,6 +138,7 @@ def create_dashboard_api_router(
     combined.include_router(create_audit_router(deps))
     combined.include_router(create_roles_router(deps))
     combined.include_router(create_users_admin_router(deps))
+    combined.include_router(create_service_tokens_admin_router(deps))
     combined.include_router(create_gateway_admin_router(deps))
     # User-facing + auth + config + events.
     combined.include_router(create_upstream_user_router(deps))

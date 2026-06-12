@@ -49,6 +49,7 @@ from mcpolis.domain.ports.organization_repository import (
 )
 from mcpolis.domain.services.org_runtime import OrgRuntime, OrgRuntimeManager
 from mcpolis.domain.services.policy_engine import PolicyEngine
+from tests.unit.factories import make_full_access_config
 
 
 # ---------------------------------------------------------------------------
@@ -124,23 +125,19 @@ def make_membership(org_id: str, email: str, role: str = "default") -> Membershi
 def make_runtime_manager_with_orgs(
     orgs: list[tuple[str, list[str]]],
     *,
-    user_emails: dict[str, str] | None = None,
+    user_emails: list[str] | None = None,
 ) -> OrgRuntimeManager:
     """Build a runtime manager with one runtime per org.
 
     ``orgs`` is a list of (org_id, [upstream_ids]). Each runtime gets
     a stub tool_registry that returns a tool per upstream named
-    ``{upstream_id}__do_thing``. ``user_emails`` is unused today —
-    the per-runtime policy engine is initialized with an empty
-    ``SettingsConfig`` (permissive mode) so the test focuses on the
-    aggregation / routing behaviour, not policy filtering.
+    ``{upstream_id}__do_thing``. Each per-org policy engine is seeded
+    with a full-access role for ``user_emails`` (default: alice) —
+    PolicyEngine fails closed on zero roles, so plumbing tests need a
+    real grant. Policy filtering itself has dedicated tests; this
+    file is about multi-org aggregation / routing.
     """
-    del user_emails
-
-    # Empty config → ``policy_engine.is_empty`` is True → permissive
-    # mode (no per-tool / per-mcp filtering). Policy filtering itself
-    # has dedicated tests; this file is about multi-org plumbing.
-    config = SettingsConfig()
+    emails = user_emails if user_emails is not None else ["alice@test.com"]
 
     manager = OrgRuntimeManager(
         config_repo=MagicMock(),
@@ -186,7 +183,9 @@ def make_runtime_manager_with_orgs(
 
         runtime = OrgRuntime(
             org_id=org_id,
-            policy_engine=PolicyEngine(config),
+            policy_engine=PolicyEngine(
+                make_full_access_config(upstream_ids, emails),
+            ),
             tool_registry=tool_registry,
             client_manager=MagicMock(),
             tool_router=MagicMock(),

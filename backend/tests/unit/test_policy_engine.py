@@ -19,29 +19,81 @@ def make_config(
     return SettingsConfig(roles=roles or {}, users=users or {})
 
 
-# --- Empty policy (permissive mode) ---
+# --- Zero-roles org fails closed (no permissive mode) ---
+#
+# An org with zero configured roles must deny every identity, exactly
+# like a role-less user in a roled org. Org membership on /mcp/{slug}
+# is enforced by policy, so an allow-all fallback here would open a
+# zero-roles org to any authenticated user of the platform.
+
+SAMPLE_TOOLS: list[tuple[str, str, dict[str, bool]]] = [
+    ("github", "create_issue", {}),
+    ("slack", "send_message", {}),
+]
 
 
-def test_empty_policy_is_permissive() -> None:
+def test_zero_roles_denies_tool_call() -> None:
     engine = PolicyEngine(make_config())
     assert engine.is_empty
     decision = engine.decide_tool_call("anyone", "github", "create_issue", {})
-    assert decision.allowed
-    assert decision.reason == "no_policy_configured"
+    assert not decision.allowed
+    assert decision.reason == "user_not_in_any_role"
 
 
-def test_empty_policy_allows_all_upstreams() -> None:
+def test_zero_roles_allows_no_upstreams() -> None:
     engine = PolicyEngine(make_config())
-    assert engine.get_allowed_upstreams("anyone") is None
+    assert engine.get_allowed_upstreams("anyone") == set()
 
 
-def test_empty_policy_filter_tools_returns_all() -> None:
+def test_zero_roles_filter_tools_returns_nothing() -> None:
     engine = PolicyEngine(make_config())
-    tools: list[tuple[str, str, dict[str, bool]]] = [
-        ("github", "create_issue", {}),
-        ("slack", "send_message", {}),
-    ]
-    assert engine.filter_tools("anyone", tools) == tools
+    assert engine.filter_tools("anyone", SAMPLE_TOOLS) == []
+
+
+def test_zero_roles_denies_member_with_dangling_role() -> None:
+    """A user listed in config.users whose role no longer exists (the
+    state an org reaches when its admin deletes every role) fails
+    closed on all three entry points."""
+    engine = PolicyEngine(
+        make_config(users={"member@test.com": UserDefinition(role="ghost")})
+    )
+    assert engine.is_empty
+    assert engine.get_allowed_upstreams("member@test.com") == set()
+    assert engine.filter_tools("member@test.com", SAMPLE_TOOLS) == []
+    decision = engine.decide_tool_call(
+        "member@test.com", "github", "create_issue", {},
+    )
+    assert not decision.allowed
+
+
+def test_zero_roles_denies_cross_tenant_user() -> None:
+    """User who is a member of org A only, against org B with zero
+    roles: no tools, no upstreams. Regression for the permissive-mode
+    hole where org B would have been open to any authenticated user."""
+    org_a = PolicyEngine(
+        make_config(
+            roles={
+                "dev": RoleDefinition(
+                    settings=RoleSettings(
+                        mcp_access=McpAccessConfig(mcps={"github": True}),
+                    ),
+                ),
+            },
+            users={"alice@test.com": UserDefinition(role="dev")},
+        )
+    )
+    org_b = PolicyEngine(make_config())  # zero roles, alice not a member
+
+    # Sanity: alice has access in her own org.
+    assert org_a.get_allowed_upstreams("alice@test.com") == {"github"}
+
+    assert org_b.get_allowed_upstreams("alice@test.com") == set()
+    assert org_b.filter_tools("alice@test.com", SAMPLE_TOOLS) == []
+    decision = org_b.decide_tool_call(
+        "alice@test.com", "github", "create_issue", {},
+    )
+    assert not decision.allowed
+    assert decision.reason == "user_not_in_any_role"
 
 
 # --- User roles ---
@@ -645,3 +697,120 @@ def test_filter_tools_with_annotations() -> None:
     assert "query" in result_names
     assert "list_tables" in result_names
     assert "drop_table" not in result_names
+
+
+# --- Boundary role (service tokens) ---
+
+
+def make_boundary_config() -> SettingsConfig:
+    """Two roles, no svc identity in users (by design)."""
+    return make_config(
+        roles={
+            "user": RoleDefinition(
+                settings=RoleSettings(
+                    mcp_access=McpAccessConfig(
+                        mcps={"github": True, "db": True},
+                    ),
+                ),
+            ),
+            "reader": RoleDefinition(
+                settings=RoleSettings(
+                    mcp_access=McpAccessConfig(mcps={"db": True}),
+                    tool_access={"db": ToolAccessConfig(
+                        fallback_enabled=False,
+                        category_defaults={"readOnly": True},
+                    )},
+                ),
+            ),
+        },
+        users={"alice@test.com": UserDefinition(role="user")},
+    )
+
+
+def test_boundary_role_filters_tools_without_users_entry() -> None:
+    engine = PolicyEngine(make_boundary_config())
+    tools: list[tuple[str, str, dict[str, bool]]] = [
+        ("github", "create_issue", {}),
+        ("db", "query", {"readOnly": True}),
+    ]
+    # svc identity is NOT in config.users; the boundary role drives.
+    result = engine.filter_tools(
+        "svc:ci-bot", tools, boundary_role="user",
+    )
+    assert result == tools
+    # Without the boundary role the same identity gets nothing.
+    assert engine.filter_tools("svc:ci-bot", tools) == []
+
+
+def test_boundary_role_decide_tool_call_allows_and_denies_per_role() -> None:
+    engine = PolicyEngine(make_boundary_config())
+    allowed = engine.decide_tool_call(
+        "svc:ci-bot", "db", "query", {},
+        tool_annotations={"readOnly": True},
+        boundary_role="reader",
+    )
+    assert allowed.allowed
+    assert allowed.matched_role == "reader"
+
+    denied_tool = engine.decide_tool_call(
+        "svc:ci-bot", "db", "drop_table", {},
+        tool_annotations={"destructive": True},
+        boundary_role="reader",
+    )
+    assert not denied_tool.allowed
+
+    denied_mcp = engine.decide_tool_call(
+        "svc:ci-bot", "github", "create_issue", {},
+        boundary_role="reader",
+    )
+    assert not denied_mcp.allowed
+    assert "not allowed" in denied_mcp.reason
+
+
+def test_boundary_role_deleted_role_fails_closed() -> None:
+    engine = PolicyEngine(make_boundary_config())
+    assert engine.get_allowed_upstreams(
+        "svc:ci-bot", boundary_role="deleted-role",
+    ) == set()
+    decision = engine.decide_tool_call(
+        "svc:ci-bot", "db", "query", {}, boundary_role="deleted-role",
+    )
+    assert not decision.allowed
+    assert decision.reason == "user_not_in_any_role"
+
+
+def test_boundary_role_none_keeps_email_lookup_behavior() -> None:
+    engine = PolicyEngine(make_boundary_config())
+    upstreams = engine.get_allowed_upstreams("alice@test.com")
+    assert upstreams == {"github", "db"}
+    # Explicit None is the same as omitting the kwarg.
+    assert engine.get_allowed_upstreams(
+        "alice@test.com", boundary_role=None,
+    ) == {"github", "db"}
+
+
+def test_boundary_role_get_allowed_upstreams() -> None:
+    engine = PolicyEngine(make_boundary_config())
+    assert engine.get_allowed_upstreams(
+        "svc:ci-bot", boundary_role="reader",
+    ) == {"db"}
+
+
+def test_boundary_role_zero_roles_org_fails_closed() -> None:
+    """A service token's access is exactly its minted role, in every
+    org state — a zero-roles org denies it on all three entry points
+    (humans fail closed too; see the zero-roles section above)."""
+    engine = PolicyEngine(make_config())  # no roles, no users
+    assert engine.is_empty
+    assert engine.get_allowed_upstreams(
+        "svc:bot", boundary_role="ghost-role",
+    ) == set()
+    tools: list[tuple[str, str, dict[str, bool]]] = [("db", "query", {})]
+    assert engine.filter_tools(
+        "svc:bot", tools, boundary_role="ghost-role",
+    ) == []
+    decision = engine.decide_tool_call(
+        "svc:bot", "db", "query", {}, boundary_role="ghost-role",
+    )
+    assert not decision.allowed
+    assert decision.reason == "user_not_in_any_role"

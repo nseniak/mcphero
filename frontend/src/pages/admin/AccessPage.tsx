@@ -139,7 +139,9 @@ function RoleSettings({
 
   const summary = roleSummaries.find((r) => r.name === role.name);
   const userCount = summary?.user_count ?? 0;
-  const canDelete = userCount === 0 && !planBlocksDelete;
+  const serviceTokenCount = summary?.service_token_count ?? 0;
+  const canDelete =
+    userCount === 0 && serviceTokenCount === 0 && !planBlocksDelete;
   const sanitizedName = editName.toLowerCase().replace(/[^a-z0-9\-_.]/g, "");
   const nameConflict = sanitizedName !== role.name && allRoles.some((r) => r.name === sanitizedName);
   const canSave = !!sanitizedName && !nameConflict;
@@ -257,14 +259,23 @@ function RoleSettings({
               <TooltipContent>
                 {planBlocksDelete
                   ? "Free plans can't recreate a role after deleting it. Upgrade to Team to remove this restriction."
-                  : `Cannot delete: ${userCount} team member${userCount > 1 ? "s" : ""} assigned`}
+                  : `Cannot delete: ${[
+                      userCount > 0
+                        ? `${userCount} team member${userCount > 1 ? "s" : ""}`
+                        : null,
+                      serviceTokenCount > 0
+                        ? `${serviceTokenCount} service token${serviceTokenCount > 1 ? "s" : ""}`
+                        : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" and ")} assigned`}
               </TooltipContent>
             </Tooltip>
           )}
         </div>
       )}
 
-      {/* Team members */}
+      {/* Team members + service tokens */}
       <div className="text-sm space-y-2 mb-4">
         <div className="flex items-center gap-2">
           <span className="text-zinc-500">Assigned to:</span>
@@ -274,6 +285,19 @@ function RoleSettings({
           >
             {userCount === 1 ? "1 team member" : `${userCount} team members`}
           </Link>
+          {serviceTokenCount > 0 && (
+            <>
+              <span className="text-zinc-400">and</span>
+              <Link
+                to={`/orgs/${orgSlug}/admin/service-tokens`}
+                className="text-blue-500 hover:underline"
+              >
+                {serviceTokenCount === 1
+                  ? "1 service token"
+                  : `${serviceTokenCount} service tokens`}
+              </Link>
+            </>
+          )}
         </div>
       </div>
 

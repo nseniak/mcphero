@@ -28,6 +28,7 @@ MCP Hero is a self-hostable **gateway for [Model Context Protocol](https://model
 - **Per-user OAuth to upstreams** — each user authenticates to upstream servers as themselves; tokens are stored encrypted.
 - **Hosted stdio MCPs** — run `command:`-style stdio MCP servers in isolated sandboxes, not just remote HTTP ones.
 - **Audit logging** — every tool call is recorded.
+- **Service tokens for agents** — headless clients (CI jobs, bots, server-side AI agents) connect with a revocable bearer token bound to a least-privilege role, no browser sign-in needed.
 - **A web dashboard** — manage servers, roles, and users without touching config files.
 
 You can run it two ways, controlled by a couple of environment variables (see [below](#the-three-switches-that-decide-how-it-runs)): a zero-config **standalone** mode for a single person or team, or a multi-tenant **cloud** mode (what powers mcphero.io).
@@ -91,6 +92,33 @@ The default email picker (`dev_stub`) has no real login. To require Google sign-
 3. **Restart.** Logins now go through Google, and the returned email is matched to roles.
 
 The detailed walkthrough (and per-upstream OAuth) is in the [backend README](backend/README.md#google-oauth-setup).
+
+---
+
+## Connecting clients: humans and agents
+
+Two kinds of client connect to the gateway, and each has a first-class credential:
+
+### Human users — interactive Google sign-in
+
+A team member points their AI client (Claude, ChatGPT, Cursor, …) at the gateway URL shown on the dashboard's **Gateway MCP** page. The client walks through Google OAuth in the browser; the signed-in email is matched to the member's role, and the tools that role allows light up in their client. Tokens are short-lived and refresh silently.
+
+### Headless agents — service tokens
+
+Software has no browser: a CI job, a scheduled script, or an AI agent in a container can't complete an interactive sign-in. For those, an admin mints a **service token** on the dashboard's **Service Tokens** page: a revocable bearer credential bound to one organization and one role. The agent sends it as a header — no sign-in flow at all:
+
+```json
+{
+  "mcpServers": {
+    "mcphero": {
+      "url": "http://localhost:8080/mcp",
+      "headers": { "Authorization": "Bearer svct_..." }
+    }
+  }
+}
+```
+
+The token's access is exactly the role you chose (make a least-privilege role for it), it never expires until revoked, and every call it makes is audited under its own `svc:<name>` identity. Full guide: [Service tokens](docs/service-tokens.md).
 
 ---
 

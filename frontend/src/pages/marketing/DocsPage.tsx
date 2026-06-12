@@ -36,6 +36,7 @@ export const SIDEBAR: DocEntry[] = [
   { slug: "your-own-mcp-code", title: "Running your own MCP code" },
   { slug: "team", title: "Team" },
   { slug: "roles-and-permissions", title: "Roles and permissions" },
+  { slug: "service-tokens", title: "Service tokens" },
   { slug: "audit-log", title: "Audit log" },
   { slug: "admin-mcp", title: "Admin MCP" },
 ];

@@ -470,14 +470,16 @@ def _make_runtime_with_tools(
     runtime.tool_registry.get_tools_for_upstreams = MagicMock(
         side_effect=get_tools_for_upstreams,
     )
-    if user_allowed_upstreams is None:
-        runtime.policy_engine.get_allowed_upstreams = MagicMock(
-            return_value=None,
-        )
-    else:
-        runtime.policy_engine.get_allowed_upstreams = MagicMock(
-            return_value=set(user_allowed_upstreams),
-        )
+    # get_allowed_upstreams always returns a set (no allow-all
+    # sentinel): default to every upstream in the fixture.
+    allowed = (
+        set(tools_by_upstream.keys())
+        if user_allowed_upstreams is None
+        else set(user_allowed_upstreams)
+    )
+    runtime.policy_engine.get_allowed_upstreams = MagicMock(
+        return_value=allowed,
+    )
     return runtime
 
 
@@ -552,14 +554,15 @@ def _make_runtime_with_resources(
     runtime.tool_registry.get_resources_for_upstreams = MagicMock(
         side_effect=get_resources_for_upstreams,
     )
-    if user_allowed_upstreams is None:
-        runtime.policy_engine.get_allowed_upstreams = MagicMock(
-            return_value=None,
-        )
-    else:
-        runtime.policy_engine.get_allowed_upstreams = MagicMock(
-            return_value=set(user_allowed_upstreams),
-        )
+    # See _make_runtime_with_tools: no allow-all sentinel.
+    allowed = (
+        set(resources_by_upstream.keys())
+        if user_allowed_upstreams is None
+        else set(user_allowed_upstreams)
+    )
+    runtime.policy_engine.get_allowed_upstreams = MagicMock(
+        return_value=allowed,
+    )
     return runtime
 
 

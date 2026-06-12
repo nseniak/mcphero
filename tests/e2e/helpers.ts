@@ -177,6 +177,19 @@ export async function makeMcpClient(
   options: ClientOptions = {}
 ): Promise<Client> {
   const path = mount === "admin-mcp" ? `${mount}/${orgSlug}/` : `${mount}/`;
+  return makeMcpClientAtPath(token, path, options);
+}
+
+/**
+ * Like ``makeMcpClient`` but with an explicit gateway path — used by
+ * specs that need the slug-scoped user mount (``mcp/{slug}/``), e.g.
+ * the service-token org-pinning checks.
+ */
+export async function makeMcpClientAtPath(
+  token: string,
+  path: string,
+  options: ClientOptions = {}
+): Promise<Client> {
   const url = new URL(`${BACKEND_URL}/${path}`);
   const transport = new StreamableHTTPClientTransport(url, {
     requestInit: {

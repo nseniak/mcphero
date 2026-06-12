@@ -72,6 +72,23 @@ async def test_create_and_delete_role(backend: str, tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
+async def test_delete_last_role_raises(backend: str, tmp_path: Path) -> None:
+    """An org must keep at least one role: a zero-roles org denies
+    every identity (PolicyEngine fails closed), so the store refuses
+    to delete the last one."""
+    async with _make_store(backend, tmp_path) as store:
+        # Defaults seed "admin" + "user" with no users assigned;
+        # deleting one is fine, deleting the survivor is not.
+        config = await store.delete_role(DEFAULT_ORG_ID, "user")
+        assert set(config.roles) == {"admin"}
+        with pytest.raises(ValueError, match="at least one role"):
+            await store.delete_role(DEFAULT_ORG_ID, "admin")
+        config = await store.load(DEFAULT_ORG_ID)
+        assert set(config.roles) == {"admin"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
 async def test_cross_org_isolation(backend: str, tmp_path: Path) -> None:
     """org_a's writes must not leak into org_b's reads."""
     async with _make_store(backend, tmp_path) as store:

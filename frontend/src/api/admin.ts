@@ -221,6 +221,42 @@ export function removeUser(email: string): Promise<void> {
   });
 }
 
+// --- Service tokens ---
+
+export interface ServiceTokenInfo {
+  label: string;
+  role: string;
+  created_by: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export interface ServiceTokenCreateResponse {
+  token: string;
+  info: ServiceTokenInfo;
+}
+
+export function listServiceTokens(): Promise<ServiceTokenInfo[]> {
+  return apiFetch<ServiceTokenInfo[]>("/api/admin/service-tokens");
+}
+
+export function createServiceToken(
+  label: string,
+  role: string,
+): Promise<ServiceTokenCreateResponse> {
+  return apiFetch<ServiceTokenCreateResponse>("/api/admin/service-tokens", {
+    method: "POST",
+    body: JSON.stringify({ label, role }),
+  });
+}
+
+export function revokeServiceToken(label: string): Promise<void> {
+  return apiFetch<void>(
+    `/api/admin/service-tokens/${encodeURIComponent(label)}`,
+    { method: "DELETE" },
+  );
+}
+
 export function fetchRoleAccess(): Promise<RoleAccessInfo[]> {
   return apiFetch<RoleAccessInfo[]>("/api/admin/roles/access");
 }

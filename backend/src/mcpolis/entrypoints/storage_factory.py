@@ -53,6 +53,9 @@ from mcpolis.adapters.repositories.file_tool_catalog_store import (
 from mcpolis.adapters.repositories.file_sandbox_file_repository import (
     FileSandboxFileRepository,
 )
+from mcpolis.adapters.repositories.file_service_token_repository import (
+    FileServiceTokenRepository,
+)
 from mcpolis.adapters.repositories.file_template_var_repository import (
     FileTemplateVarRepository,
 )
@@ -68,6 +71,7 @@ from mcpolis.adapters.repositories.mongo_client import (
     COLL_OAUTH_STATE,
     COLL_SANDBOX_FILES,
     COLL_SANDBOX_REFS,
+    COLL_SERVICE_TOKENS,
     COLL_TEMPLATE_VARS,
     COLL_TOOL_CATALOG,
     COLL_UPSTREAMS,
@@ -88,6 +92,9 @@ from mcpolis.adapters.repositories.mongo_sandbox_persistence_repository import (
 )
 from mcpolis.adapters.repositories.mongo_sandbox_file_repository import (
     MongoSandboxFileRepository,
+)
+from mcpolis.adapters.repositories.mongo_service_token_repository import (
+    MongoServiceTokenRepository,
 )
 from mcpolis.adapters.repositories.mongo_template_var_repository import (
     MongoTemplateVarRepository,
@@ -118,6 +125,7 @@ from mcpolis.domain.ports.sandbox_persistence_repository import (
     SandboxPersistenceRepository,
 )
 from mcpolis.domain.ports.sandbox_file_repository import SandboxFileRepository
+from mcpolis.domain.ports.service_token_repository import ServiceTokenRepository
 from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
 from mcpolis.domain.ports.session_revocation import SessionRevocationStore
 from mcpolis.entrypoints.config import Settings
@@ -155,6 +163,7 @@ class StorageBundle:
     sandbox_persistence_repo: SandboxPersistenceRepository
     template_var_repo: TemplateVarRepository
     sandbox_file_repo: SandboxFileRepository
+    service_token_repo: ServiceTokenRepository
     event_stream: EventStream
     rate_limiter: RateLimiter
     distributed_lock: DistributedLock
@@ -201,6 +210,9 @@ def build_file_storage(
     connection_store = FileConnectionStore(settings.data_dir)
     template_var_repo: TemplateVarRepository = FileTemplateVarRepository(settings.data_dir)
     sandbox_file_repo: SandboxFileRepository = FileSandboxFileRepository(settings.data_dir)
+    service_token_repo: ServiceTokenRepository = FileServiceTokenRepository(
+        settings.data_dir,
+    )
     audit_repo = FileAuditRepository(
         settings.audit_log_path,
         event_bus=event_stream,
@@ -227,6 +239,7 @@ def build_file_storage(
         sandbox_persistence_repo=sandbox_persistence_repo,
         template_var_repo=template_var_repo,
         sandbox_file_repo=sandbox_file_repo,
+        service_token_repo=service_token_repo,
         event_stream=event_stream,
         rate_limiter=rate_limiter,
         distributed_lock=distributed_lock,
@@ -302,6 +315,11 @@ def build_cloud_storage(
     sandbox_file_repo: SandboxFileRepository = MongoSandboxFileRepository(
         scoped(COLL_SANDBOX_FILES),
     )
+    # Plain collection on purpose — the verify-path lookup by hash is
+    # global (no org context yet); see MongoServiceTokenRepository.
+    service_token_repo: ServiceTokenRepository = MongoServiceTokenRepository(
+        db[COLL_SERVICE_TOKENS],
+    )
 
     return StorageBundle(
         config_repo=config_repo,
@@ -314,6 +332,7 @@ def build_cloud_storage(
         sandbox_persistence_repo=sandbox_persistence_repo,
         template_var_repo=template_var_repo,
         sandbox_file_repo=sandbox_file_repo,
+        service_token_repo=service_token_repo,
         event_stream=event_stream,
         rate_limiter=rate_limiter,
         distributed_lock=distributed_lock,

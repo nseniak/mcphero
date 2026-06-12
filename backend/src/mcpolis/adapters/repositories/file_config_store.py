@@ -177,7 +177,8 @@ class FileConfigStore:
             return config
 
     async def delete_role(self, org_id: str, name: str) -> SettingsConfig:
-        """Delete a role. Fails if any users reference it."""
+        """Delete a role. Fails if any users reference it or if it is
+        the org's last role."""
         async with self._lock:
             config = self._read()
             if name not in config.roles:
@@ -188,6 +189,13 @@ class FileConfigStore:
             if users_with_role:
                 raise ValueError(
                     f"Cannot delete role '{name}': {len(users_with_role)} user(s) assigned"
+                )
+            if len(config.roles) == 1:
+                # A zero-roles org denies every identity (PolicyEngine
+                # fails closed), so reaching that state is never what
+                # an admin wants — refuse rather than brick the org.
+                raise ValueError(
+                    f"Cannot delete role '{name}': an org must keep at least one role"
                 )
             del config.roles[name]
             self._write(config)

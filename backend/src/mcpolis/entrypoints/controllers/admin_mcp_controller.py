@@ -46,6 +46,7 @@ from mcpolis.domain.services.plan_gates import (
 )
 from mcpolis.domain.services.plan_policy import PlanLimitExceeded
 from mcpolis.domain.services.policy_engine import PolicyEngine
+from mcpolis.domain.services.service_token_service import ServiceTokenService
 from mcpolis.domain.services.sandbox_service import (
     ResourcesUnsupported,
     SandboxResources,
@@ -103,6 +104,7 @@ def create_admin_mcp_server(
     terminate_gateway_sessions: Callable[[str, str], int] | None = None,
     allow_stdio_mcp: bool = True,
     org_repo: OrganizationRepository | None = None,
+    service_token_service: ServiceTokenService | None = None,
 ) -> FastMCP:
     server = FastMCP(name="MCP Hero Admin", streamable_http_path="/")
 
@@ -872,12 +874,16 @@ def create_admin_mcp_server(
         user_counts: dict[str, int] = {}
         for user_def in config.users.values():
             user_counts[user_def.role] = user_counts.get(user_def.role, 0) + 1
+        token_counts: dict[str, int] = {}
+        if service_token_service is not None:
+            token_counts = await service_token_service.count_by_role(org_id)
         results = [
             {
                 "name": name,
                 "is_admin": role_def.is_admin,
                 "is_default": role_def.is_default,
                 "user_count": user_counts.get(name, 0),
+                "service_token_count": token_counts.get(name, 0),
             }
             for name, role_def in config.roles.items()
         ]
@@ -921,13 +927,24 @@ def create_admin_mcp_server(
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="delete_role",
         description=(
-            "Delete a role. Fails if any users are assigned to it."
+            "Delete a role. Fails if any users or service tokens are "
+            "assigned to it."
         ),
         annotations=DESTRUCTIVE_IDEMPOTENT,
     )
     async def delete_role(role_name: str) -> str:
         org_id = current_org_id.get()
         runtime = await runtime_manager.get(org_id)
+        # Service-token guard — mirrors the dashboard route: the
+        # policy store only knows config.users.
+        if service_token_service is not None:
+            token_counts = await service_token_service.count_by_role(org_id)
+            in_use = token_counts.get(role_name, 0)
+            if in_use:
+                return (
+                    f"Error: Cannot delete role '{role_name}': {in_use} "
+                    f"service token(s) assigned"
+                )
         try:
             new_config = await policy_store.delete_role(org_id, role_name)
         except ValueError as e:
