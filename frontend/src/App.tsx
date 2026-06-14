@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-quer
 import { AuthContext, useAuth, useAuthProvider } from "./hooks/useAuth";
 import { useFeatures } from "./hooks/useFeatures";
 import { fetchGatewayConfig } from "./api/user";
+import { getLoginUrl } from "./api/auth";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { setUpgradeDialogOpener } from "./lib/planLimits";
 import type { PlanLimitDialogState } from "./lib/planLimits";
@@ -60,6 +61,20 @@ function DefaultRedirect() {
     queryFn: fetchGatewayConfig,
     enabled: !!user && !user.is_admin,
   });
+
+  // Once auth + features have resolved and there's still no user, the
+  // visitor is logged out. Hand off to the server login route — the
+  // dev_stub email picker in standalone, Google in cloud — instead of
+  // rendering nothing. Without this, /app is a permanent blank page for
+  // a logged-out user, which is exactly where standalone's "open
+  // localhost:8080" lands (/ → /app), so the README's promised email
+  // picker never appears.
+  const loggedOut = !loading && !featuresLoading && !user;
+  useEffect(() => {
+    if (loggedOut) {
+      window.location.href = getLoginUrl();
+    }
+  }, [loggedOut]);
 
   if (loading || featuresLoading || !user) {
     return null;

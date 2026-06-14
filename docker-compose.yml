@@ -96,6 +96,13 @@ services:
     profiles: [standalone]
     ports:
       - "8080:8080"
+    environment:
+      # Advertised base URL the dashboard hands to MCP clients (Connect
+      # page, service-token config JSON) and uses to build the OAuth
+      # callback. Must match the published port above — without this it
+      # falls back to the backend default ``http://localhost:8000`` and
+      # every copy-paste client config points at a dead port.
+      MCPOLIS_SERVER_URL: http://localhost:8080
     volumes:
       - mcpolis-config:/app/config
       - mcpolis-data:/app/data

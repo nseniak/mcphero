@@ -39,7 +39,14 @@ class FileOrganizationRepository(OrganizationRepository):
         self._subscription_path = data_dir / "subscription.json"
         self._created_at = datetime.now(UTC)
         self._memberships: dict[tuple[str, str], Membership] = {}
-        self._subscription: Subscription = Subscription(plan=PlanName.free)
+        # Standalone is a self-hosted single-tenant install — the Free/Team
+        # plan tiers are a property of the hosted mcphero.io offering, not
+        # of the AGPL self-host. Default the lone org to the unlimited
+        # (Team) plan so no upstream caps, seat caps, custom-role caps, or
+        # sandbox-size restrictions apply, and the dashboard never shows
+        # hosted-tier limits or upsells. (A persisted subscription.json
+        # still wins, e.g. an explicit superadmin override.)
+        self._subscription: Subscription = Subscription(plan=PlanName.team)
         self._load()
         self._load_subscription()
 

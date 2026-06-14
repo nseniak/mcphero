@@ -196,10 +196,12 @@ async def _build_admin_server(
     )
     audit_repo = FileAuditRepository(tmp_path / "data" / "audit.jsonl")
     org_repo = FileOrganizationRepository(tmp_path / "data")
-    if plan != PlanName.free:
-        await org_repo.update_subscription(
-            DEFAULT_ORG_ID, Subscription(plan=plan),
-        )
+    # Standalone now defaults the lone org to the unlimited Team plan, so
+    # persist the requested plan explicitly (Free included) — these tests
+    # assert the Free gate mechanics on an explicitly-Free org.
+    await org_repo.update_subscription(
+        DEFAULT_ORG_ID, Subscription(plan=plan),
+    )
 
     rm = make_runtime_manager(
         policy_engine,

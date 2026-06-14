@@ -145,7 +145,9 @@ export function DashboardLayout() {
               <Menu size={20} />
             </button>
             <OrgSwitcher />
-            <PlanBadge />
+            {/* Plan tiers belong to the hosted offering; a self-hosted
+                standalone install has no plan, so suppress the badge. */}
+            {mode === "cloud" && <PlanBadge />}
           </div>
           <div className="flex items-center gap-3 text-sm text-zinc-600">
             <span className="hidden sm:inline truncate max-w-[180px]">{user.email}</span>

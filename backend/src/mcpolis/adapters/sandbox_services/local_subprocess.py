@@ -196,14 +196,31 @@ class LocalSubprocessSandboxService:
 
         exit_signal = ExitSignalImpl()
 
-        process = await asyncio.create_subprocess_exec(
-            cfg.command,
-            *list(cfg.args),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=spawn_env,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                cfg.command,
+                *list(cfg.args),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=spawn_env,
+            )
+        except FileNotFoundError as exc:
+            # The raw OSError is just "[Errno 2] No such file or
+            # directory" — it never names the command, so a new user has
+            # no way to know e.g. ``npx`` isn't installed. Surface the
+            # missing executable explicitly; ``str(exc)`` is what reaches
+            # the dashboard's "Couldn't connect" line.
+            raise FileNotFoundError(
+                f"Command {cfg.command!r} not found in the sandbox "
+                "environment. Make sure it's installed and on the "
+                "server's PATH."
+            ) from exc
+        except PermissionError as exc:
+            raise PermissionError(
+                f"Command {cfg.command!r} is not executable in the "
+                "sandbox environment."
+            ) from exc
         # Fail-loud type-narrow: PIPE is requested for all three so the
         # SDK populates them. Asserting keeps the rest of the code free
         # of ``| None`` noise on every send/read.

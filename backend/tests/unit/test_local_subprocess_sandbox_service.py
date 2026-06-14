@@ -127,6 +127,31 @@ async def test_session_starts_subprocess_and_logs_lifecycle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_missing_command_names_the_executable() -> None:
+    """A missing command must surface its name, not a bare
+    "[Errno 2] No such file or directory" — ``str(exc)`` is what reaches
+    the dashboard's "Couldn't connect" line (M3)."""
+    service = LocalSubprocessSandboxService()
+    upstream = make_upstream_definition(
+        id="missing-mcp", command="npx-not-installed-xyz",
+    )
+    with pytest.raises(FileNotFoundError) as exc:
+        async with service.session(
+            session_id="test-session",
+            org_id="org",
+            upstream=upstream,
+            resources=make_default_resources(),
+            denylist=(),
+        ):
+            pass
+    message = str(exc.value)
+    assert "npx-not-installed-xyz" in message
+    assert "not found" in message
+    # The raw OSError prefix must not leak through.
+    assert "Errno 2" not in message
+
+
+@pytest.mark.asyncio
 async def test_session_routes_stderr_to_errlog() -> None:
     """``errlog`` receives the subprocess's stderr stream verbatim.
 

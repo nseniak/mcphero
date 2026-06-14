@@ -9,19 +9,19 @@
 
 # MCP Hero
 
-**One endpoint for all your MCP servers, with the access control, auth, and auditing a team needs.**
+**One endpoint for all your MCP servers, with access control, auth, and audit logging for teams.**
 
 Hosted version: **[mcphero.io](https://mcphero.io)** · or self-host with this repo.
 
 <p align="center">
-  <a href="https://mcphero.io"><img src="docs/images/dashboard-upstreams.png" alt="MCP Hero dashboard — many MCP servers behind one endpoint, with transport, per-user auth, and live status at a glance" width="900"></a>
+  <a href="https://mcphero.io"><img src="docs/images/dashboard-upstreams.png" alt="MCP Hero dashboard — many MCP servers behind one endpoint, with transport, per-user auth, and live status" width="900"></a>
 </p>
 
 ---
 
 ## What is MCP Hero?
 
-MCP Hero is a self-hostable **gateway for [Model Context Protocol](https://modelcontextprotocol.io) servers**. It mounts many upstream MCP servers behind a single URL and adds the things you need to run them for real:
+MCP Hero is a self-hostable **gateway for [Model Context Protocol](https://modelcontextprotocol.io) servers**. Normally each person configures every MCP server separately in every client they use, with no shared way to control access or audit calls. MCP Hero mounts those upstream servers behind a single URL and adds the access, auth, and audit layer for running them across a team:
 
 - **One endpoint** — point your MCP client (Claude and friends) at one gateway URL instead of wiring up each server separately.
 - **Role-based access control** — decide which roles can reach which servers, down to individual tools.

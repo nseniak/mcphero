@@ -43,6 +43,20 @@ RUN npm run build
 # --- Backend stage ---
 FROM python:3.12-slim AS runtime
 
+# Hosted stdio MCPs run as local subprocesses in standalone mode, so the
+# runtimes their launchers need must be on PATH. The overwhelming
+# majority of real-world stdio servers are invoked via ``npx`` (Node) or
+# ``uvx`` (uv); without these the README's canonical
+# ``npx … @modelcontextprotocol/server-everything`` example fails with a
+# bare "[Errno 2] No such file or directory". Pull Node 20 (node/npm/npx)
+# from the official slim image and uv/uvx from the astral image rather
+# than apt (Debian's nodejs is older and uv isn't packaged).
+COPY --from=node:20-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:20-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
 RUN pip install --no-cache-dir poetry && \
     poetry config virtualenvs.create false
 

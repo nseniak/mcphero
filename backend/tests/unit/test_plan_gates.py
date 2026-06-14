@@ -67,6 +67,15 @@ def make_settings(tmp_path: Path, *, mcp_json: str, config_json: str) -> Setting
     mcp_path.write_text(mcp_json)
     config_path = tmp_path / "config.json"
     config_path.write_text(config_json)
+    # Standalone now defaults the lone org to the unlimited Team plan, so
+    # seed an explicit Free subscription: these tests exercise the Free
+    # gate mechanics, and the Team-path tests overwrite this via
+    # ``_flip_plan(settings, PlanName.team)`` before building the client.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "subscription.json").write_text(
+        json.dumps({"plan": PlanName.free.value})
+    )
     return Settings(
         _env_file=None,  # type: ignore[call-arg]
         mcp_json_path=mcp_path,
@@ -326,16 +335,50 @@ def test_subscription_persistence_through_file_repo(tmp_path: Path) -> None:
         repo = FileOrganizationRepository(tmp_path)
         org_before = await repo.get_organization(DEFAULT_ORG_ID)
         assert org_before is not None
-        assert org_before.subscription.plan == PlanName.free
+        # Standalone defaults the lone org to the unlimited Team plan.
+        assert org_before.subscription.plan == PlanName.team
         await repo.update_subscription(
-            DEFAULT_ORG_ID, Subscription(plan=PlanName.team),
+            DEFAULT_ORG_ID, Subscription(plan=PlanName.free),
         )
         repo2 = FileOrganizationRepository(tmp_path)
         org_after = await repo2.get_organization(DEFAULT_ORG_ID)
         assert org_after is not None
-        assert org_after.subscription.plan == PlanName.team
+        assert org_after.subscription.plan == PlanName.free
 
     asyncio.run(_round_trip())
+
+
+def test_standalone_default_org_is_unlimited_team(tmp_path: Path) -> None:
+    """M1: a self-hosted standalone install has no plan tier, so the lone
+    org defaults to the unlimited Team plan — no Free-tier caps or
+    upsells leak into the self-host. The Free gate would otherwise block
+    a 6th HTTP upstream; on the default org it must not."""
+    upstreams: dict[str, dict[str, object]] = {
+        f"u{i}": {"display_name": f"U{i}", "auth_mode": "service_account"}
+        for i in range(5)
+    }
+    mcp_servers: dict[str, dict[str, object]] = {
+        f"u{i}": {"url": f"http://localhost:90{i:02d}/mcp"} for i in range(5)
+    }
+    config_json, mcp_json = _config_with_users_and_upstreams(
+        {ADMIN_EMAIL: {"role": "admin"}}, upstreams, mcp_servers,
+    )
+    # Note: NOT seeding a Free subscription — exercise the real default.
+    settings = make_settings(tmp_path, mcp_json=mcp_json, config_json=config_json)
+    (settings.data_dir / "subscription.json").unlink()
+    client = make_client(settings)
+    resp = client.post(
+        "/api/admin/upstreams",
+        json={
+            "id": "u5",
+            "display_name": "U5",
+            "url": "http://localhost:9100/mcp",
+            "auth_mode": "service_account",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    me = client.get("/api/auth/me").json()
+    assert me["current_org"]["plan"] == "team"
 
 
 def test_plan_limit_exception_handler_shape(tmp_path: Path) -> None:

@@ -72,3 +72,6 @@ internal/screenshots/node_modules
 # Playwright e2e run artifacts (traces, screenshots, error-context.md)
 tests/e2e/test-results/
 .firecrawl/
+
+# Mondrian interactive-diagram tool state (served locally; not part of the repo)
+.mondrian/
