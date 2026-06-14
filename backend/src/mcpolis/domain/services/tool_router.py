@@ -283,6 +283,41 @@ class ToolRouter:
                     },
                 )
 
+    async def audit_denied(
+        self,
+        org_id: str,
+        *,
+        user_id: str,
+        upstream_id: str,
+        tool: str,
+        reason: str,
+        policy_rule: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        """Record a policy-denied tool call.
+
+        Enforcement happens upstream in the gateway controller (which
+        short-circuits before ``route_call`` ever runs); this writes the
+        matching ``denied`` audit row so the deny is as auditable as an
+        allowed call. ``reason`` is a human-readable explanation (which
+        MCP / which forbidden argument) surfaced in the Audit UI.
+        """
+        entry = AuditEntry(
+            timestamp=datetime.now(UTC).isoformat(),
+            org_id=org_id,
+            action="tool_call",
+            user_id=user_id,
+            upstream_id=upstream_id,
+            tool=tool,
+            policy_decision="denied",
+            policy_rule=policy_rule or reason,
+            response_status="denied",
+            outcome="denied",
+            error_message=reason,
+            session_id=session_id,
+        )
+        await self._audit.log(org_id, entry)
+
     async def read_resource(
         self,
         org_id: str,

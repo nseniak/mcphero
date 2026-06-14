@@ -2,6 +2,8 @@
 
 A short walkthrough that takes you from sign-up to your first MCP shared with your team.
 
+> **This guide describes cloud mode** (`mcphero.io`): Google sign-in, you create an organization at sign-up, and you invite teammates by their Google email. **Standalone mode** (the self-hosted Docker Quick start in the [README](../README.md)) differs: it uses a no-login dev email picker, auto-creates a single `default` org for you (no "Create organization" step — you land straight on **Upstream MCPs**), and serves the gateway at the bare `/mcp` instead of `/mcp/<org-slug>`. The "add an MCP" and "connect a client" steps below apply to both modes.
+
 You will:
 
 1. Create your organization

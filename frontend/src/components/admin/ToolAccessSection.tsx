@@ -1,5 +1,6 @@
 import { Link } from "react-router";
 import { ChevronRight } from "lucide-react";
+import { useOrgSlug } from "../../hooks/useOrgSlug";
 import type {
   RoleAccessInfo,
   ToolAccessConfig,
@@ -83,6 +84,7 @@ export function ToolAccessSection({
   upstreams: UpstreamSummary[];
   allTools: ToolInfo[];
 }) {
+  const orgSlug = useOrgSlug();
   // Group tools by upstream
   const toolsByUpstream = new Map<string, ToolInfo[]>();
   for (const t of allTools) {
@@ -105,7 +107,7 @@ export function ToolAccessSection({
           return (
             <Link
               key={upstream.id}
-              to={`/admin/permissions/tools?role=${encodeURIComponent(role.name)}&upstream=${encodeURIComponent(upstream.id)}`}
+              to={`/orgs/${orgSlug}/admin/permissions/tools?role=${encodeURIComponent(role.name)}&upstream=${encodeURIComponent(upstream.id)}`}
               className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 transition-colors"
             >
               <span>{upstream.display_name}</span>

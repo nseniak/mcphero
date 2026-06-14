@@ -166,6 +166,9 @@ def test_capabilities_hide_disk_grid() -> None:
     assert caps.allowed_disk_gb == ()
     assert caps.supports_persistent_disk is False
     assert caps.supports_egress_filtering is False
+    # E2B enforces the picked CPU/RAM (template-backed), so the admin
+    # UI keeps the resource picker live.
+    assert caps.enforces_resources is True
 
 
 def test_validate_resources_rejects_non_zero_disk() -> None:

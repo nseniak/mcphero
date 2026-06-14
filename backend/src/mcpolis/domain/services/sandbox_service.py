@@ -193,6 +193,12 @@ class SandboxCapabilities(BaseModel):
     # explicit template matrix.
     allowed_combinations: tuple[SandboxResourceCombo, ...]
 
+    # Whether the backend actually enforces the requested CPU/RAM/disk.
+    # ``local-subprocess`` spawns the MCP as an ordinary host process and
+    # ignores the picked combo, so the admin UI hides/disables the
+    # resource picker (with a "not enforced" note) when this is False.
+    enforces_resources: bool = True
+
     supports_pause_resume: bool
     supports_egress_filtering: bool
     supports_persistent_disk: bool

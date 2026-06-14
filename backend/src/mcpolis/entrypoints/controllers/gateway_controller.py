@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import mcp.types as mcp_types
@@ -411,13 +412,18 @@ def create_mcp_server(
     @server.call_tool(validate_input=False)
     async def handle_call_tool(  # pyright: ignore[reportUnusedFunction]
         name: str, arguments: dict[str, Any] | None
-    ) -> Iterable[mcp_types.ContentBlock]:
+    ) -> mcp_types.CallToolResult:
+        # Return the full ``CallToolResult`` (not just ``.content``) so
+        # the ``isError`` flag reaches the client: policy denials and
+        # genuine upstream tool errors both surface as ``isError: true``
+        # rather than being flattened to a success-shaped result. This
+        # also preserves any ``structuredContent`` the upstream returned.
         user_id = _get_current_user()
         session_id = current_session_id.get()
         org_id = current_org_id.get()
 
         if org_id == MULTI_ORG_SENTINEL:
-            result = await _call_tool_multi_org(
+            return await _call_tool_multi_org(
                 runtime_manager,
                 org_service,
                 user_id=user_id,
@@ -425,9 +431,8 @@ def create_mcp_server(
                 prefixed_name=name,
                 arguments=arguments or {},
             )
-            return result.content
 
-        result = await _call_tool_single_org(
+        return await _call_tool_single_org(
             runtime_manager,
             org_id=org_id,
             user_id=user_id,
@@ -435,7 +440,6 @@ def create_mcp_server(
             prefixed_name=name,
             arguments=arguments or {},
         )
-        return result.content
 
     # ── Resources ──────────────────────────────────────────────────────
 
@@ -738,9 +742,9 @@ async def _call_tool_single_org(
             prefixed_name = resolved
         else:
             return resolved  # CallToolResult error from the resolver.
-    denial = _check_upstream_and_tool_policy(
-        runtime, user_id=user_id, prefixed_name=prefixed_name,
-        arguments=arguments,
+    denial = await _enforce_policy(
+        runtime, org_id=org_id, user_id=user_id, session_id=session_id,
+        prefixed_name=prefixed_name, arguments=arguments,
     )
     if denial is not None:
         return denial
@@ -853,9 +857,9 @@ async def _call_tool_multi_org(
         org_id=org.id,
         inner_name=inner_prefixed,
     )
-    denial = _check_upstream_and_tool_policy(
-        runtime, user_id=user_id, prefixed_name=inner_prefixed,
-        arguments=arguments,
+    denial = await _enforce_policy(
+        runtime, org_id=org.id, user_id=user_id, session_id=session_id,
+        prefixed_name=inner_prefixed, arguments=arguments,
     )
     if denial is not None:
         return denial
@@ -913,14 +917,32 @@ async def _resolve_bare_tool_name_multi_org(
     )
 
 
+@dataclass
+class _PolicyDenial:
+    """A policy-denied tool call, with the metadata needed to both
+    surface the denial to the caller and write a ``denied`` audit row.
+
+    ``result`` is the user-facing ``isError`` CallToolResult; the
+    remaining fields feed ``ToolRouter.audit_denied`` so the deny is as
+    auditable as an allowed call (the gateway short-circuits before
+    ``route_call``, which is what writes the allowed row).
+    """
+
+    result: mcp_types.CallToolResult
+    upstream_id: str
+    tool: str
+    reason: str
+    policy_rule: str
+
+
 def _check_upstream_and_tool_policy(
     runtime: OrgRuntime,
     *,
     user_id: str,
     prefixed_name: str,
     arguments: dict[str, Any],
-) -> mcp_types.CallToolResult | None:
-    """Returns an access-denied result, or None if the call is allowed."""
+) -> _PolicyDenial | None:
+    """Returns a policy denial, or None if the call is allowed."""
     tool_registry = runtime.tool_registry
     policy_engine = runtime.policy_engine
 
@@ -938,9 +960,15 @@ def _check_upstream_and_tool_policy(
     enabled_ids = [uid for uid in all_ids if uid in allowed]
 
     if target_upstream not in enabled_ids:
-        return _access_denied(
-            f"Access denied: MCP '{target_upstream}' is disabled for "
-            f"user '{user_id}'."
+        reason = (
+            f"MCP '{target_upstream}' is disabled for user '{user_id}'."
+        )
+        return _PolicyDenial(
+            result=_access_denied(f"Access denied: {reason}"),
+            upstream_id=target_upstream,
+            tool=prefixed_name,
+            reason=reason,
+            policy_rule="mcp_disabled",
         )
 
     tool_annotations = tool_registry.get_tool_annotations(
@@ -952,8 +980,47 @@ def _check_upstream_and_tool_policy(
         boundary_role=boundary_role,
     )
     if not decision.allowed:
-        return _access_denied(f"Access denied: {decision.reason}")
+        return _PolicyDenial(
+            result=_access_denied(f"Access denied: {decision.reason}"),
+            upstream_id=target_upstream,
+            tool=prefixed_name,
+            reason=decision.reason,
+            policy_rule=decision.matched_rule or decision.reason,
+        )
     return None
+
+
+async def _enforce_policy(
+    runtime: OrgRuntime,
+    *,
+    org_id: str,
+    user_id: str,
+    session_id: str | None,
+    prefixed_name: str,
+    arguments: dict[str, Any],
+) -> mcp_types.CallToolResult | None:
+    """Run the policy check and, on denial, write the ``denied`` audit
+    row before returning the denial result. ``None`` means allowed.
+
+    Single choke point shared by the single- and multi-org call paths
+    so both deny paths (MCP-disabled, argument-check) audit identically.
+    """
+    denial = _check_upstream_and_tool_policy(
+        runtime, user_id=user_id, prefixed_name=prefixed_name,
+        arguments=arguments,
+    )
+    if denial is None:
+        return None
+    await runtime.tool_router.audit_denied(
+        org_id,
+        user_id=user_id,
+        upstream_id=denial.upstream_id,
+        tool=denial.tool,
+        reason=denial.reason,
+        policy_rule=denial.policy_rule,
+        session_id=session_id,
+    )
+    return denial.result
 
 
 def _access_denied(message: str) -> mcp_types.CallToolResult:

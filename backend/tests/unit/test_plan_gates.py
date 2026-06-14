@@ -458,6 +458,11 @@ def test_sandbox_capabilities_marks_off_combos_disabled(tmp_path: Path) -> None:
     client = make_client(settings)
     resp = client.get("/api/admin/sandbox/capabilities")
     assert resp.status_code == 200
+    # Standalone test settings carry no E2B key, so the provider falls
+    # back to local-subprocess, which does not enforce the picked combo
+    # — the flag must reach the wire so the UI can disable the picker.
+    assert resp.json()["provider"] == "local-subprocess"
+    assert resp.json()["enforces_resources"] is False
     combos = resp.json()["allowed_combinations"]
     # The plan policy permits only (1, 1024) on Free. Provider may
     # expose more — those are surfaced with enabled=False.

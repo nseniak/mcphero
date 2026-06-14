@@ -126,19 +126,31 @@ function Combobox({
   );
 }
 
-function OutcomeBadge({ entry }: { entry: Record<string, unknown> }) {
+export function OutcomeBadge({ entry }: { entry: Record<string, unknown> }) {
   const action = String(entry.action ?? "tool_call");
   if (action === "tool_call") {
     const decision = String(entry.policy_decision ?? "—");
     const isAllowed = decision === "allowed";
     return (
-      <span
-        className={`px-1.5 py-0.5 rounded text-xs font-medium ${
-          isAllowed ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
-        }`}
-      >
-        {decision}
-      </span>
+      <div className="flex flex-col gap-0.5">
+        <span
+          className={`px-1.5 py-0.5 rounded text-xs font-medium inline-block w-fit ${
+            isAllowed ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+          }`}
+        >
+          {decision}
+        </span>
+        {/* Deny reason (which MCP / which forbidden argument). Only
+            denials carry an error_message on tool_call rows. */}
+        {entry.error_message != null && (
+          <span
+            className="text-[10px] text-red-500 truncate max-w-[250px]"
+            title={String(entry.error_message)}
+          >
+            {String(entry.error_message)}
+          </span>
+        )}
+      </div>
     );
   }
   const outcome = String(entry.outcome ?? "—");

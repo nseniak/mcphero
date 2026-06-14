@@ -49,9 +49,11 @@ runner/dev-certs/out/
 *.crt
 *.cer
 
-# Claude Code per-user overrides. Team-shared rules live in
-# `.claude/settings.json` and `.claude/skills/*.md` (both committed).
+# Claude Code config. `settings.json` and the per-user
+# `settings.local.json` are untracked (local to each machine); only the
+# team-shared `.claude/skills/*.md` are committed.
 .claude/settings.local.json
+.claude/settings.json
 
 .playwright-mcp
 

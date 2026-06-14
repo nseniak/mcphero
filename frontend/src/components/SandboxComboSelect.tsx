@@ -32,7 +32,10 @@ function formatCombo(
     c.memory_mb >= 1024 && c.memory_mb % 1024 === 0
       ? `${c.memory_mb / 1024} GiB`
       : `${c.memory_mb} MiB`;
-  const disk = showDisk ? ` / ${c.disk_gb} GiB disk` : "";
+  // Only surface the disk segment when it carries a real value — a
+  // provider with no configurable disk reports 0, and "0 GiB disk"
+  // reads as broken.
+  const disk = showDisk && c.disk_gb > 0 ? ` / ${c.disk_gb} GiB disk` : "";
   return `${cpu} / ${ram}${disk}`;
 }
 
@@ -44,15 +47,20 @@ export function SandboxComboSelect({
   borderDefault = "border-zinc-300",
   command,
 }: SandboxComboSelectProps) {
-  const showDisk = capabilities.allowed_disk_gb.length > 0;
+  // Only treat disk as configurable when some combo actually carries a
+  // non-zero value; a flat [0] list means "no disk axis" and must not
+  // render as "0 GiB disk".
+  const showDisk = capabilities.allowed_disk_gb.some((d) => d > 0);
+  const enforced = capabilities.enforces_resources;
   const currentKey = comboKey(value);
   const dockerBelowFloor =
-    isDockerCommand(command) && value.cpu_vcpus < 2;
+    enforced && isDockerCommand(command) && value.cpu_vcpus < 2;
 
   return (
     <>
       <select
         value={currentKey}
+        disabled={!enforced}
         onChange={(e) => {
           const picked = capabilities.allowed_combinations.find(
             (c: SandboxResourceCombo) => comboKey(c) === e.target.value,
@@ -65,8 +73,8 @@ export function SandboxComboSelect({
           });
         }}
         className={`max-w-md w-full px-2 py-1 text-sm border rounded bg-white ${
-          hasError ? "border-red-400" : borderDefault
-        }`}
+          !enforced ? "opacity-60 cursor-not-allowed bg-zinc-50 " : ""
+        }${hasError ? "border-red-400" : borderDefault}`}
       >
         {capabilities.allowed_combinations.map((c: SandboxResourceCombo) => (
           <option
@@ -79,6 +87,13 @@ export function SandboxComboSelect({
           </option>
         ))}
       </select>
+      {!enforced && (
+        <p className="mt-1.5 text-xs text-zinc-500">
+          Not enforced in local mode — this MCP runs as a host subprocess
+          and ignores these limits. Configure a sandbox provider (E2B) to
+          enforce CPU and memory.
+        </p>
+      )}
       {dockerBelowFloor && (
         <p className="mt-1.5 text-xs text-amber-600">
           Docker's recommended minimum is 2 vCPU / 2 GB — the daemon alone

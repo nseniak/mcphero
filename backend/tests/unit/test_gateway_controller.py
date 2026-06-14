@@ -8,7 +8,14 @@ import mcp.types as mcp_types
 import pytest
 
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
-from mcpolis.domain.model.settings import SettingsConfig
+from mcpolis.domain.model.settings import (
+    ArgumentConstraint,
+    McpAccessConfig,
+    RoleDefinition,
+    RoleSettings,
+    SettingsConfig,
+    UserDefinition,
+)
 from mcpolis.adapters.repositories.file_audit_repository import FileAuditRepository
 from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
@@ -142,3 +149,137 @@ async def test_call_tool_delegates_to_router(tmp_path: Path) -> None:
     # fail if the call stops reaching the mocked upstream session.
     text = cast(mcp_types.TextContent, call_result.content[0]).text
     assert text == "done"
+
+
+def _mcp_disabled_config() -> SettingsConfig:
+    """Role with ``github`` enabled but ``slack`` left off the access map.
+
+    Calling a ``slack`` tool exercises the MCP-disabled deny path in
+    ``_check_upstream_and_tool_policy``.
+    """
+    return SettingsConfig(
+        roles={
+            "default": RoleDefinition(
+                is_default=True,
+                settings=RoleSettings(
+                    mcp_access=McpAccessConfig(mcps={"github": True}),
+                ),
+            ),
+        },
+        users={"anonymous": UserDefinition(role="default")},
+    )
+
+
+def _forbidden_arg_config() -> SettingsConfig:
+    """Role granting ``github`` access but forbidding the substring
+    ``blocked`` in ``create_issue``'s ``title`` argument."""
+    return SettingsConfig(
+        roles={
+            "default": RoleDefinition(
+                is_default=True,
+                settings=RoleSettings(
+                    mcp_access=McpAccessConfig(mcps={"github": True}),
+                    argument_constraints={
+                        "github__create_issue": {
+                            "title": ArgumentConstraint(
+                                pattern="blocked", mode="forbid",
+                            ),
+                        },
+                    },
+                ),
+            ),
+        },
+        users={"anonymous": UserDefinition(role="default")},
+    )
+
+
+async def _call(
+    handler: Any, name: str, arguments: dict[str, Any],
+) -> mcp_types.CallToolResult:
+    request = mcp_types.CallToolRequest(
+        method="tools/call",
+        params=mcp_types.CallToolRequestParams(name=name, arguments=arguments),
+    )
+    result = await handler(request)
+    return cast(mcp_types.CallToolResult, result.root)
+
+
+@pytest.mark.asyncio
+async def test_denied_mcp_disabled_writes_audit_entry(tmp_path: Path) -> None:
+    """An MCP-disabled denial writes exactly one ``denied`` audit row
+    carrying the tool, upstream, acting user, and a readable reason."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    rm = make_runtime_manager(
+        PolicyEngine(_mcp_disabled_config()),
+        tool_registry=registry, tool_router=router,
+    )
+    server = create_mcp_server(rm)
+    handler = server.request_handlers[mcp_types.CallToolRequest]
+
+    call_result = await _call(handler, "slack__send_message", {"text": "hi"})
+    assert call_result.isError
+    text = cast(mcp_types.TextContent, call_result.content[0]).text
+    assert "disabled" in text
+
+    entries = await router._audit.search("default", limit=100)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["action"] == "tool_call"
+    assert entry["policy_decision"] == "denied"
+    assert entry["user_id"] == "anonymous"
+    assert entry["upstream_id"] == "slack"
+    assert entry["tool"] == "slack__send_message"
+    # Reason names which MCP was disabled, for the operator.
+    reason = (entry.get("error_message") or "") + (entry.get("policy_rule") or "")
+    assert "slack" in reason and "disabled" in reason
+
+
+@pytest.mark.asyncio
+async def test_denied_forbidden_argument_writes_audit_entry(
+    tmp_path: Path,
+) -> None:
+    """An argument-check (Forbid) denial writes one ``denied`` audit row
+    naming the offending argument."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    rm = make_runtime_manager(
+        PolicyEngine(_forbidden_arg_config()),
+        tool_registry=registry, tool_router=router,
+    )
+    server = create_mcp_server(rm)
+    handler = server.request_handlers[mcp_types.CallToolRequest]
+
+    call_result = await _call(
+        handler, "github__create_issue", {"title": "this should be blocked"},
+    )
+    assert call_result.isError
+    text = cast(mcp_types.TextContent, call_result.content[0]).text
+    assert "forbidden pattern" in text
+
+    entries = await router._audit.search("default", limit=100)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["policy_decision"] == "denied"
+    assert entry["upstream_id"] == "github"
+    assert entry["tool"] == "github__create_issue"
+    reason = (entry.get("error_message") or "") + (entry.get("policy_rule") or "")
+    assert "title" in reason
+
+
+@pytest.mark.asyncio
+async def test_allowed_call_writes_single_audit_entry(tmp_path: Path) -> None:
+    """Allowed calls still produce exactly one ``allowed`` row — the
+    denial-audit change must not double-log the happy path."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    rm = make_runtime_manager(
+        PolicyEngine(make_full_access_config(["github", "slack"], ["anonymous"])),
+        tool_registry=registry, tool_router=router,
+    )
+    server = create_mcp_server(rm)
+    handler = server.request_handlers[mcp_types.CallToolRequest]
+
+    call_result = await _call(handler, "github__create_issue", {"title": "ok"})
+    assert not call_result.isError
+
+    entries = await router._audit.search("default", limit=100)
+    assert len(entries) == 1
+    assert entries[0]["policy_decision"] == "allowed"

@@ -81,6 +81,9 @@ class LocalSubprocessSandboxService:
             allowed_memory_mb=_ALLOWED_MEMORY_MB,
             allowed_disk_gb=_ALLOWED_DISK_GB,
             allowed_combinations=combos,
+            # The subprocess runs unconstrained on the host — the picked
+            # CPU/RAM/disk are advisory only, never enforced.
+            enforces_resources=False,
             supports_pause_resume=False,
             supports_egress_filtering=False,
             supports_persistent_disk=False,

@@ -779,6 +779,27 @@ def _build_sandbox_provider_plumbing(
             f"{sorted(services)}",
         )
 
+    if provider == "local-subprocess":
+        # No-isolation dev path: stdio MCPs run as ordinary host
+        # subprocesses (no CPU/RAM/disk enforcement, no egress filter,
+        # full host filesystem and network). Cloud mode rejects this
+        # provider outright in ``validate_startup_secrets``; here
+        # (standalone / dev) we allow it but flag it loudly so the
+        # operator knows the boundary is off. The README's "flagged as
+        # unsafe at startup" promise is this line.
+        logger.warning(
+            "sandbox.provider.local_subprocess.unsafe",
+            provider=provider,
+            message=(
+                "Sandbox provider resolved to 'local-subprocess': stdio "
+                "MCPs run UNSANDBOXED as host subprocesses with no "
+                "isolation (no resource limits, no egress filtering, "
+                "full host access). This is a dev-only path. Set "
+                "MCPOLIS_E2B_API_KEY (or MCPOLIS_SANDBOX_PROVIDER=e2b) to "
+                "run stdio MCPs in an isolated E2B sandbox."
+            ),
+        )
+
     resolver = SandboxResolver(global_provider=provider)
     return resolver, services, persistence, instance_id
 

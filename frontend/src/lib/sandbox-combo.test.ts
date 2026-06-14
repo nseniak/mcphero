@@ -26,6 +26,7 @@ function makeCaps(
     allowed_memory_mb: [1024, 2048, 4096, 8192],
     allowed_disk_gb: [],
     allowed_combinations: combos,
+    enforces_resources: true,
     supports_pause_resume: true,
     supports_egress_filtering: false,
     supports_persistent_disk: false,

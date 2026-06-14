@@ -156,6 +156,10 @@ export interface SandboxCapabilitiesResponse {
    *  Local-subprocess: the cross-product of the per-axis lists.
    *  E2B: the explicit template grid. */
   allowed_combinations: SandboxResourceCombo[];
+  /** False ⇔ the backend ignores the picked combo (local-subprocess
+   *  runs the MCP as a host process). The picker is disabled with a
+   *  "not enforced in local mode" note in that case. */
+  enforces_resources: boolean;
   supports_pause_resume: boolean;
   supports_egress_filtering: boolean;
   supports_persistent_disk: boolean;

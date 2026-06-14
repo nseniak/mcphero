@@ -45,7 +45,9 @@ cd mcphero
 docker compose --profile standalone up --build
 ```
 
-Then open **http://localhost:8080**. On first launch you'll see an email picker (standalone uses a no-login dev auth by default); pick any email and you become the admin of the default org. Config and data persist in Docker volumes (`mcpolis-config`, `mcpolis-data`), so your setup survives restarts.
+Then open **http://localhost:8080**. On first launch you'll see an email picker (standalone uses a no-login dev auth by default); pick any email and you become the admin of the default org. Config and data persist in Docker volumes, so your setup survives restarts. The compose project is pinned to `name: mcpolis`, so the volumes are created as `mcpolis_mcpolis-config` and `mcpolis_mcpolis-data` (the project name prefixes the volume key) — use those names with `docker volume inspect`.
+
+Because the compose file pins `name: mcpolis`, binds host port `8080`, and uses fixed volume names, two standalone instances can't coexist and `docker compose down` acts on the global `mcpolis` project. To run an isolated second instance, override the project name and host port: `docker compose -p mcphero-test --profile standalone up --build` (then tear it down with `docker compose -p mcphero-test down`).
 
 That's the whole install. Now add your first MCP server.
 
@@ -60,6 +62,14 @@ Open **Upstream MCPs → Add MCP** in the dashboard. There are two kinds of serv
 </p>
 
 **Hosted stdio MCP** — a `command:`-style server (e.g. `npx …`) that MCP Hero runs for you — by default as a local subprocess, or in an isolated remote sandbox when you configure one. Switch to the **JSON** tab and paste its config (command, args, env). Secrets are stored safely whether you write them inline or pull them into reusable `${VARIABLE}` placeholders — config lives in local files in standalone mode and is encrypted in the database in cloud.
+
+For a no-credentials first run, paste this into the **JSON** tab — the reference "everything" server needs no secrets:
+
+```json
+{ "command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"] }
+```
+
+The standalone image ships Node 20 (`npx`, `npm`) and `uvx`, so `npx`- and `uvx`-based stdio MCPs work out of the box — no host toolchain required. After adding it, click **Start** to connect and discover its tools.
 
 <p align="center">
   <img src="docs/images/add-mcp-stdio.png" alt="Adding a Hosted stdio MCP: paste a command/args JSON config on the JSON tab, with ${VARIABLE} placeholders for secrets" width="760">
@@ -278,7 +288,8 @@ Most domain logic is shared; divergence is concentrated in the storage factory, 
 | `stdio` MCP default | Allowed | Disabled (override via `MCPOLIS_ALLOW_STDIO_MCP`) |
 | Sandbox provider | `e2b` or `local-subprocess` | `e2b` only |
 | Startup secret validation | Skipped | Enforces session/encryption/Mongo/Redis (+ E2B when used) |
-| Multi-org UI (`OrgSwitcher`, Team page) | Hidden | Shown |
+| Org switcher (`OrgSwitcher`) | Hidden (single `default` org) | Shown |
+| Team page | Shown (manages the `default` org) | Shown |
 
 ---
 

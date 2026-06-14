@@ -143,6 +143,8 @@ test.describe("Non-admin gateway access", () => {
         arguments: { message: "evil plans" },
       });
       expect(JSON.stringify(denied.content)).toContain("Access denied");
+      // A hard policy block reports isError so clients can branch on it.
+      expect(denied.isError).toBe(true);
 
       // A message that doesn't match the pattern still goes through,
       // proving the constraint was the reason for the denial above.
@@ -151,6 +153,22 @@ test.describe("Non-admin gateway access", () => {
         arguments: { message: "nice plans" },
       });
       expect(JSON.stringify(ok.content)).toContain("nice plans");
+      expect(ok.isError ?? false).toBe(false);
+
+      // The denial is auditable: a ``denied`` row lands in the same
+      // audit log the admin UI reads, naming the forbidden argument.
+      const auditResp = await api.get(
+        `${BACKEND}/api/admin/audit?tool=test-tools__echo&user_id=${NON_ADMIN_EMAIL}`
+      );
+      expect(auditResp.status()).toBe(200);
+      const audit = await auditResp.json();
+      const deniedEntry = audit.entries.find(
+        (e: { policy_decision?: string; tool?: string }) =>
+          e.policy_decision === "denied" && e.tool === "test-tools__echo"
+      );
+      expect(deniedEntry).toBeDefined();
+      expect(deniedEntry.user_id).toBe(NON_ADMIN_EMAIL);
+      expect(String(deniedEntry.error_message)).toContain("forbidden pattern");
     } finally {
       await api.delete(
         `${BACKEND}/api/admin/roles/${NON_ADMIN_ROLE}/upstreams/test-tools/tools/echo/constraints/message`

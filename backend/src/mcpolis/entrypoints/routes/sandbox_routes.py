@@ -69,6 +69,9 @@ class SandboxCapabilitiesResponse(BaseModel):
     allowed_memory_mb: list[int]
     allowed_disk_gb: list[int]
     allowed_combinations: list[SandboxResourceComboView]
+    # False ⇔ the backend ignores the picked combo (local-subprocess);
+    # the admin UI hides/disables the picker with a "not enforced" note.
+    enforces_resources: bool = True
     supports_pause_resume: bool
     supports_egress_filtering: bool
     supports_persistent_disk: bool
@@ -132,6 +135,7 @@ def create_sandbox_router(
                 )
                 for combo in caps.allowed_combinations
             ],
+            enforces_resources=caps.enforces_resources,
             supports_pause_resume=caps.supports_pause_resume,
             supports_egress_filtering=caps.supports_egress_filtering,
             supports_persistent_disk=caps.supports_persistent_disk,

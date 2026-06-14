@@ -1,5 +1,6 @@
 import { Link } from "react-router";
 import { ChevronRight } from "lucide-react";
+import { useOrgSlug } from "../../hooks/useOrgSlug";
 import type { UpstreamSummary } from "../../api/types";
 import SettingToggle from "../ui/setting-toggle";
 
@@ -25,6 +26,7 @@ export function McpAccessTable({
   bordered?: boolean;
   onToolsClick?: (mcpId: string) => void;
 }) {
+  const orgSlug = useOrgSlug();
   if (upstreams.length === 0) {
     return <p className="text-zinc-400 text-sm">{emptyMessage}</p>;
   }
@@ -54,7 +56,7 @@ export function McpAccessTable({
                   </button>
                 ) : (
                   <Link
-                    to={`/admin/upstream/${row.mcpId}`}
+                    to={`/orgs/${orgSlug}/admin/upstream/${row.mcpId}`}
                     className={`hover:underline font-medium ${row.value ? "text-blue-600" : "text-zinc-400"}`}
                   >
                     {row.displayName}

@@ -52,6 +52,9 @@ def test_capabilities_declare_no_isolation() -> None:
     assert caps.supports_pause_resume is False
     assert caps.supports_egress_filtering is False
     assert caps.supports_persistent_disk is False
+    # The host subprocess ignores the requested CPU/RAM/disk, so the
+    # admin UI hides/disables the resource picker.
+    assert caps.enforces_resources is False
     # Disk is not user-configurable on this backend (only the
     # ephemeral 0 GiB choice).
     assert caps.allowed_disk_gb == (0,)

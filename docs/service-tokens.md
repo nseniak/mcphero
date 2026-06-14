@@ -56,6 +56,8 @@ curl -s https://mcphero.io/mcp/your-org/ \
 
 Use the organization-scoped URL (`/mcp/your-org`) from the dashboard. The token only works for its own organization — pointing it at another organization's URL is rejected.
 
+> **Gateway URL by mode.** The examples above are cloud (`mcphero.io`), where the gateway is org-scoped: `/mcp/<org-slug>`. In **standalone** mode there's a single `default` org and the gateway is served at the bare `/mcp` (e.g. `http://localhost:8080/mcp`) — no slug. Whichever mode you run, copy the exact URL shown on the dashboard's **Gateway MCP** / **Connect AI Assistant** page rather than hand-building it.
+
 ## Tokens in the audit log
 
 Every call an agent makes appears in the [audit log](audit-log.md) under the identity `svc:<name>` — for example `svc:ci-bot`. You can filter the **User** column by that identity just like a member email. This is why each agent should get its own token: separate tokens mean separate audit trails and independent revocation.

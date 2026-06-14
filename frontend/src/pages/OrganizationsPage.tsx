@@ -344,7 +344,7 @@ export function OrganizationsPage() {
                       )}
                     </td>
                     <td className="px-4 py-2">
-                      <RoleBadge role={org.role} />
+                      <RoleBadge role={org.role} orgSlug={org.slug} />
                     </td>
                     <td className="px-4 py-2 text-right tabular-nums text-zinc-700">
                       {org.member_count}
