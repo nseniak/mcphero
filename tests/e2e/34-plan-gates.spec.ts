@@ -22,6 +22,7 @@ import {
   expect,
   flipPlan,
   loginWithPlan,
+  resetSeededBaseline,
   upgradeDialogTitle,
 } from "./_plan_gates_helpers";
 import { BACKEND_URL, loginAs, apiLoginAs } from "./helpers";
@@ -30,6 +31,12 @@ test.describe.configure({ mode: "serial" });
 
 test.beforeEach(async ({ page }) => {
   await flipPlan(page.request, "free");
+  // Return the org to its seeded cold-boot state. This serial group's
+  // tests aren't individually idempotent (test 1 adds a member, the
+  // gate tests seed upstreams); without resetting, a single flake mid-run
+  // makes the Playwright retry of the whole group fail with stale-state
+  // 409s instead of recovering.
+  await resetSeededBaseline(page.request);
 });
 
 test.afterAll(async ({ request }) => {
@@ -196,30 +203,43 @@ test("9 — Plan column on /orgs/manage shows correct label per row", async ({ p
   await loginAs(page, ADMIN, ORG);
   await page.goto(`/orgs/manage`);
   await expect(page.getByRole("heading", { name: /Organizations/i })).toBeVisible();
-  // Scope to the table — the dashboard chrome also renders a
-  // ``plan-badge`` for the current org, which would otherwise
-  // win ``.first()``.
-  const rowBadge = page
-    .locator("table")
-    .getByTestId("plan-badge")
-    .first();
-  await expect(rowBadge).toHaveAttribute("data-plan", "free");
+  // Scope to acme-corp's row, NOT ``.first()``. The dashboard chrome
+  // renders its own ``plan-badge``, AND co-located specs on the same
+  // shard can leave extra orgs admin@example.com belongs to — either
+  // would win ``.first()`` and assert against the wrong org's plan. The
+  // row is identified by its slug span (rendered as exact text).
+  const rowBadge = () =>
+    page
+      .locator("tbody tr")
+      .filter({ has: page.getByText(ORG, { exact: true }) })
+      .getByTestId("plan-badge");
+  await expect(rowBadge()).toHaveAttribute("data-plan", "free");
   await flipPlan(page.request, "team");
   await page.reload();
-  await expect(
-    page.locator("table").getByTestId("plan-badge").first(),
-  ).toHaveAttribute("data-plan", "team");
+  await expect(rowBadge()).toHaveAttribute("data-plan", "team");
 });
 
 test("10 — Plan column + flip on superadmin list", async ({ page }) => {
   await loginAs(page, SUPERADMIN, ORG);
   await page.goto(`/superadmin/orgs`);
-  const select = page.getByTestId("superadmin-plan-select").first();
+  // Scope to acme-corp's row, NOT ``.first()``. Co-located specs on the
+  // same shard can leave extra orgs in the superadmin list, and the table
+  // re-renders (and may re-sort) after the PATCH lands — so ``.first()``
+  // can select one org and then poll a *different* row's value, which
+  // stays "free" forever ("Expected team, Received free").
+  const row = page.locator("tbody tr").filter({
+    has: page.getByRole("link", { name: ORG, exact: true }),
+  });
+  const select = row.getByTestId("superadmin-plan-select");
   await expect(select).toBeVisible();
   await select.selectOption("team");
+  // The select is controlled by query data, so its value reflects "team"
+  // only once the PATCH + refetch round-trips — which can lag under
+  // cross-suite load. 20s stays under the 30s standalone test timeout
+  // while giving the refetch room when the box is busy.
   await expect.poll(async () => {
-    return page.getByTestId("superadmin-plan-select").first().inputValue();
-  }, { timeout: 10_000 }).toBe("team");
+    return row.getByTestId("superadmin-plan-select").inputValue();
+  }, { timeout: 20_000 }).toBe("team");
 });
 
 test("11 — public /pricing while signed out", async ({ page, context }) => {

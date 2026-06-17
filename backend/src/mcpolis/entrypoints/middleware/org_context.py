@@ -39,6 +39,8 @@ Mongo round-trip per request. The cache is:
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import parse_qsl
 
@@ -63,6 +65,15 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 _MCP_PREFIX = "/mcp/"
 _ADMIN_MCP_PREFIX = "/admin-mcp/"
+
+# Throttle for the ``superadmin.org_access`` audit line: at most one
+# per (actor, org) per interval. A live cross-org drill-down re-sends
+# the ``X-Org-Slug`` / ``?org=`` override on every poll and SSE tick,
+# so an un-throttled log would emit dozens of identical lines per
+# session. 60s keeps the trail honest (every distinct access window is
+# recorded) without flooding Elastic. Mirrors the service-token
+# ``last_used_at`` throttle.
+_ACCESS_LOG_INTERVAL_SECONDS = 60.0
 
 # ``RESERVED_MCP_SEGMENTS`` is imported at module top. Deliberately
 # narrower than ``RESERVED_ORG_SLUGS``: that broader set (checked by
@@ -112,11 +123,17 @@ class OrgContextMiddleware:
         settings: Settings,
         org_service: OrgService,
         slug_cache: SlugCache,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._app = app
         self._settings = settings
         self._org_service = org_service
         self._cache = slug_cache
+        self._monotonic = monotonic
+        # (actor_email, org_id) -> last-logged monotonic time. Bounds
+        # the ``superadmin.org_access`` audit volume; see
+        # ``_ACCESS_LOG_INTERVAL_SECONDS``.
+        self._access_log_throttle: dict[tuple[str, str], float] = {}
 
     async def _resolve_slug(self, slug: str) -> str | None:
         cached = self._cache.get(slug)
@@ -132,6 +149,34 @@ class OrgContextMiddleware:
                 return None
             self._cache.put(slug, org.id)
             return org.id
+
+    def _record_superadmin_access(
+        self, actor: str, org_slug: str, org_id: str,
+    ) -> None:
+        """Emit a throttled audit line when a super-admin drills into a
+        foreign org via the cross-org override.
+
+        The override gate is otherwise silent — without this there is
+        no record that an operator entered a customer's org. The line
+        flows to Elastic through the structlog pipeline, the same path
+        the other ``superadmin.*`` action events take. Throttled per
+        (actor, org); see ``_ACCESS_LOG_INTERVAL_SECONDS``.
+        """
+        key = (actor, org_id)
+        now_mono = self._monotonic()
+        last = self._access_log_throttle.get(key)
+        if (
+            last is not None
+            and now_mono - last < _ACCESS_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._access_log_throttle[key] = now_mono
+        logger.info(
+            "superadmin.org_access",
+            actor=actor,
+            org_slug=org_slug,
+            org_id=org_id,
+        )
 
     @staticmethod
     def _split_slug_prefix(path: str, prefix: str) -> tuple[str, str] | None:
@@ -280,16 +325,28 @@ class OrgContextMiddleware:
                 elif header_name == b"x-org-slug":
                     header_override = header_value.decode("latin-1").strip()
             payload = _extract_cookie_payload(cookie_header, self._settings)
-            chosen_slug = _payload_str(payload, "org_slug")
+            own_slug = _payload_str(payload, "org_slug")
+            chosen_slug = own_slug
             override = header_override or _query_param(scope, "org")
+            # Set to the super-admin's email when this request is a
+            # genuine cross-org drill-down (override to an org other
+            # than the cookie's own), so we can record it after the
+            # slug resolves.
+            drilldown_actor = ""
             if override:
                 email = _payload_str(payload, "email")
                 if email and email in self._settings.parsed_superadmin_emails():
                     chosen_slug = override
+                    if override != own_slug:
+                        drilldown_actor = email
             if chosen_slug:
                 resolved_org_id = await self._resolve_slug(chosen_slug)
                 if resolved_org_id is not None:
                     resolved_slug = chosen_slug
+                    if drilldown_actor:
+                        self._record_superadmin_access(
+                            drilldown_actor, resolved_slug, resolved_org_id,
+                        )
 
         if resolved_org_id is None:
             # Bare ``/admin-mcp`` in cloud is a client error — it can't

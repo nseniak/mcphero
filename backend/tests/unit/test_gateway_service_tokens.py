@@ -30,14 +30,19 @@ from mcpolis.adapters.repositories.file_service_token_repository import (
 from mcpolis.domain.services.service_token_service import ServiceTokenService
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
+from tests.unit._loopback_mcp import (
+    MCP_CLIENT_TIMEOUT,
+    free_ports,
+    wait_for_health,
+)
 
-# Fixed-port convention shared with test_mcp_integration.py (which
-# owns 19876-19885): run-unit-tests.sh uses ``--dist loadfile``, so a
-# file's tests run serially in one worker — fixed ports are safe as
-# long as every file claims a disjoint range. Next free range starts
-# at 19888.
-GATEWAY_PORT = 19886
-UPSTREAM_PORT = 19887
+# OS-assigned at stack boot (see ``_start_stack``). Fixed ports collide
+# under load — a fixed loopback connect that times out raised an uncaught
+# ``httpx.ConnectTimeout`` and failed the test. ``_list_tools_with`` /
+# ``_call_tool_with`` read these module globals, so the file's single
+# serial stack sets them before the helpers run.
+_gateway_port = 0
+_upstream_port = 0
 
 
 def _write_config(tmp_path: Path, upstream_port: int) -> tuple[Path, Path]:
@@ -74,7 +79,7 @@ def _write_config(tmp_path: Path, upstream_port: int) -> tuple[Path, Path]:
 def _create_fake_upstream():  # noqa: ANN202 — FastMCP type lives in test dep
     from mcp.server.fastmcp import FastMCP
 
-    fake = FastMCP("fake", host="127.0.0.1", port=UPSTREAM_PORT)
+    fake = FastMCP("fake", host="127.0.0.1", port=_upstream_port)
 
     @fake.tool(description="Say hello")
     def greet(name: str) -> str:  # pyright: ignore[reportUnusedFunction]
@@ -86,17 +91,19 @@ def _create_fake_upstream():  # noqa: ANN202 — FastMCP type lives in test dep
 async def _start_stack(
     tmp_path: Path,
 ) -> tuple[uvicorn.Server, uvicorn.Server, asyncio.Task[None]]:
+    global _gateway_port, _upstream_port
+    _upstream_port, _gateway_port = free_ports(2)
     fake_mcp = _create_fake_upstream()
     upstream_server = uvicorn.Server(uvicorn.Config(
         fake_mcp.streamable_http_app(), host="127.0.0.1",
-        port=UPSTREAM_PORT, log_level="warning", ws="none",
+        port=_upstream_port, log_level="warning", ws="none",
     ))
 
-    mcp_json_path, config_path = _write_config(tmp_path, UPSTREAM_PORT)
+    mcp_json_path, config_path = _write_config(tmp_path, _upstream_port)
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         host="127.0.0.1",
-        port=GATEWAY_PORT,
+        port=_gateway_port,
         mcp_json_path=mcp_json_path,
         config_path=config_path,
         data_dir=tmp_path / "data",
@@ -106,10 +113,10 @@ async def _start_stack(
         google_client_id="",
         google_client_secret="",
         session_secret="svc-token-test-secret",
-        server_url=f"http://127.0.0.1:{GATEWAY_PORT}",
+        server_url=f"http://127.0.0.1:{_gateway_port}",
     )
     gateway_server = uvicorn.Server(uvicorn.Config(
-        create_app(settings), host="127.0.0.1", port=GATEWAY_PORT,
+        create_app(settings), host="127.0.0.1", port=_gateway_port,
         log_level="warning", ws="none",
     ))
 
@@ -119,16 +126,11 @@ async def _start_stack(
             tg.create_task(gateway_server.serve())
 
     server_task = asyncio.create_task(run_servers())
-    for port in (UPSTREAM_PORT, GATEWAY_PORT):
-        for _ in range(50):
-            try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(f"http://127.0.0.1:{port}/health")
-                    if resp.status_code == 200:
-                        break
-            except httpx.ConnectError:
-                pass
-            await asyncio.sleep(0.1)
+    await wait_for_health(
+        f"http://127.0.0.1:{_upstream_port}/health",
+        f"http://127.0.0.1:{_gateway_port}/health",
+        label="service-token gateway stack",
+    )
     return upstream_server, gateway_server, server_task
 
 
@@ -162,9 +164,10 @@ def make_registry_service(tmp_path: Path) -> ServiceTokenService:
 async def _list_tools_with(token: str) -> list[str]:
     async with httpx.AsyncClient(
         headers={"Authorization": f"Bearer {token}"},
+        timeout=MCP_CLIENT_TIMEOUT,
     ) as http_client:
         async with streamable_http_client(
-            f"http://127.0.0.1:{GATEWAY_PORT}/mcp/", http_client=http_client,
+            f"http://127.0.0.1:{_gateway_port}/mcp/", http_client=http_client,
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -177,9 +180,10 @@ async def _call_tool_with(
 ) -> tuple[bool, str]:
     async with httpx.AsyncClient(
         headers={"Authorization": f"Bearer {token}"},
+        timeout=MCP_CLIENT_TIMEOUT,
     ) as http_client:
         async with streamable_http_client(
-            f"http://127.0.0.1:{GATEWAY_PORT}/mcp/", http_client=http_client,
+            f"http://127.0.0.1:{_gateway_port}/mcp/", http_client=http_client,
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()

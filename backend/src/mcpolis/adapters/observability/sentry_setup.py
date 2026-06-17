@@ -51,6 +51,16 @@ _SCRUB_HEADERS = {"authorization", "cookie"}
 # so it must not be stuffed into Sentry's ``user.email`` field.
 _ANON_USER = "anonymous"
 
+# Paths hit only by machine probes (the Docker/LB healthchecks). The
+# cloud compose runs a 10s ``/health`` healthcheck against the ASGI app
+# — ~8.6k requests/day — and the FastAPI integration would auto-trace
+# every one. A sibling project sharing this Sentry org's pooled
+# transaction quota let exactly this become ~90% of its transactions
+# and starved the quota, rate-limiting every other project (mcpolis
+# included). We sample these to 0.0 so the probe volume can never spend
+# quota, independent of how often it fires.
+_UNTRACED_PATHS = frozenset({"/health", "/healthz"})
+
 
 def _first_real(
     candidates: tuple[object, ...], sentinels: frozenset[str]
@@ -122,6 +132,29 @@ def _make_before_send(
     return _before_send
 
 
+def _make_traces_sampler(
+    base_rate: float, untraced_paths: frozenset[str]
+) -> Callable[[dict[str, object]], float]:
+    """Sample at ``base_rate`` except for machine-probe paths (→ 0.0).
+
+    The ASGI integration exposes the request path at
+    ``sampling_context["asgi_scope"]["path"]``. We deliberately do NOT
+    honor an inbound ``parent_sampled`` decision: the ``/mcp`` gateway
+    is public, so trusting a client-supplied ``sentry-trace`` header
+    would let anyone force 100% sampling and burn the shared quota.
+    """
+
+    def _traces_sampler(sampling_context: dict[str, object]) -> float:
+        scope = sampling_context.get("asgi_scope")
+        if isinstance(scope, dict):
+            path = scope.get("path")  # type: ignore[reportUnknownMemberType]
+            if isinstance(path, str) and path in untraced_paths:
+                return 0.0
+        return base_rate
+
+    return _traces_sampler
+
+
 def init_sentry(settings: Settings) -> bool:
     """Initialize Sentry if a DSN is configured. Returns True if enabled."""
     if not settings.sentry_dsn:
@@ -130,7 +163,9 @@ def init_sentry(settings: Settings) -> bool:
         dsn=settings.sentry_dsn,
         environment=settings.sentry_environment or settings.mode,
         release=settings.release or None,
-        traces_sample_rate=settings.sentry_traces_sample_rate,
+        traces_sampler=_make_traces_sampler(
+            settings.sentry_traces_sample_rate, _UNTRACED_PATHS
+        ),
         send_default_pii=False,
         before_send=_make_before_send(_org_sentinels(settings.mode)),
     )
@@ -138,5 +173,6 @@ def init_sentry(settings: Settings) -> bool:
         "sentry.enabled",
         environment=settings.sentry_environment or settings.mode,
         traces_sample_rate=settings.sentry_traces_sample_rate,
+        untraced_paths=sorted(_UNTRACED_PATHS),
     )
     return True

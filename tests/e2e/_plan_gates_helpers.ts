@@ -66,6 +66,42 @@ export async function loginWithPlan(
   await loginAs(page, ADMIN, ORG);
 }
 
+/** Artifacts the serial 34-plan-gates group adds across its tests.
+ *  Cleared by ``resetSeededBaseline`` in beforeEach so every test — and
+ *  every Playwright retry of the serial group — starts from the seeded
+ *  cold-boot state. Without this, one flake mid-group makes the retry run
+ *  against dirtied state: test 1 re-adds ``fourth@example.com`` and 409s,
+ *  the upstream-gate tests 409 on their re-seeds, and the whole group
+ *  fails for the wrong reason instead of recovering. */
+export const ADDED_MEMBERS = ["fourth@example.com"];
+export const ADDED_UPSTREAMS = [
+  "seed-http-0",
+  "seed-http-1",
+  "seed-http-2",
+  "seed-http-3",
+  "seed-http-blocked",
+  "seed-stdio-0",
+  "seed-stdio-1",
+];
+
+/** Delete every artifact the 34-plan-gates tests add, returning the org to
+ *  its seeded baseline (3 members, 3 upstreams). Deletes are idempotent —
+ *  a 404 on an already-absent id is fine — and never plan-gated, so this is
+ *  safe to call on either plan. */
+export async function resetSeededBaseline(
+  request: APIRequestContext,
+): Promise<void> {
+  await apiLoginAs(request, ADMIN);
+  for (const id of ADDED_UPSTREAMS) {
+    await request.delete(`${BACKEND_URL}/api/admin/upstreams/${id}`);
+  }
+  for (const email of ADDED_MEMBERS) {
+    await request.delete(
+      `${BACKEND_URL}/api/admin/users/${encodeURIComponent(email)}`,
+    );
+  }
+}
+
 /** Add ``count`` extra members to the seeded org so subsequent
  *  ``Add member`` clicks hit the seat gate. The seeded admin counts
  *  toward the cap, so passing 2 lands at exactly the Free-plan

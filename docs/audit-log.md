@@ -33,3 +33,7 @@ The play/pause button at the top-left of the filter bar controls **live mode**:
 - **Paused** — the view freezes. Useful for taking a snapshot, scrolling through what's there, or copy/pasting an entry without it scrolling away.
 
 Clicking pause doesn't stop logging — it just stops the dashboard from showing new entries until you press play again.
+
+## Operator access
+
+If you use the hosted MCP Hero, the people who operate the service have a limited support role that can step into your organization to help (for example, to investigate failing connections). That access is recorded, as are the reversible account actions an operator can take on your behalf. It can't read your secrets or your tool-call arguments. See [Operator access](operator-access.md) for the full picture.

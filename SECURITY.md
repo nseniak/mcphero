@@ -49,3 +49,35 @@ When deploying your own instance, review the README's cloud-mode and
 "Securing secrets" sections, set strong `MCPOLIS_SESSION_SECRET` /
 `MCPOLIS_ENCRYPTION_KEY` values, and terminate TLS at your reverse
 proxy.
+
+## The operator (superadmin) role
+
+Multi-tenant cloud deployments have an **operator** role — `superadmin`
+in the code — gated by the `MCPOLIS_SUPERADMIN_EMAILS` allowlist (a
+comma-separated env var read once at startup). It's empty in
+single-org / standalone deployments. Every SaaS operator has privileged
+access to the system they run; this one is explicit and bounded so it
+can be audited here rather than taken on trust. On the hosted service
+the allowlist is the operator alone; if you self-host, you control it
+(set it to yourself, or leave it empty).
+
+**The operator role can:** read cross-organization *metadata* (org
+names, member rosters, plans, upstream names / transport / connection
+status, OAuth token *health* — never token values); search the audit
+log across orgs; change an org's plan; take soft, reversible account
+actions (revoke a user's gateway sessions, clear a stuck OAuth
+connection); delete an org behind an explicit confirmation; and enter an
+org's admin surface to support it. The mutations and the org-entry are
+recorded with the operator's identity.
+
+**The operator role cannot:** impersonate a user or forge gateway
+credentials (it acts only as itself); read back your secrets (secret
+variables and upstream credentials are *write-only* — accepted when set,
+never returned by any read API, even to an operator inside your org); or
+see tool-call arguments (the audit log records *what* ran and *whether
+it was allowed*, not argument values).
+
+When an operator enters an organization they don't belong to, an access
+record carrying the operator's identity and the target org is written to
+the log pipeline — so every operator touch of a customer org leaves a
+trail.

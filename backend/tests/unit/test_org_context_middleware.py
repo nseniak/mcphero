@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+import structlog
 from starlette.types import Message, Receive, Scope, Send
 
 from mcpolis.domain.ports import DEFAULT_ORG_ID
@@ -135,19 +136,21 @@ def make_org_service(slugs: dict[str, str] | None = None) -> FakeOrgService:
     )
 
 
-async def run_middleware(
+def build_middleware(
     settings: Settings,
-    path: str,
-    *,
-    cookie_header: str | None = None,
-    org_slug_header: str | None = None,
-    query_string: str = "",
     org_service: FakeOrgService | None = None,
-) -> MiddlewareResult:
-    """Drive the middleware with a mock downstream ASGI app."""
+    monotonic: Any = None,
+) -> tuple[OrgContextMiddleware, dict[str, Any]]:
+    """Build a middleware over a mock downstream ASGI app.
+
+    Returns ``(middleware, captured)``. ``captured`` is refreshed on
+    every downstream call with the path / org_id / org_slug the mount
+    saw. Reuse the same returned middleware across multiple ``drive``
+    calls to exercise instance state (the slug cache, the
+    super-admin-access log throttle).
+    """
     slug_cache = SlugCache()
     org_svc = org_service or make_org_service()
-
     captured: dict[str, Any] = {}
 
     async def downstream(scope: Scope, receive: Receive, send: Send) -> None:
@@ -165,10 +168,27 @@ async def run_middleware(
             "more_body": False,
         })
 
+    kwargs: dict[str, Any] = {}
+    if monotonic is not None:
+        kwargs["monotonic"] = monotonic
     middleware = OrgContextMiddleware(
         downstream, settings, org_svc,  # type: ignore[arg-type]
-        slug_cache,
+        slug_cache, **kwargs,
     )
+    return middleware, captured
+
+
+async def drive(
+    middleware: OrgContextMiddleware,
+    captured: dict[str, Any],
+    path: str,
+    *,
+    cookie_header: str | None = None,
+    org_slug_header: str | None = None,
+    query_string: str = "",
+) -> MiddlewareResult:
+    """Send one request through an already-built middleware."""
+    captured.clear()
 
     headers: list[tuple[bytes, bytes]] = []
     if cookie_header is not None:
@@ -209,6 +229,25 @@ async def run_middleware(
         org_id=captured["org_id"],
         org_slug=captured["org_slug"],
         status=status,
+    )
+
+
+async def run_middleware(
+    settings: Settings,
+    path: str,
+    *,
+    cookie_header: str | None = None,
+    org_slug_header: str | None = None,
+    query_string: str = "",
+    org_service: FakeOrgService | None = None,
+) -> MiddlewareResult:
+    """Drive a fresh middleware with a mock downstream for one request."""
+    middleware, captured = build_middleware(settings, org_service)
+    return await drive(
+        middleware, captured, path,
+        cookie_header=cookie_header,
+        org_slug_header=org_slug_header,
+        query_string=query_string,
     )
 
 
@@ -625,6 +664,144 @@ async def test_superadmin_override_unknown_slug_falls_back_to_default() -> None:
     assert result.status == 200
     assert result.org_id == DEFAULT_ORG_ID
     assert result.org_slug == ""
+
+
+# ── Cloud mode: super-admin cross-org access audit log ───────────────
+
+
+@pytest.mark.asyncio
+async def test_superadmin_drilldown_emits_access_audit_log() -> None:
+    """A super-admin drilling into a foreign org emits one
+    ``superadmin.org_access`` line carrying actor + target org, so the
+    otherwise-silent override leaves an audit trail."""
+    settings = make_settings(
+        mode="cloud", superadmin_emails="super@admin.com",
+    )
+    org_svc = make_org_service(
+        {"home": "home-org-id", "acme": "acme-org-id"},
+    )
+    middleware, captured = build_middleware(settings, org_svc)
+    with structlog.testing.capture_logs() as logs:
+        result = await drive(
+            middleware, captured, "/api/admin/upstreams/up-1",
+            cookie_header=_superadmin_cookie(settings, org_slug="home"),
+            org_slug_header="acme",
+        )
+
+    assert result.org_id == "acme-org-id"
+    access = [e for e in logs if e["event"] == "superadmin.org_access"]
+    assert len(access) == 1
+    assert access[0]["actor"] == "super@admin.com"
+    assert access[0]["org_slug"] == "acme"
+    assert access[0]["org_id"] == "acme-org-id"
+
+
+@pytest.mark.asyncio
+async def test_superadmin_own_org_override_emits_no_access_log() -> None:
+    """An override that resolves to the super-admin's own cookie org is
+    not a cross-org drill-down — no audit line."""
+    settings = make_settings(
+        mode="cloud", superadmin_emails="super@admin.com",
+    )
+    org_svc = make_org_service({"home": "home-org-id"})
+    middleware, captured = build_middleware(settings, org_svc)
+    with structlog.testing.capture_logs() as logs:
+        await drive(
+            middleware, captured, "/api/admin/upstreams/up-1",
+            cookie_header=_superadmin_cookie(settings, org_slug="home"),
+            org_slug_header="home",
+        )
+
+    assert not [e for e in logs if e["event"] == "superadmin.org_access"]
+
+
+@pytest.mark.asyncio
+async def test_non_superadmin_override_emits_no_access_log() -> None:
+    """A normal user's ignored override grants no access and logs
+    nothing — the gate is super-admin-only on both axes."""
+    settings = make_settings(
+        mode="cloud", superadmin_emails="super@admin.com",
+    )
+    org_svc = make_org_service(
+        {"home": "home-org-id", "acme": "acme-org-id"},
+    )
+    middleware, captured = build_middleware(settings, org_svc)
+    with structlog.testing.capture_logs() as logs:
+        result = await drive(
+            middleware, captured, "/api/admin/upstreams/up-1",
+            cookie_header=_member_cookie(
+                settings, email="bob@home.com", org_slug="home",
+            ),
+            org_slug_header="acme",
+        )
+
+    assert result.org_id == "home-org-id"
+    assert not [e for e in logs if e["event"] == "superadmin.org_access"]
+
+
+@pytest.mark.asyncio
+async def test_superadmin_unknown_override_slug_emits_no_access_log() -> None:
+    """An override slug that doesn't resolve (typo / deleted org) never
+    reached a foreign org, so it logs no access line."""
+    settings = make_settings(
+        mode="cloud", superadmin_emails="super@admin.com",
+    )
+    org_svc = make_org_service({"home": "home-org-id"})  # "ghost" absent
+    middleware, captured = build_middleware(settings, org_svc)
+    with structlog.testing.capture_logs() as logs:
+        await drive(
+            middleware, captured, "/api/admin/upstreams/up-1",
+            cookie_header=_superadmin_cookie(settings, org_slug="home"),
+            org_slug_header="ghost",
+        )
+
+    assert not [e for e in logs if e["event"] == "superadmin.org_access"]
+
+
+@pytest.mark.asyncio
+async def test_superadmin_access_log_throttled_per_org() -> None:
+    """Repeat drill-downs into the same org inside the throttle window
+    emit one line; a different org is keyed separately and emits its
+    own; past the window the same org logs again. A controllable
+    monotonic clock drives the window."""
+    settings = make_settings(
+        mode="cloud", superadmin_emails="super@admin.com",
+    )
+    org_svc = make_org_service(
+        {"home": "home-org-id", "acme": "acme-org-id", "beta": "beta-org-id"},
+    )
+    clock = {"t": 1000.0}
+    middleware, captured = build_middleware(
+        settings, org_svc, monotonic=lambda: clock["t"],
+    )
+    cookie = _superadmin_cookie(settings, org_slug="home")
+
+    with structlog.testing.capture_logs() as logs:
+        # First acme hit logs.
+        await drive(
+            middleware, captured, "/api/admin/upstreams/up-1",
+            cookie_header=cookie, org_slug_header="acme",
+        )
+        # +30s: still inside the 60s window for acme — throttled.
+        clock["t"] += 30.0
+        await drive(
+            middleware, captured, "/api/admin/upstreams/up-1",
+            cookie_header=cookie, org_slug_header="acme",
+        )
+        # beta is a separate (actor, org) key — logs immediately.
+        await drive(
+            middleware, captured, "/api/admin/upstreams/up-1",
+            cookie_header=cookie, org_slug_header="beta",
+        )
+        # +31s (61s since the first acme hit) — past the window, logs again.
+        clock["t"] += 31.0
+        await drive(
+            middleware, captured, "/api/admin/upstreams/up-1",
+            cookie_header=cookie, org_slug_header="acme",
+        )
+
+    access = [e for e in logs if e["event"] == "superadmin.org_access"]
+    assert [e["org_slug"] for e in access] == ["acme", "beta", "acme"]
 
 
 # ── Cloud mode: bare /mcp/ and /admin-mcp/ (current behaviour) ──────

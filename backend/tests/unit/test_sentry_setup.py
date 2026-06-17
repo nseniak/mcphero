@@ -15,7 +15,9 @@ import structlog
 from sentry_sdk.types import Event, Hint
 
 from mcpolis.adapters.observability.sentry_setup import (
+    _UNTRACED_PATHS,
     _make_before_send,
+    _make_traces_sampler,
     _org_sentinels,
 )
 from mcpolis.entrypoints.config import Mode
@@ -127,6 +129,50 @@ def test_before_send_tags_default_org_in_standalone() -> None:
     bind_identity(ctx_user="anonymous", ctx_org="default")
     result = run_before_send(make_event(), mode="standalone")
     assert org_tag_of(result) == "default"
+
+
+def make_sampling_context(
+    path: str | None = None, parent_sampled: bool | None = None
+) -> dict[str, object]:
+    """Build a Sentry ``traces_sampler`` context.
+
+    With ``path`` it carries an ``asgi_scope`` (the HTTP-request shape);
+    without it, the bare dict stands in for a non-ASGI transaction (e.g.
+    a background-task ``start_transaction``).
+    """
+    ctx: dict[str, object] = {}
+    if path is not None:
+        ctx["asgi_scope"] = {"type": "http", "path": path}
+    if parent_sampled is not None:
+        ctx["parent_sampled"] = parent_sampled
+    return ctx
+
+
+def test_traces_sampler_drops_machine_probe_paths() -> None:
+    sampler = _make_traces_sampler(0.1, _UNTRACED_PATHS)
+    assert sampler(make_sampling_context("/health")) == 0.0
+    assert sampler(make_sampling_context("/healthz")) == 0.0
+
+
+def test_traces_sampler_keeps_base_rate_for_real_routes() -> None:
+    sampler = _make_traces_sampler(0.1, _UNTRACED_PATHS)
+    assert sampler(make_sampling_context("/api/orgs")) == 0.1
+    assert sampler(make_sampling_context("/mcp/your-org/")) == 0.1
+
+
+def test_traces_sampler_ignores_client_supplied_parent_decision() -> None:
+    # The /mcp gateway is public: a client-set ``sentry-trace`` header
+    # must not force-sample (or unsample) and burn the shared quota. The
+    # sampler is path-only, so parent_sampled is irrelevant.
+    sampler = _make_traces_sampler(0.1, _UNTRACED_PATHS)
+    assert sampler(make_sampling_context("/api/orgs", parent_sampled=True)) == 0.1
+    assert sampler(make_sampling_context("/health", parent_sampled=True)) == 0.0
+
+
+def test_traces_sampler_keeps_base_rate_without_asgi_scope() -> None:
+    # Non-ASGI transactions (background tasks) keep the base rate.
+    sampler = _make_traces_sampler(0.1, _UNTRACED_PATHS)
+    assert sampler(make_sampling_context()) == 0.1
 
 
 def test_before_send_scrubs_auth_headers() -> None:

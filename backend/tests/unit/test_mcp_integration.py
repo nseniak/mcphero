@@ -16,6 +16,11 @@ from mcp.server.fastmcp import FastMCP
 
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
+from tests.unit._loopback_mcp import (
+    MCP_CLIENT_TIMEOUT,
+    free_ports,
+    wait_for_health,
+)
 
 
 def _write_config(tmp_path: Path, upstream_port: int) -> tuple[Path, Path]:
@@ -76,7 +81,9 @@ async def test_end_to_end_tool_discovery_and_call(tmp_path: Path) -> None:
     fake_mcp = _create_fake_upstream()
     upstream_app = fake_mcp.streamable_http_app()
 
-    upstream_port = 19876
+    # OS-assigned free ports — fixed ports collide under load (see
+    # tests/unit/_loopback_mcp.py).
+    upstream_port, gateway_port = free_ports(2)
     # ``ws="none"`` skips loading uvicorn's ws adapter, which still
     # imports the deprecated ``websockets.server.WebSocketServerProtocol``
     # path and emits a DeprecationWarning. The MCP gateway uses
@@ -113,7 +120,7 @@ async def test_end_to_end_tool_discovery_and_call(tmp_path: Path) -> None:
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         host="127.0.0.1",
-        port=19877,
+        port=gateway_port,
         mcp_json_path=mcp_json_path,
         config_path=config_path,
         data_dir=tmp_path / "data",
@@ -123,11 +130,11 @@ async def test_end_to_end_tool_discovery_and_call(tmp_path: Path) -> None:
         google_client_id="",
         google_client_secret="",
         session_secret="integration-test-secret",
-        server_url="http://127.0.0.1:19877",
+        server_url=f"http://127.0.0.1:{gateway_port}",
     )
     gateway_app = create_app(settings)
     gateway_config = uvicorn.Config(
-        gateway_app, host="127.0.0.1", port=19877,
+        gateway_app, host="127.0.0.1", port=gateway_port,
         log_level="warning", ws="none",
     )
     gateway_server = uvicorn.Server(gateway_config)
@@ -140,25 +147,21 @@ async def test_end_to_end_tool_discovery_and_call(tmp_path: Path) -> None:
     server_task = asyncio.create_task(run_servers())
 
     try:
-        # Wait for both servers to be ready
-        for port in (upstream_port, 19877):
-            for _ in range(50):
-                try:
-                    async with httpx.AsyncClient() as client:
-                        resp = await client.get(f"http://127.0.0.1:{port}/health")
-                        if resp.status_code == 200:
-                            break
-                except httpx.ConnectError:
-                    pass
-                await asyncio.sleep(0.1)
+        # Wait for both servers to be ready (raises if either never comes up).
+        await wait_for_health(
+            f"http://127.0.0.1:{upstream_port}/health",
+            f"http://127.0.0.1:{gateway_port}/health",
+            label="e2e tool-discovery stack",
+        )
 
         # 3. Connect MCP client to gateway with a real bearer token.
         gateway_provider = gateway_app.state.mcp_gateway_oauth_provider
         token = await gateway_provider.mint_test_token("admin@test.com")
         async with httpx.AsyncClient(
             headers={"Authorization": f"Bearer {token}"},
+            timeout=MCP_CLIENT_TIMEOUT,
         ) as http_client, streamable_http_client(
-            "http://127.0.0.1:19877/mcp/", http_client=http_client,
+            f"http://127.0.0.1:{gateway_port}/mcp/", http_client=http_client,
         ) as (read_stream, write_stream, _get_session_id):
             session = ClientSession(read_stream, write_stream)
             async with session:
@@ -205,9 +208,15 @@ async def test_end_to_end_tool_discovery_and_call(tmp_path: Path) -> None:
 
 
 async def _start_gateway_with_policy(
-    tmp_path: Path, upstream_port: int, gateway_port: int
-) -> tuple[uvicorn.Server, uvicorn.Server, asyncio.Task[None], object]:
-    """Start fake upstream + gateway with policy config. Returns servers, task, and gateway provider."""
+    tmp_path: Path,
+) -> tuple[uvicorn.Server, uvicorn.Server, asyncio.Task[None], object, int]:
+    """Start fake upstream + gateway with policy config.
+
+    Allocates its own free ports (fixed ports collide under load) and
+    returns the servers, the run task, the gateway provider, and the
+    gateway port the caller should connect to.
+    """
+    upstream_port, gateway_port = free_ports(2)
     fake_mcp = _create_fake_upstream()
     upstream_app = fake_mcp.streamable_http_app()
     upstream_server = uvicorn.Server(
@@ -248,19 +257,20 @@ async def _start_gateway_with_policy(
 
     server_task = asyncio.create_task(run_servers())
 
-    # Wait for both servers to be ready
-    for port in (upstream_port, gateway_port):
-        for _ in range(50):
-            try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(f"http://127.0.0.1:{port}/health")
-                    if resp.status_code == 200:
-                        break
-            except httpx.ConnectError:
-                pass
-            await asyncio.sleep(0.1)
+    # Wait for both servers to be ready (raises if either never comes up).
+    await wait_for_health(
+        f"http://127.0.0.1:{upstream_port}/health",
+        f"http://127.0.0.1:{gateway_port}/health",
+        label="policy gateway stack",
+    )
 
-    return upstream_server, gateway_server, server_task, gateway_app.state.mcp_gateway_oauth_provider
+    return (
+        upstream_server,
+        gateway_server,
+        server_task,
+        gateway_app.state.mcp_gateway_oauth_provider,
+        gateway_port,
+    )
 
 
 async def _connect_as(
@@ -270,6 +280,7 @@ async def _connect_as(
     token = await gateway_provider.mint_test_token(user_id)  # type: ignore[attr-defined]
     async with httpx.AsyncClient(
         headers={"Authorization": f"Bearer {token}"},
+        timeout=MCP_CLIENT_TIMEOUT,
     ) as http_client:
         async with streamable_http_client(
             f"http://127.0.0.1:{gateway_port}/mcp/", http_client=http_client
@@ -291,6 +302,7 @@ async def _call_tool_as(
     token = await gateway_provider.mint_test_token(user_id)  # type: ignore[attr-defined]
     async with httpx.AsyncClient(
         headers={"Authorization": f"Bearer {token}"},
+        timeout=MCP_CLIENT_TIMEOUT,
     ) as http_client:
         async with streamable_http_client(
             f"http://127.0.0.1:{gateway_port}/mcp/", http_client=http_client
@@ -304,11 +316,11 @@ async def _call_tool_as(
 
 @pytest.mark.asyncio
 async def test_policy_admin_sees_all_tools(tmp_path: Path) -> None:
-    upstream_server, gateway_server, server_task, gateway_provider = await _start_gateway_with_policy(
-        tmp_path, 19878, 19879
+    upstream_server, gateway_server, server_task, gateway_provider, gateway_port = (
+        await _start_gateway_with_policy(tmp_path)
     )
     try:
-        tools = await _connect_as(19879, gateway_provider, "admin@test.com")
+        tools = await _connect_as(gateway_port, gateway_provider, "admin@test.com")
         assert "fake__greet" in tools
     finally:
         upstream_server.should_exit = True
@@ -323,11 +335,11 @@ async def test_policy_admin_sees_all_tools(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_policy_limited_user_sees_only_allowed_tools(tmp_path: Path) -> None:
-    upstream_server, gateway_server, server_task, gateway_provider = await _start_gateway_with_policy(
-        tmp_path, 19880, 19881
+    upstream_server, gateway_server, server_task, gateway_provider, gateway_port = (
+        await _start_gateway_with_policy(tmp_path)
     )
     try:
-        tools = await _connect_as(19881, gateway_provider, "limited@test.com")
+        tools = await _connect_as(gateway_port, gateway_provider, "limited@test.com")
         assert "fake__greet" in tools
     finally:
         upstream_server.should_exit = True
@@ -342,11 +354,11 @@ async def test_policy_limited_user_sees_only_allowed_tools(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_policy_unknown_user_sees_no_tools(tmp_path: Path) -> None:
-    upstream_server, gateway_server, server_task, gateway_provider = await _start_gateway_with_policy(
-        tmp_path, 19882, 19883
+    upstream_server, gateway_server, server_task, gateway_provider, gateway_port = (
+        await _start_gateway_with_policy(tmp_path)
     )
     try:
-        tools = await _connect_as(19883, gateway_provider, "nobody@test.com")
+        tools = await _connect_as(gateway_port, gateway_provider, "nobody@test.com")
         assert tools == []
     finally:
         upstream_server.should_exit = True
@@ -361,19 +373,19 @@ async def test_policy_unknown_user_sees_no_tools(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_policy_argument_pattern_blocks_call(tmp_path: Path) -> None:
-    upstream_server, gateway_server, server_task, gateway_provider = await _start_gateway_with_policy(
-        tmp_path, 19884, 19885
+    upstream_server, gateway_server, server_task, gateway_provider, gateway_port = (
+        await _start_gateway_with_policy(tmp_path)
     )
     try:
         # Allowed call
         _is_error, text = await _call_tool_as(
-            19885, gateway_provider, "limited@test.com", "fake__greet", {"name": "World"}
+            gateway_port, gateway_provider, "limited@test.com", "fake__greet", {"name": "World"}
         )
         assert "Hello, World" in text
 
         # Blocked by allow pattern (doesn't match ^World$)
         _is_error, text = await _call_tool_as(
-            19885, gateway_provider, "limited@test.com", "fake__greet", {"name": "evil"}
+            gateway_port, gateway_provider, "limited@test.com", "fake__greet", {"name": "evil"}
         )
         assert "Access denied" in text
     finally:

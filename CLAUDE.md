@@ -157,6 +157,26 @@ point it at the e2e test mongo instead (running whenever an
 e2e run hasn't been torn down with `--clean`).
 - Type check: `bash backend/run-pyright.sh src/ tests/`
 
+### Run all three suites at once: `make test-all`
+
+`make test-all` (→ [tests/run-all-tests.py](tests/run-all-tests.py))
+runs the backend unit, full Playwright e2e, and E2B integration
+suites **concurrently** and exits non-zero if any fails. The three
+only oversubscribed the box when each ran at full tilt, so the
+orchestrator bounds *total* concurrency to the host's cores rather
+than serializing: each e2e shard counts ~2 CPUs, integration is
+network-bound (~0), and unit's `-j` takes the rest with ~2 cores of
+headroom. On a 14-core box that's `unit -j4`, `e2e --shards 4`,
+`integration -j4`. Per-suite JSON reports are aggregated into
+`/tmp/mcpolis-all-aggregate.txt`; per-suite logs land at
+`/tmp/mcpolis-all-{unit,e2e,integration}.log`.
+
+Knobs (env vars): `NO_INTEGRATION=1` skips the paid E2B leg for
+cheap local runs; `UNIT_JOBS` / `E2E_SHARDS` / `INTEGRATION_JOBS`
+override the budget; `E2E_RETRIES` / `E2E_TIMEOUT_MS` (defaulted
+to `2` / `45000` under `test-all`) are forwarded to Playwright,
+which reads them in [tests/e2e/playwright.config.ts](tests/e2e/playwright.config.ts).
+
 ## Service tokens (gateway auth for headless agents)
 
 Non-interactive bearer credentials for the `/mcp` gateway: `svct_`-prefixed

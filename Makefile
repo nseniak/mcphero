@@ -8,10 +8,13 @@
 #   conda activate mcpolis
 #   make <target>
 
-.PHONY: help og-image app-icon github-social
+.PHONY: help og-image app-icon github-social test-all
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+test-all: ## Run unit + e2e + integration suites concurrently under a shared core budget (NO_INTEGRATION=1 to skip the paid E2B leg)
+	bash tests/run-all-tests.sh
 
 og-image: ## Re-render frontend/public/og-image.png from frontend/scripts/og-card.svg
 	cd frontend && node scripts/generate-og-image.mjs

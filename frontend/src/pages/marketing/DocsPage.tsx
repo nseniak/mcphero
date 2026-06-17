@@ -38,6 +38,7 @@ export const SIDEBAR: DocEntry[] = [
   { slug: "roles-and-permissions", title: "Roles and permissions" },
   { slug: "service-tokens", title: "Service tokens" },
   { slug: "audit-log", title: "Audit log" },
+  { slug: "operator-access", title: "Operator access" },
   { slug: "admin-mcp", title: "Admin MCP" },
 ];
 

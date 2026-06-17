@@ -17,4 +17,5 @@ If you're brand new, start with **Getting started**. If you know what you're loo
 - **[Roles and permissions](roles-and-permissions.md)** — the access model: roles, per-MCP and per-tool access, argument checks.
 - **[Service tokens](service-tokens.md)** — connecting headless agents (CI jobs, bots, server-side AI agents) to the gateway with a revocable bearer token bound to a role.
 - **[Audit log](audit-log.md)** — what gets logged, and how to search it.
+- **[Operator access](operator-access.md)** — what the people who run the hosted service can and can't see, and how that access is recorded.
 - **[Admin MCP](admin-mcp.md)** — managing MCP Hero conversationally from your AI assistant.
