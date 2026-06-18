@@ -36,7 +36,11 @@ from mcpolis.domain.services.upstream_connection_service import (
 )
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.model.upstream import UpstreamDefinition
-from tests.unit.factories import make_upstream_auth, make_upstream_definition
+from tests.unit.factories import (
+    make_refresh_failure_signature,
+    make_upstream_auth,
+    make_upstream_definition,
+)
 
 
 SERVER_URL = "http://localhost:8080"
@@ -660,73 +664,369 @@ async def test_build_oauth_provider_keeps_stale_client_info_on_silent_path(
     assert info.client_id == "stale-client-id"
 
 
-@pytest.mark.asyncio
-async def test_consent_path_drops_client_info_on_stale_redirect_uri(
-    tmp_path: Path,
-) -> None:
-    """The fresh-consent path is the one place where a callback-URL
-    change MUST drop the stored client_info — the upstream's authorize
-    endpoint rejects redirect_uris that don't match what it has on file
-    for the registered client. ``_drop_client_info_if_redirect_stale``
-    exists to be called from there (and only there)."""
-    from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
-    from mcpolis.domain.services.upstream_connection_service import (
-        _drop_client_info_if_redirect_stale,
-    )
-
-    store = FileConnectionStore(tmp_path)
-    upstream = make_http_upstream()
-    await store.put_client_info(
+def _seed_client_info(
+    store: FileConnectionStore, *, redirect_uri: str, client_id: str,
+) -> Any:
+    """Coroutine: seed one DCR ``client_info`` row for (mixpanel, __admin__)
+    with the given redirect_uri so the consent self-heal has something to
+    inspect. Returns the awaitable from ``put_client_info``."""
+    return store.put_client_info(
         DEFAULT_ORG_ID, "mixpanel", "__admin__",
         {
-            "client_id": "stale-client-id",
-            "client_secret": "stale-secret",
-            "redirect_uris": ["http://localhost:8080/oauth/upstream/callback"],
+            "client_id": client_id,
+            "client_secret": "secret",
+            "redirect_uris": [redirect_uri],
             "token_endpoint_auth_method": "client_secret_post",
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_consent_path_drops_client_info_on_stale_redirect_uri(
+    tmp_path: Path,
+) -> None:
+    """Trigger 1 (unchanged): a callback-URL change MUST drop the stored
+    client_info — the upstream's authorize endpoint rejects redirect_uris
+    that don't match what it has on file. Fires regardless of token
+    state (here there's a live refresh token, yet the stale redirect
+    still wins)."""
+    from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
+    from mcpolis.domain.services.upstream_connection_service import (
+        _refresh_stale_client_info_for_consent,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    await _seed_client_info(
+        store,
+        redirect_uri="http://localhost:8080/oauth/upstream/callback",
+        client_id="stale-client-id",
+    )
+    # A live refresh token would normally pin client_info, but a stale
+    # redirect overrides that — the registration is unusable either way.
+    await store.put_user_token(
+        DEFAULT_ORG_ID, "__admin__", "mixpanel", make_oauth_token(),
+    )
     storage = McpTokenStorage(store, DEFAULT_ORG_ID, "mixpanel", "__admin__")
 
-    await _drop_client_info_if_redirect_stale(storage, upstream, SERVER_URL)
+    await _refresh_stale_client_info_for_consent(
+        storage, upstream, SERVER_URL, store,
+    )
 
     assert await storage.get_client_info() is None
 
 
 @pytest.mark.asyncio
-async def test_consent_path_keeps_client_info_when_redirect_uri_matches(
+async def test_consent_path_keeps_client_info_with_live_refresh_token(
     tmp_path: Path,
 ) -> None:
-    """No-op when the stored redirect_uri already matches the current
-    callback — common case for established connections that haven't
-    seen a callback-URL change."""
+    """Regression guard for the Client-ID-mismatch hazard: when the
+    redirect matches AND a live refresh token exists, client_info MUST
+    be preserved. Re-registering would mint a new client_id, and the
+    stored refresh_token (issued under the old one) would then fail with
+    ``invalid_grant: Client ID mismatch`` on the next refresh."""
     from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
     from mcpolis.domain.services.upstream_connection_service import (
-        _drop_client_info_if_redirect_stale,
+        _refresh_stale_client_info_for_consent,
     )
 
     store = FileConnectionStore(tmp_path)
     upstream = make_http_upstream()
     current_callback = f"{SERVER_URL}/api/oauth/upstream/callback"
-    await store.put_client_info(
-        DEFAULT_ORG_ID, "mixpanel", "__admin__",
-        {
-            "client_id": "fresh-client-id",
-            "client_secret": "fresh-secret",
-            "redirect_uris": [current_callback],
-            "token_endpoint_auth_method": "client_secret_post",
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-        },
+    await _seed_client_info(
+        store, redirect_uri=current_callback, client_id="fresh-client-id",
+    )
+    await store.put_user_token(
+        DEFAULT_ORG_ID, "__admin__", "mixpanel", make_oauth_token(),
     )
     storage = McpTokenStorage(store, DEFAULT_ORG_ID, "mixpanel", "__admin__")
 
-    await _drop_client_info_if_redirect_stale(storage, upstream, SERVER_URL)
+    await _refresh_stale_client_info_for_consent(
+        storage, upstream, SERVER_URL, store,
+    )
 
     info = await storage.get_client_info()
     assert info is not None
     assert info.client_id == "fresh-client-id"
+
+
+@pytest.mark.asyncio
+async def test_consent_path_reregisters_when_no_token(
+    tmp_path: Path,
+) -> None:
+    """Trigger 2 (the fix): redirect matches but there is NO stored token
+    — a returning user whose tokens are gone, or whose stored DCR client
+    the upstream has since forgotten/expired (mee6's ``invalid_client``).
+    We can't observe the upstream's authorize-step 400, so we proactively
+    re-register. Safe because no refresh token can be stranded."""
+    from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
+    from mcpolis.domain.services.upstream_connection_service import (
+        _refresh_stale_client_info_for_consent,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    current_callback = f"{SERVER_URL}/api/oauth/upstream/callback"
+    await _seed_client_info(
+        store, redirect_uri=current_callback, client_id="maybe-dead-id",
+    )
+    storage = McpTokenStorage(store, DEFAULT_ORG_ID, "mixpanel", "__admin__")
+
+    await _refresh_stale_client_info_for_consent(
+        storage, upstream, SERVER_URL, store,
+    )
+
+    assert await storage.get_client_info() is None
+
+
+@pytest.mark.asyncio
+async def test_consent_path_reregisters_when_token_lacks_refresh(
+    tmp_path: Path,
+) -> None:
+    """Trigger 2, the mee6 shape: a long-lived access token with NO
+    refresh token. The redirect matches, but since no refresh grant is
+    tied to the client_id, re-registering can't strand anything — drop
+    the possibly-dead client so the next consent runs a fresh DCR."""
+    from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
+    from mcpolis.domain.services.upstream_connection_service import (
+        _refresh_stale_client_info_for_consent,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    current_callback = f"{SERVER_URL}/api/oauth/upstream/callback"
+    await _seed_client_info(
+        store, redirect_uri=current_callback, client_id="maybe-dead-id",
+    )
+    await store.put_user_token(
+        DEFAULT_ORG_ID, "__admin__", "mixpanel",
+        InternalOAuthToken(
+            access_token="long-lived",
+            refresh_token=None,
+            expires_at=datetime.now(UTC) + timedelta(days=365),
+            scopes=["read"],
+        ),
+    )
+    storage = McpTokenStorage(store, DEFAULT_ORG_ID, "mixpanel", "__admin__")
+
+    await _refresh_stale_client_info_for_consent(
+        storage, upstream, SERVER_URL, store,
+    )
+
+    assert await storage.get_client_info() is None
+
+
+@pytest.mark.asyncio
+async def test_consent_path_noop_when_no_client_info(tmp_path: Path) -> None:
+    """No stored registration → nothing to self-heal; the SDK will run a
+    fresh DCR on its own. Must not raise."""
+    from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
+    from mcpolis.domain.services.upstream_connection_service import (
+        _refresh_stale_client_info_for_consent,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    storage = McpTokenStorage(store, DEFAULT_ORG_ID, "mixpanel", "__admin__")
+
+    await _refresh_stale_client_info_for_consent(
+        storage, upstream, SERVER_URL, store,
+    )
+
+    assert await storage.get_client_info() is None
+
+
+# ── Reactive dead-client backstop (the "both" net for case C) ────────
+
+
+async def _seed_token(
+    store: FileConnectionStore, *, refresh: str | None,
+) -> None:
+    """Coroutine: seed a (mixpanel, __admin__) user token whose
+    refresh_token presence is what the backstop's safety gate checks."""
+    await store.put_user_token(
+        DEFAULT_ORG_ID, "__admin__", "mixpanel",
+        InternalOAuthToken(
+            access_token="at",
+            refresh_token=refresh,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            scopes=["read"],
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_backstop_drops_on_invalid_client_even_with_live_refresh(
+    tmp_path: Path,
+) -> None:
+    """The case proactive self-heal can't touch: a live refresh token is
+    present (so pre-flight left client_info alone), but the token-endpoint
+    refused the client with ``invalid_client``. That signal is
+    unambiguous — drop the dead client so the next consent re-registers,
+    regardless of the refresh token (it was issued under the dead client
+    and is useless anyway)."""
+    from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
+    from mcpolis.domain.services.upstream_connection_service import (
+        _drop_client_info_on_dead_client_failure,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    current_callback = f"{SERVER_URL}/api/oauth/upstream/callback"
+    await _seed_client_info(
+        store, redirect_uri=current_callback, client_id="dead-id",
+    )
+    await _seed_token(store, refresh="live-refresh")
+    storage = McpTokenStorage(store, DEFAULT_ORG_ID, "mixpanel", "__admin__")
+
+    await _drop_client_info_on_dead_client_failure(
+        RuntimeError("flow failed"),
+        make_refresh_failure_signature(error_code="invalid_client"),
+        storage, upstream,
+    )
+
+    assert await storage.get_client_info() is None
+
+
+@pytest.mark.asyncio
+async def test_backstop_drops_on_timeout_when_no_live_refresh(
+    tmp_path: Path,
+) -> None:
+    """A callback timeout with no live refresh token is the browser-side
+    authorize-400 symptom (Sentry MCPOLIS-BACKEND-2) and nothing to
+    strand — drop so the next consent re-registers."""
+    from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
+    from mcpolis.domain.services.upstream_connection_service import (
+        _drop_client_info_on_dead_client_failure,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    current_callback = f"{SERVER_URL}/api/oauth/upstream/callback"
+    await _seed_client_info(
+        store, redirect_uri=current_callback, client_id="dead-id",
+    )
+    await _seed_token(store, refresh=None)
+    storage = McpTokenStorage(store, DEFAULT_ORG_ID, "mixpanel", "__admin__")
+
+    await _drop_client_info_on_dead_client_failure(
+        TimeoutError("callback timed out"), None, storage, upstream,
+    )
+
+    assert await storage.get_client_info() is None
+
+
+@pytest.mark.asyncio
+async def test_backstop_keeps_on_timeout_with_live_refresh(
+    tmp_path: Path,
+) -> None:
+    """Safety gate: a bare timeout (no invalid_client signal) with a live
+    refresh token must NOT drop client_info — the timeout could be plain
+    user abandonment, and dropping would strand the refresh token under a
+    fresh client_id (the Client-ID-mismatch regression)."""
+    from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
+    from mcpolis.domain.services.upstream_connection_service import (
+        _drop_client_info_on_dead_client_failure,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    current_callback = f"{SERVER_URL}/api/oauth/upstream/callback"
+    await _seed_client_info(
+        store, redirect_uri=current_callback, client_id="maybe-alive-id",
+    )
+    await _seed_token(store, refresh="live-refresh")
+    storage = McpTokenStorage(store, DEFAULT_ORG_ID, "mixpanel", "__admin__")
+
+    await _drop_client_info_on_dead_client_failure(
+        TimeoutError("callback timed out"), None, storage, upstream,
+    )
+
+    info = await storage.get_client_info()
+    assert info is not None
+    assert info.client_id == "maybe-alive-id"
+
+
+@pytest.mark.asyncio
+async def test_backstop_keeps_on_unrelated_failure(tmp_path: Path) -> None:
+    """A non-timeout failure with no invalid_client signature (e.g. a
+    transient transport error) is not a dead-client signal — keep
+    client_info so we don't churn DCR on every blip."""
+    from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
+    from mcpolis.domain.services.upstream_connection_service import (
+        _drop_client_info_on_dead_client_failure,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    current_callback = f"{SERVER_URL}/api/oauth/upstream/callback"
+    await _seed_client_info(
+        store, redirect_uri=current_callback, client_id="fine-id",
+    )
+    await _seed_token(store, refresh=None)
+    storage = McpTokenStorage(store, DEFAULT_ORG_ID, "mixpanel", "__admin__")
+
+    await _drop_client_info_on_dead_client_failure(
+        RuntimeError("transient blip"),
+        make_refresh_failure_signature(error_code=None),
+        storage, upstream,
+    )
+
+    assert await storage.get_client_info() is not None
+
+
+# ── Pending-code guard: resume must skip the consent self-heal ───────
+
+
+@pytest.mark.asyncio
+async def test_initiate_resuming_stored_code_preserves_client_info(
+    tmp_path: Path,
+) -> None:
+    """Regression guard for the blind-review finding: when a callback code
+    stashed before a mid-flow restart is resumed, the consent self-heal
+    must be skipped. Otherwise trigger-2 (no usable token) would drop the
+    client_info, but the resumed code+PKCE was issued under that very
+    client_id, so the exchange would fail on a client mismatch."""
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    cm = make_client_manager()
+    coordinator = PendingAuthCoordinator(make_signing_key())
+
+    current_callback = f"{SERVER_URL}/api/oauth/upstream/callback"
+    await _seed_client_info(
+        store, redirect_uri=current_callback, client_id="resume-client",
+    )
+    # A stashed callback code, and NO usable token — exactly the shape
+    # that would trip trigger-2 of the self-heal if it weren't skipped.
+    await store.put_pending_code(
+        DEFAULT_ORG_ID, "mixpanel", "__admin__", "the-code", "orig-state",
+    )
+
+    with patch(
+        "mcpolis.domain.services.upstream_connection_service"
+        "._start_background_token_acquisition",
+    ) as mock_bg:
+        def fake_start(*_args: Any, **_kwargs: Any) -> asyncio.Task[None]:
+            pending = _args[3]
+            assert pending.auth_code == "the-code"  # code was resumed
+
+            async def _bg() -> None:
+                pending.mark_tokens_refreshed()
+            return asyncio.create_task(_bg())
+
+        mock_bg.side_effect = fake_start
+
+        await initiate_oauth_connection(
+            DEFAULT_ORG_ID, upstream, "__admin__", store, coordinator, cm,
+            SERVER_URL,
+        )
+
+    # The stored client_info survived — the resume skipped the self-heal.
+    info = await store.get_client_info(DEFAULT_ORG_ID, "mixpanel", "__admin__")
+    assert info is not None
+    assert info["client_id"] == "resume-client"
 
 
 # ── Edge branches in ``initiate_oauth_connection`` ──────────────────

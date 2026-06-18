@@ -210,6 +210,38 @@ class MongoConnectionRepository(ConnectionStore, ConnectionRepository):
             count += 1
         return count
 
+    async def delete_all_for_upstream(
+        self, org_id: str, upstream_id: str
+    ) -> int:
+        # Every key in the connection store is shaped
+        # ``<prefix>:<upstream_id>[:<user_id>]`` — the upstream_id is
+        # always the second colon-field. Match that field exactly so a
+        # purge of ``github`` can never catch ``user:gitlab:github@x``.
+        import re
+        pattern = rf"^[^:]+:{re.escape(upstream_id)}(?::|$)"
+        docs = await self._coll.find_many(org_id, {"key": {"$regex": pattern}})
+        count = 0
+        for doc in docs:
+            await self._coll.delete_one(org_id, {"key": doc["key"]})
+            count += 1
+        return count
+
+    async def delete_all_for_user(
+        self, org_id: str, user_id: str
+    ) -> int:
+        # User-scoped keys are exactly the three-field shape
+        # ``<prefix>:<upstream_id>:<user_id>``; the user_id is the whole
+        # final field. Two-field upstream-only keys (admin/error/
+        # enabled/started_config_hash) don't match, so they survive.
+        import re
+        pattern = rf"^[^:]+:[^:]+:{re.escape(user_id)}$"
+        docs = await self._coll.find_many(org_id, {"key": {"$regex": pattern}})
+        count = 0
+        for doc in docs:
+            await self._coll.delete_one(org_id, {"key": doc["key"]})
+            count += 1
+        return count
+
     async def get_all_stored_tokens(
         self, org_id: str
     ) -> list[tuple[str, str]]:

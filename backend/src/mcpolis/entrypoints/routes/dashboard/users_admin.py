@@ -143,10 +143,13 @@ def create_users_admin_router(deps: DashboardDeps) -> APIRouter:
         # Revoke gateway tokens.
         if deps.revoke_gateway_user is not None:
             deps.revoke_gateway_user(email)
-        # Disconnect upstream sessions and tokens.
+        # Disconnect upstream sessions and purge ALL per-user OAuth state
+        # (tokens + DCR client_info + oauth_metadata + counters). A
+        # token-only delete would let a re-invite on the same email reuse
+        # a dead client_info and hit ``invalid_client``.
         await runtime.client_manager.disconnect_all_user_sessions(email)
         if deps.connection_store is not None:
-            await deps.connection_store.delete_all_user_tokens(org_id, email)
+            await deps.connection_store.delete_all_for_user(org_id, email)
         get_analytics().track_async(
             admin_email,
             "user_removed",

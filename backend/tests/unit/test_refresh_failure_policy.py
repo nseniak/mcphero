@@ -55,9 +55,11 @@ from mcpolis.domain.services.upstream_connection_service import (  # pyright: ig
     RefreshFailureSignature,
     _InitializingOAuthClientProvider,
     _should_delete_on_refresh_failure,
+    purge_user_oauth_state,
     reconnect_with_stored_tokens,
 )
 from tests.unit.factories import (
+    make_oauth_metadata,
     make_oauth_upstream,
     make_refresh_failure_signature,
     seed_oauth_storage,
@@ -94,6 +96,53 @@ def test_invalid_grant_deletes_on_first_failure() -> None:
         failure_count=1,
         first_failure_at=datetime.now(UTC),
     ) is True
+
+
+def test_invalid_client_deletes_on_first_failure() -> None:
+    """``invalid_client`` means the upstream has forgotten, rotated, or
+    expired our DCR registration — the stored ``client_id`` is dead.
+    Retrying it is futile (every tick re-discovers the same 400), so it
+    is terminal exactly like ``invalid_grant``: delete immediately so the
+    purge drops the dead client and the next consent re-registers."""
+    assert _should_delete_on_refresh_failure(
+        signature=_make_signature("invalid_client"),
+        failure_count=1,
+        first_failure_at=datetime.now(UTC),
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_purge_user_oauth_state_drops_token_client_and_metadata(
+    tmp_path: Path,
+) -> None:
+    """``purge_user_oauth_state`` is the convergence primitive for a
+    terminal auth rejection: it must clear the token, the dead DCR
+    ``client_info``, the cached ``oauth_metadata``, AND the failure
+    counter in one shot. Dropping client_info is safe here precisely
+    because the token is gone too — no surviving refresh grant is tied
+    to the old client_id for a later refresh to mismatch."""
+    store = FileConnectionStore(tmp_path)
+    await _seed(store)  # token + client_info
+    await store.put_oauth_metadata(
+        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+        make_oauth_metadata().model_dump(mode="json"),
+    )
+    await store.record_refresh_failure(DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID)
+
+    await purge_user_oauth_state(store, DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID)
+
+    assert await store.get_user_token(
+        DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
+    ) is None
+    assert await store.get_client_info(
+        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+    ) is None
+    assert await store.get_oauth_metadata(
+        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+    ) is None
+    assert await store.get_refresh_failures(
+        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+    ) is None
 
 
 def test_transient_failure_below_threshold_keeps_tokens() -> None:
@@ -308,6 +357,46 @@ async def test_reconnect_invalid_grant_deletes_immediately(
     ) is None
     # Counter cleared — we made our decision, don't carry state.
     assert await store.get_refresh_failures(
+        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_reconnect_invalid_client_purges_client_info_and_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh rejected with ``invalid_client`` must delete the token
+    AND drop the dead DCR ``client_info`` + cached ``oauth_metadata``.
+    Deleting the token alone leaves the dead ``client_id`` in storage;
+    the next consent re-seeds the SDK with it and the upstream 400s at
+    ``/oauth/authorize`` forever (the mee6 brick). This pins the
+    convergence: terminal rejection → clean slate → fresh DCR next time."""
+    store = FileConnectionStore(tmp_path)
+    await _seed(store)  # token + client_info (matching callback)
+    await store.put_oauth_metadata(
+        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+        make_oauth_metadata().model_dump(mode="json"),
+    )
+    _install_failing_reconnect(monkeypatch, _make_signature("invalid_client"))
+
+    result = await reconnect_with_stored_tokens(
+        org_id=DEFAULT_ORG_ID,
+        upstream=_make_upstream(),
+        effective_user=USER_ID,
+        connection_store=store,
+        client_manager=_make_failing_client_manager(),
+        server_url=SERVER_URL,
+    )
+
+    assert result is DisconnectReason.token_refresh_failed
+    assert await store.get_user_token(
+        DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
+    ) is None
+    # The dead DCR client_info is gone — this is what unbricks re-consent.
+    assert await store.get_client_info(
+        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+    ) is None
+    assert await store.get_oauth_metadata(
         DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
     ) is None
 

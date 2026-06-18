@@ -53,6 +53,23 @@ def _deserialize_token(data: dict[str, Any]) -> OAuthToken:
     )
 
 
+def _key_upstream_id(key: str) -> str | None:
+    """The upstream_id every connection-store key is built around: it is
+    always the second colon-field of ``<prefix>:<upstream_id>[:<user_id>]``.
+    ``None`` for a malformed single-field key."""
+    parts = key.split(":")
+    return parts[1] if len(parts) >= 2 else None
+
+
+def _key_user_id(key: str) -> str | None:
+    """The user_id of a user-scoped key, or ``None`` for an upstream-only
+    key. User-scoped keys are exactly the three-field shape
+    ``<prefix>:<upstream_id>:<user_id>``; emails and slugs never contain
+    a colon, so a strict field count distinguishes the two axes."""
+    parts = key.split(":")
+    return parts[2] if len(parts) == 3 else None
+
+
 class FileConnectionStore(ConnectionStore):
     """JSON file-based connection store with asyncio.Lock for concurrency."""
 
@@ -140,6 +157,26 @@ class FileConnectionStore(ConnectionStore):
                 k for k in data
                 if k == admin_key or k.startswith(user_prefix)
             ]
+            for k in keys:
+                del data[k]
+            if keys:
+                self._write(data)
+            return len(keys)
+
+    async def delete_all_for_upstream(self, org_id: str, upstream_id: str) -> int:
+        async with self._lock:
+            data = self._read()
+            keys = [k for k in data if _key_upstream_id(k) == upstream_id]
+            for k in keys:
+                del data[k]
+            if keys:
+                self._write(data)
+            return len(keys)
+
+    async def delete_all_for_user(self, org_id: str, user_id: str) -> int:
+        async with self._lock:
+            data = self._read()
+            keys = [k for k in data if _key_user_id(k) == user_id]
             for k in keys:
                 del data[k]
             if keys:

@@ -711,13 +711,20 @@ def _build_backend_env(shard: ShardConfig) -> dict[str, str]:
         # seed can run. Prod never sets this — the strict deny-list
         # is what closes the SSRF.
         "MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK": "1",
-        # MCPOLIS_SANDBOX_PROVIDER is intentionally left unset. The
-        # validator (entrypoints/config.py) treats an empty value as
-        # "fall back to e2b when an API key is configured, else
-        # local-subprocess with a warning" — and *only* rejects
-        # local-subprocess when it's explicitly named. The bash
-        # variant also relies on this fallback (since
-        # backend/.env.cloud ships with no MCPOLIS_E2B_API_KEY).
+        # Pin the sandbox to local-subprocess so e2e stays hermetic and
+        # free — stdio MCPs must never reach paid hosted E2B. We can't
+        # name 'local-subprocess' explicitly (the cloud-mode validator
+        # rejects it), so instead we leave MCPOLIS_SANDBOX_PROVIDER unset
+        # and force the empty-provider fallback onto local-subprocess by
+        # ensuring no E2B key is visible. Stripping MCPOLIS_* above only
+        # clears the *process* env; Settings still loads the operator's
+        # backend env file, which on some machines DOES carry a real
+        # MCPOLIS_E2B_API_KEY — which would silently route every stdio
+        # MCP through hosted E2B. A blank env var overrides the env file
+        # (env > env_file in pydantic-settings), exactly like
+        # MCPOLIS_SENTRY_DSN above, so the fallback always lands on
+        # local-subprocess regardless of what the env file holds.
+        "MCPOLIS_E2B_API_KEY": "",
     })
     return env
 

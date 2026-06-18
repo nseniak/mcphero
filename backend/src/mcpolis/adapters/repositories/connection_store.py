@@ -46,7 +46,41 @@ class ConnectionStore:
         raise NotImplementedError
 
     async def delete_all_upstream_tokens(self, org_id: str, upstream_id: str) -> int:
-        """Delete admin token + all per-user tokens for this upstream."""
+        """Delete admin token + all per-user tokens for this upstream.
+
+        Tokens only. For removing an upstream entirely (so a re-add on
+        the same slug starts clean) use ``delete_all_for_upstream``,
+        which also drops ``client_info`` / ``oauth_metadata`` / enabled
+        markers / failure counters — anything the slug-keyed re-add
+        would otherwise resurrect.
+        """
+        raise NotImplementedError
+
+    async def delete_all_for_upstream(self, org_id: str, upstream_id: str) -> int:
+        """Delete EVERY stored row keyed to this upstream, regardless of
+        prefix or whether it is user-scoped: tokens, ``client_info``,
+        ``oauth_metadata``, pending codes, failure counters, notified
+        flags, the enabled marker, the connection-error row, and the
+        started-config-hash. Returns the number of rows removed.
+
+        This is the entity-removal cascade. Its job is to guarantee that
+        removing an upstream and re-adding it on the same id can't reuse
+        a now-dead DCR ``client_info`` (the ``invalid_client`` brick).
+        """
+        raise NotImplementedError
+
+    async def delete_all_for_user(self, org_id: str, user_id: str) -> int:
+        """Delete EVERY user-scoped row for this user across all
+        upstreams: their per-user tokens, ``client_info``,
+        ``oauth_metadata``, pending codes, failure counters and notified
+        flags. Returns the number of rows removed.
+
+        Upstream-only rows (admin token, enabled marker, connection
+        error, started-config-hash) are deliberately left alone — they
+        outlive any single user. This is the user-removal cascade; it
+        keeps a remove + re-invite on the same email from reusing a dead
+        DCR registration.
+        """
         raise NotImplementedError
 
     async def get_all_stored_tokens(self, org_id: str) -> list[tuple[str, str]]:

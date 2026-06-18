@@ -154,11 +154,19 @@ test.describe("Stdio template-var substitution + Sandbox files — runtime", () 
     const api = await adminApi(request);
     const upstreamId = uniqueId("subst-file");
     const expected = `e2e-file-body-${Date.now().toString(36)}`;
-    // ``${HOME}`` resolves to ``/home/user`` on every published
-    // mcpolis E2B template (and is a sane default for the local-
-    // subprocess fallback when the operator runs as themselves).
-    const targetPath = "${HOME}/.config/e2e-cred.txt";
-    const expectedResolvedPath = "/home/user/.config/e2e-cred.txt";
+    // Host-portable target path, writable under BOTH the E2B sandbox
+    // (Linux) and the local-subprocess backend (the test host). We
+    // deliberately avoid ``${HOME}`` here: it resolves to the E2B
+    // template's ``/home/user``, which the local-subprocess host cannot
+    // create (macOS ``/home`` is autofs-managed → ENOTSUP), so the file
+    // would never materialize off-E2B and this test would only pass when
+    // a stray E2B key routed it to a real sandbox. ``${HOME}`` resolution
+    // is covered by the display specs (20a / 22a); this test's job is the
+    // materialize → MCP-read round-trip, which a literal absolute path
+    // (accepted by the target_path validator) exercises on any backend.
+    // Per-test-unique so parallel shards sharing the host don't collide.
+    const targetPath = `/tmp/mcpolis-e2e-sbx/${upstreamId}/e2e-cred.txt`;
+    const expectedResolvedPath = targetPath;
 
     const createUpstream = await api.post(
       `${BACKEND_URL}/api/admin/upstreams`,

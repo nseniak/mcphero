@@ -244,6 +244,42 @@ def _extract_refresh_failure(
 MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
 MIN_TRANSIENT_FAILURE_WINDOW_SECONDS = 30 * 60
 
+# OAuth error codes the upstream returns to mean "this is permanently
+# rejected, retrying won't help": the refresh token is dead
+# (``invalid_grant``) or the client registration is dead
+# (``invalid_client`` — expired / rotated / forgotten DCR). Both are
+# terminal: delete the token immediately and (via
+# ``purge_user_oauth_state``) drop the DCR client so the next consent
+# re-registers, rather than churning the same rejection every tick.
+_TERMINAL_AUTH_ERROR_CODES = ("invalid_grant", "invalid_client")
+
+
+async def purge_user_oauth_state(
+    connection_store: ConnectionStore,
+    org_id: str,
+    upstream_id: str,
+    user_id: str,
+) -> None:
+    """Tear down ALL per-user OAuth state for one (upstream, user) after a
+    terminal auth rejection: the token, the DCR ``client_info``, the
+    cached authorization-server ``oauth_metadata``, and the
+    refresh-failure counter.
+
+    Dropping ``client_info`` here is safe precisely because the token is
+    deleted in the same breath. The hazard that
+    ``_refresh_stale_client_info_for_consent`` guards against — a live
+    ``refresh_token`` issued under the old ``client_id`` later failing
+    with ``invalid_grant: Client ID mismatch`` — cannot apply once the
+    token is gone. The next consent re-runs DCR and mints a fresh
+    ``client_id``; that is the only escape from an ``invalid_client``
+    brick the backend can trigger on its own (the upstream's 400 at the
+    browser ``/oauth/authorize`` step is never observable here).
+    """
+    await connection_store.delete_user_token(org_id, user_id, upstream_id)
+    await connection_store.delete_client_info(org_id, upstream_id, user_id)
+    await connection_store.delete_oauth_metadata(org_id, upstream_id, user_id)
+    await connection_store.reset_refresh_failures(org_id, upstream_id, user_id)
+
 
 def _should_delete_on_refresh_failure(
     signature: RefreshFailureSignature | None,
@@ -257,10 +293,13 @@ def _should_delete_on_refresh_failure(
     user prompted to re-authenticate; False when the failure looks
     transient and the token should stay in place for the next retry.
 
-    - RFC 6749 ``invalid_grant`` → delete immediately. The upstream has
-      told us the refresh token is dead; keeping it around just means
-      every subsequent tick re-discovers the same rejection and churns
-      the §5.4 signature row.
+    - A terminal auth code (``invalid_grant`` = dead refresh token, or
+      ``invalid_client`` = dead DCR registration) → delete immediately.
+      The upstream is telling us this credential is permanently
+      rejected; keeping it around just means every subsequent tick
+      re-discovers the same rejection and churns the §5.4 signature row.
+      The caller pairs the delete with ``purge_user_oauth_state`` so an
+      ``invalid_client`` also drops the dead client_info.
     - Any other failure (5xx, network, unknown) → only delete once we've
       accumulated ``MAX_CONSECUTIVE_TRANSIENT_FAILURES`` failures spanning
       at least ``MIN_TRANSIENT_FAILURE_WINDOW_SECONDS``. Below the
@@ -269,7 +308,10 @@ def _should_delete_on_refresh_failure(
     The ``now`` parameter is for testability (inject a fixed clock) —
     callers in production should leave it ``None``.
     """
-    if signature is not None and signature.error_code == "invalid_grant":
+    if (
+        signature is not None
+        and signature.error_code in _TERMINAL_AUTH_ERROR_CODES
+    ):
         return True
     if failure_count < MAX_CONSECUTIVE_TRANSIENT_FAILURES:
         return False
@@ -314,8 +356,8 @@ async def _build_oauth_provider(
             redirect_uris=[AnyUrl(callback_url)],
             token_endpoint_auth_method="client_secret_post",
         ))
-    # NOTE: stale-redirect self-heal lives in
-    # ``_drop_client_info_if_redirect_stale`` and is only invoked from
+    # NOTE: stale-client self-heal lives in
+    # ``_refresh_stale_client_info_for_consent`` and is only invoked from
     # the fresh-consent path (``initiate_oauth_connection``). Doing it
     # here used to wipe stored DCR credentials on every silent path
     # (periodic refresh, liveness probe, …). For ``grant_type=refresh_token``
@@ -520,7 +562,7 @@ async def _resume_pending_from_stored_code(
     org_id: str,
     upstream: UpstreamDefinition,
     effective_user: str,
-) -> None:
+) -> bool:
     """Resume an in-flight OAuth flow from a callback code on disk.
 
     The OAuth callback endpoint persists the ``(code, state)`` pair
@@ -531,14 +573,17 @@ async def _resume_pending_from_stored_code(
     ``callback_handler`` returns immediately, and pops the code from
     durable storage so it isn't replayed on a third attempt.
 
-    No-op when no code is on disk (the typical first-time-consent
-    path); the SDK then waits on the browser redirect normally.
+    Returns ``True`` if a stored code was resumed, ``False`` otherwise
+    (the typical first-time-consent path; the SDK then waits on the
+    browser redirect normally). The caller uses this to skip the
+    client_info self-heal: a resumed code+PKCE was issued under the
+    existing ``client_id``, so re-registering would orphan it.
     """
     stored_code = await connection_store.pop_pending_code(
         org_id, upstream.id, effective_user,
     )
     if stored_code is None:
-        return
+        return False
     code, original_state = stored_code
     pending.complete(code, original_state)
     logger.info(
@@ -547,49 +592,134 @@ async def _resume_pending_from_stored_code(
         user=effective_user,
         org_id=org_id,
     )
+    return True
 
 
-async def _drop_client_info_if_redirect_stale(
+async def _refresh_stale_client_info_for_consent(
     storage: McpTokenStorage,
     upstream: UpstreamDefinition,
     server_url: str,
+    connection_store: ConnectionStore,
 ) -> None:
-    """Self-heal stale DCR records on the consent path only.
+    """Self-heal a stale DCR registration on the consent path only.
 
-    If the gateway's callback path changed since the last registration
-    (e.g. the 2026-05-07 mcpolis.seniak.com → mcphero.io rebrand, or
-    commit 4b43375 moving ``/oauth/upstream/callback`` under ``/api``),
-    the upstream's authorize endpoint will reject redirect URIs that
-    don't match what it has on file. Drop the stored client so the
-    SDK performs a fresh DCR with the current callback URL.
+    Two independent triggers drop the stored client so the SDK runs a
+    fresh Dynamic Client Registration:
 
-    Only safe to call from the fresh-consent path. Calling from a
-    silent path (refresh / liveness probe) destroys still-valid
-    refresh credentials: ``grant_type=refresh_token`` doesn't carry
-    ``redirect_uri`` (RFC 6749 §6), so a callback-URL change is
-    invisible to the upstream's token endpoint — but the next refresh
-    after a drop runs against a freshly-DCR'd ``client_id`` that
-    doesn't match the one the stored ``refresh_token`` was issued
-    under, and the upstream rejects with ``invalid_grant: Client ID
-    mismatch``.
+    **Trigger 1 — stale redirect URI.** If the gateway's callback path
+    changed since the last registration (e.g. the 2026-05-07
+    mcpolis.seniak.com → mcphero.io rebrand, or commit 4b43375 moving
+    ``/oauth/upstream/callback`` under ``/api``), the upstream's
+    authorize endpoint rejects redirect URIs it doesn't have on file.
+    Always safe to drop.
+
+    **Trigger 2 — possibly-dead client.** The upstream may have expired,
+    rotated, or forgotten the ``client_id`` and now answers
+    ``invalid_client`` at its ``/oauth/authorize`` step. That 400 is
+    served to the user's *browser*, never to us — the backend only sees
+    the callback never arrive (a ``callback_handler`` TimeoutError;
+    Sentry MCPOLIS-BACKEND-2). With no observable signal to react to, we
+    proactively re-register on consent whenever doing so cannot strand a
+    live credential.
+
+    Both triggers are safe ONLY on the fresh-consent path, never on a
+    silent path (refresh / liveness probe). ``grant_type=refresh_token``
+    carries no ``redirect_uri`` (RFC 6749 §6), so dropping a client that
+    still has a live ``refresh_token`` makes the next refresh run under a
+    freshly-DCR'd ``client_id`` the stored token wasn't issued under, and
+    the upstream rejects with ``invalid_grant: Client ID mismatch``.
+    Trigger 2 therefore fires only when no refresh token is at risk: no
+    token row at all, or a stored token with no refresh_token (the mee6
+    shape — a long-lived access token with no refresh grant). When a live
+    refresh token IS present, only trigger 1 can drop.
     """
     if upstream.auth.client_id:
         # Pre-configured client (not DCR) — nothing to self-heal.
         return
-    callback_url = (
-        f"{server_url.rstrip('/')}/api/oauth/upstream/callback"
-    )
     existing = await storage.get_client_info()
     if existing is None:
         return
+
+    # Trigger 1: redirect-URI drift — always safe to drop.
+    callback_url = (
+        f"{server_url.rstrip('/')}/api/oauth/upstream/callback"
+    )
     registered_uris = [str(u) for u in (existing.redirect_uris or [])]
-    if callback_url in registered_uris:
+    if callback_url not in registered_uris:
+        logger.warning(
+            "upstream.oauth.client_info.stale_redirect_dropped",
+            upstream_id=upstream.id,
+            registered_redirect_uris=registered_uris,
+            current_callback_url=callback_url,
+        )
+        await storage.delete_client_info()
         return
-    logger.warning(
-        "upstream.oauth.client_info.stale_redirect_dropped",
+
+    # Trigger 2: possibly-dead client — re-register only when no live
+    # refresh token could be stranded by a new client_id.
+    raw_token = await connection_store.get_user_token(
+        storage.org_id, storage.user_id, storage.upstream_id,
+    )
+    if raw_token is None or not raw_token.refresh_token:
+        logger.info(
+            "upstream.oauth.client_info.reregister_on_consent",
+            upstream_id=upstream.id,
+            org_id=storage.org_id,
+            user=storage.user_id,
+            has_stored_token=raw_token is not None,
+        )
+        await storage.delete_client_info()
+
+
+async def _drop_client_info_on_dead_client_failure(
+    exc: BaseException,
+    signature: RefreshFailureSignature | None,
+    storage: McpTokenStorage,
+    upstream: UpstreamDefinition,
+) -> None:
+    """Reactive consent-path backstop for a dead DCR client — the
+    complement to the proactive ``_refresh_stale_client_info_for_consent``.
+
+    Proactive self-heal deliberately leaves the stored client alone when a
+    live refresh token is present (dropping it pre-flight could strand that
+    token under a fresh ``client_id`` — see that function's docstring). So
+    the one case it can't fix is "live refresh token, but the client is in
+    fact dead." This runs after the consent flow has failed and recovers
+    exactly that case, by dropping the client so the *next* consent
+    re-registers. Triggers on:
+
+    - an explicit ``invalid_client`` from the token endpoint (the SDK's
+      refresh/exchange POST — unambiguous, the upstream rejected the
+      ``client_id``), or
+    - a callback ``TimeoutError`` (the browser-side authorize-step 400 has
+      no server-visible response; it only shows up as the callback never
+      arriving — Sentry MCPOLIS-BACKEND-2) when no live refresh token
+      could be stranded by re-registering.
+
+    No-op for pre-configured (non-DCR) clients and when nothing is stored.
+    By the time we reach a callback timeout the SDK has already attempted
+    any viable refresh, so an explicit ``invalid_client`` is the precise
+    signal and the timeout is the coarse fallback.
+    """
+    if upstream.auth.client_id is not None:
+        return
+    if await storage.get_client_info() is None:
+        return
+    invalid_client = (
+        signature is not None and signature.error_code == "invalid_client"
+    )
+    drop = invalid_client
+    if not drop and _exception_chain_contains(exc, TimeoutError):
+        tokens = await storage.get_tokens()
+        drop = tokens is None or not tokens.refresh_token
+    if not drop:
+        return
+    logger.info(
+        "upstream.oauth.client_info.dropped_on_consent_failure",
         upstream_id=upstream.id,
-        registered_redirect_uris=registered_uris,
-        current_callback_url=callback_url,
+        org_id=storage.org_id,
+        user=storage.user_id,
+        reason="invalid_client" if invalid_client else "callback_timeout",
     )
     await storage.delete_client_info()
 
@@ -631,18 +761,28 @@ async def initiate_oauth_connection(
         refresh_margin_seconds=TOKEN_REFRESH_MARGIN,
     )
 
-    # Consent path: self-heal stale DCR client_info before the SDK's
-    # OAuth flow starts. Silent paths (refresh / liveness) deliberately
-    # skip this; see ``_drop_client_info_if_redirect_stale`` docstring.
-    await _drop_client_info_if_redirect_stale(storage, upstream, server_url)
-
     pending = auth_coordinator.create_pending(
         org_id, upstream.id, effective_user
     )
 
-    await _resume_pending_from_stored_code(
+    # Resume a callback code stashed before a mid-flow restart FIRST. That
+    # code+PKCE was issued under the existing ``client_id``, so the
+    # client_info self-heal below must not run when we're resuming — a
+    # re-DCR would mint a new client_id and the token exchange would fail
+    # on a client mismatch.
+    resumed = await _resume_pending_from_stored_code(
         connection_store, pending, org_id, upstream, effective_user,
     )
+
+    if not resumed:
+        # Consent path: self-heal a stale DCR client_info before the SDK's
+        # OAuth flow starts — stale redirect URI, or a possibly-dead client
+        # when no live refresh token is at risk. Silent paths (refresh /
+        # liveness) deliberately skip this; see
+        # ``_refresh_stale_client_info_for_consent`` docstring.
+        await _refresh_stale_client_info_for_consent(
+            storage, upstream, server_url, connection_store,
+        )
 
     oauth_auth = await _build_oauth_provider(
         upstream, storage,
@@ -765,6 +905,14 @@ def _start_background_token_acquisition(
                 if on_error is not None:
                     on_error(user_msg, reason)
                 return
+
+            # Reactive dead-client backstop. The proactive consent
+            # self-heal can't act when a live refresh token pinned the
+            # client_info; if the flow then failed because that client is
+            # in fact dead, drop it here so the next consent re-registers.
+            await _drop_client_info_on_dead_client_failure(
+                e, _extract_refresh_failure(auth), storage, upstream,
+            )
 
         # If the redirect_handler was never called, tokens were
         # refreshed silently — signal this to the caller.
@@ -1059,8 +1207,9 @@ async def _classify_reconnect_failure(
         signature, failure_count, first_at,
     ):
         reason = (
-            "invalid_grant"
-            if signature is not None and signature.error_code == "invalid_grant"
+            signature.error_code
+            if signature is not None
+            and signature.error_code in _TERMINAL_AUTH_ERROR_CODES
             else f"transient-threshold (failures={failure_count})"
         )
         logger.info(
@@ -1071,11 +1220,11 @@ async def _classify_reconnect_failure(
             reason=reason,
             exc_info=True,
         )
-        await connection_store.delete_user_token(
-            org_id, effective_user, upstream.id,
-        )
-        await connection_store.reset_refresh_failures(
-            org_id, upstream.id, effective_user,
+        # Purge the whole per-user state, not just the token: an
+        # ``invalid_client`` rejection means the DCR client_info is dead
+        # too, and leaving it would re-brick the next consent.
+        await purge_user_oauth_state(
+            connection_store, org_id, upstream.id, effective_user,
         )
     else:
         elapsed = int((datetime.now(UTC) - first_at).total_seconds())

@@ -79,6 +79,86 @@ def test_prune_data_preserves_admin_client_info_and_pending_code(
     assert "pending_code:notion:__admin__" in remaining
 
 
+def test_prune_data_drops_every_key_prefix_for_removed_upstream(
+    tmp_path: Path,
+) -> None:
+    """The pruner must reach EVERY per-upstream key prefix, not a stale
+    subset. A prefix it doesn't know about leaks past every future prune
+    — the exact class of bug behind the ``oauth_metadata`` /
+    ``client_info`` orphans that re-brick a re-added upstream."""
+    conn_path = tmp_path / "connections.json"
+    _write_connections(conn_path, {
+        # Removed upstream "gone": every shape must be swept.
+        "user:gone:alice@co.com": {"token": {"access_token": "at"}},
+        "client_info:gone:alice@co.com": {"client_id": "cid"},
+        "oauth_metadata:gone:alice@co.com": {"issuer": "iss"},
+        "pending_code:gone:alice@co.com": {"code": "c"},
+        "failures:gone:alice@co.com": {"count": 1},
+        "notified:gone:alice@co.com": {"notified_at": "t"},
+        "admin:gone": {"token": {"access_token": "at"}},
+        "error:gone": {"error": "boom"},
+        "enabled:gone": False,
+        "started_config_hash:gone": "h",
+        # Surviving upstream "notion" / valid user must remain.
+        "oauth_metadata:notion:alice@co.com": {"issuer": "iss"},
+        "started_config_hash:notion": "h",
+    })
+
+    prune_data(
+        org_id="default",
+        data_dir=tmp_path,
+        valid_emails={"alice@co.com"},
+        valid_upstream_ids={"notion"},
+    )
+
+    remaining = json.loads(conn_path.read_text())
+    for gone_key in (
+        "user:gone:alice@co.com",
+        "client_info:gone:alice@co.com",
+        "oauth_metadata:gone:alice@co.com",
+        "pending_code:gone:alice@co.com",
+        "failures:gone:alice@co.com",
+        "notified:gone:alice@co.com",
+        "admin:gone",
+        "error:gone",
+        "enabled:gone",
+        "started_config_hash:gone",
+    ):
+        assert gone_key not in remaining, gone_key
+    assert "oauth_metadata:notion:alice@co.com" in remaining
+    assert "started_config_hash:notion" in remaining
+
+
+def test_prune_data_drops_user_axis_prefixes_for_orphan_user(
+    tmp_path: Path,
+) -> None:
+    """The user-axis sweep must cover ``oauth_metadata`` / ``failures`` /
+    ``notified`` too — an orphaned user (removed from the roster) on a
+    still-valid upstream must leave none of their per-user rows behind,
+    or a re-invite inherits stale state."""
+    conn_path = tmp_path / "connections.json"
+    _write_connections(conn_path, {
+        "oauth_metadata:notion:orphan@co.com": {"issuer": "iss"},
+        "failures:notion:orphan@co.com": {"count": 2},
+        "notified:notion:orphan@co.com": {"notified_at": "t"},
+        # Valid user's rows must survive.
+        "oauth_metadata:notion:alice@co.com": {"issuer": "iss"},
+    })
+
+    prune_data(
+        org_id="default",
+        data_dir=tmp_path,
+        valid_emails={"alice@co.com"},
+        valid_upstream_ids={"notion"},
+    )
+
+    remaining = json.loads(conn_path.read_text())
+    assert "oauth_metadata:notion:orphan@co.com" not in remaining
+    assert "failures:notion:orphan@co.com" not in remaining
+    assert "notified:notion:orphan@co.com" not in remaining
+    assert "oauth_metadata:notion:alice@co.com" in remaining
+
+
 def test_prune_data_still_drops_admin_rows_for_removed_upstreams(
     tmp_path: Path,
 ) -> None:

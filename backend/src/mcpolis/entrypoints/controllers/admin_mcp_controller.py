@@ -829,7 +829,10 @@ def create_admin_mcp_server(
             revoke_gateway_user(email)
         await runtime.client_manager.disconnect_all_user_sessions(email)
         if connection_store is not None:
-            await connection_store.delete_all_user_tokens(org_id, email)
+            # Purge the whole per-user key family (tokens + client_info +
+            # oauth_metadata + counters), so a re-invite re-registers
+            # cleanly instead of reusing a dead DCR client_info.
+            await connection_store.delete_all_for_user(org_id, email)
         return f"User '{email}' removed."
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]

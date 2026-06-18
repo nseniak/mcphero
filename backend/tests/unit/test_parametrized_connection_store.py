@@ -611,3 +611,132 @@ async def test_get_connected_users_scopes_by_upstream(
         assert await store.get_connected_users(DEFAULT_ORG_ID, "notion") == [
             "bob@co.com",
         ]
+
+
+# ── comprehensive per-entity purge (delete_all_for_upstream / _user) ──
+#
+# An upstream remove + re-add on the same slug, or a user remove +
+# re-invite with the same email, must NOT resurrect any stale OAuth
+# state — in particular a dead DCR ``client_info`` row that would make
+# the upstream's authorize endpoint reject our recycled ``client_id``
+# with ``invalid_client``. The token-only ``delete_all_*_tokens`` helpers
+# leave every sibling row behind; these purge the whole key family.
+
+
+async def _seed_full_state(
+    store: ConnectionStore, upstream: str, user: str,
+) -> None:
+    """Write one row of every key shape for (upstream, user) so a purge
+    can be proven exhaustive. Covers both axes: user-scoped rows
+    (``user``/``client_info``/``oauth_metadata``/``pending_code``/
+    ``failures``/``notified``) and upstream-only rows
+    (``admin``/``enabled``/``error``/``started_config_hash``)."""
+    await store.put_user_token(DEFAULT_ORG_ID, user, upstream, _token())
+    await store.put_admin_token(
+        DEFAULT_ORG_ID, upstream, _token(), authorized_by="admin@co.com",
+    )
+    await store.put_client_info(
+        DEFAULT_ORG_ID, upstream, user, {"client_id": f"cid-{upstream}-{user}"},
+    )
+    await store.put_oauth_metadata(
+        DEFAULT_ORG_ID, upstream, user, {"issuer": f"iss-{upstream}"},
+    )
+    await store.put_pending_code(DEFAULT_ORG_ID, upstream, user, "code", "state")
+    await store.record_refresh_failure(DEFAULT_ORG_ID, upstream, user)
+    await store.mark_notified(DEFAULT_ORG_ID, upstream, user)
+    await store.set_disabled(DEFAULT_ORG_ID, upstream)
+    await store.set_connection_error(DEFAULT_ORG_ID, upstream, "boom")
+    await store.set_started_config_hash(DEFAULT_ORG_ID, upstream, "hash-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_delete_all_for_upstream_purges_every_key_shape(
+    backend: str, tmp_path: Path,
+) -> None:
+    """``delete_all_for_upstream`` must drop EVERY row keyed to the
+    upstream — including the DCR ``client_info`` that the token-only
+    cascade historically left behind (the ``invalid_client`` brick) —
+    while leaving an unrelated upstream's rows untouched."""
+    async with _make_store(backend, tmp_path) as store:
+        await _seed_full_state(store, "github", "alice@co.com")
+        await _seed_full_state(store, "github", "bob@co.com")
+        await _seed_full_state(store, "slack", "alice@co.com")
+
+        deleted = await store.delete_all_for_upstream(DEFAULT_ORG_ID, "github")
+        assert deleted > 0
+
+        # Every github row is gone, across both users and both axes.
+        for user in ("alice@co.com", "bob@co.com"):
+            assert await store.get_user_token(DEFAULT_ORG_ID, user, "github") is None
+            assert await store.get_client_info(DEFAULT_ORG_ID, "github", user) is None
+            assert await store.get_oauth_metadata(DEFAULT_ORG_ID, "github", user) is None
+            assert await store.get_refresh_failures(DEFAULT_ORG_ID, "github", user) is None
+            assert await store.was_notified(DEFAULT_ORG_ID, "github", user) is False
+            assert await store.pop_pending_code(DEFAULT_ORG_ID, "github", user) is None
+        assert await store.get_admin_token(DEFAULT_ORG_ID, "github") is None
+        assert await store.is_enabled(DEFAULT_ORG_ID, "github") is True  # marker gone
+        assert await store.get_connection_error(DEFAULT_ORG_ID, "github") is None
+        assert await store.get_started_config_hash(DEFAULT_ORG_ID, "github") is None
+
+        # The unrelated upstream is fully intact.
+        assert await store.get_client_info(
+            DEFAULT_ORG_ID, "slack", "alice@co.com",
+        ) is not None
+        assert await store.get_admin_token(DEFAULT_ORG_ID, "slack") is not None
+        assert await store.is_enabled(DEFAULT_ORG_ID, "slack") is False
+
+        # Idempotent: re-running finds nothing left.
+        assert await store.delete_all_for_upstream(DEFAULT_ORG_ID, "github") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_delete_all_for_user_purges_user_axis_only(
+    backend: str, tmp_path: Path,
+) -> None:
+    """``delete_all_for_user`` must drop every USER-scoped row for that
+    email across all upstreams (so a re-invite re-registers cleanly),
+    but must NOT touch upstream-only rows (admin token, disabled marker,
+    connection error, started-config-hash) — those outlive any one user,
+    and another user on the same upstream must be unaffected."""
+    async with _make_store(backend, tmp_path) as store:
+        await _seed_full_state(store, "github", "alice@co.com")
+        await _seed_full_state(store, "slack", "alice@co.com")
+        await _seed_full_state(store, "github", "bob@co.com")
+
+        deleted = await store.delete_all_for_user(DEFAULT_ORG_ID, "alice@co.com")
+        assert deleted > 0
+
+        # All of alice's per-user rows are gone, on every upstream.
+        for upstream in ("github", "slack"):
+            assert await store.get_user_token(
+                DEFAULT_ORG_ID, "alice@co.com", upstream,
+            ) is None
+            assert await store.get_client_info(
+                DEFAULT_ORG_ID, upstream, "alice@co.com",
+            ) is None
+            assert await store.get_oauth_metadata(
+                DEFAULT_ORG_ID, upstream, "alice@co.com",
+            ) is None
+            assert await store.get_refresh_failures(
+                DEFAULT_ORG_ID, upstream, "alice@co.com",
+            ) is None
+
+        # Bob (same upstream) is untouched.
+        assert await store.get_user_token(
+            DEFAULT_ORG_ID, "bob@co.com", "github",
+        ) is not None
+        assert await store.get_client_info(
+            DEFAULT_ORG_ID, "github", "bob@co.com",
+        ) is not None
+
+        # Upstream-only rows are NOT user-scoped — they survive.
+        assert await store.get_admin_token(DEFAULT_ORG_ID, "github") is not None
+        assert await store.is_enabled(DEFAULT_ORG_ID, "github") is False  # still disabled
+        assert await store.get_connection_error(DEFAULT_ORG_ID, "github") is not None
+        assert await store.get_started_config_hash(
+            DEFAULT_ORG_ID, "github",
+        ) == "hash-1"
+
+        assert await store.delete_all_for_user(DEFAULT_ORG_ID, "alice@co.com") == 0

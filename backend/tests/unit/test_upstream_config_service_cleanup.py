@@ -85,6 +85,55 @@ async def test_remove_upstream_deletes_stored_tokens(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_remove_upstream_purges_all_oauth_state(tmp_path: Path) -> None:
+    """Removing an upstream must purge the *whole* key family, not just
+    tokens. The DCR ``client_info`` row is the one that bricks a re-add
+    on the same slug (recycled, now-dead ``client_id`` →
+    ``invalid_client``); ``oauth_metadata`` and the disabled marker are
+    the other rows a re-add would otherwise inherit."""
+    connection_store = FileConnectionStore(tmp_path)
+    org_id = "acme"
+    upstream_id = "mee6"
+
+    await connection_store.put_user_token(
+        org_id, "alice@acme.com", upstream_id, make_token()
+    )
+    await connection_store.put_client_info(
+        org_id, upstream_id, "alice@acme.com", {"client_id": "dead-cid"},
+    )
+    await connection_store.put_oauth_metadata(
+        org_id, upstream_id, "alice@acme.com", {"issuer": "https://mee6"},
+    )
+    await connection_store.set_disabled(org_id, upstream_id)
+    await connection_store.record_refresh_failure(
+        org_id, upstream_id, "alice@acme.com",
+    )
+
+    cm = UpstreamClientManager([])
+    registry = ToolRegistry([], cm)
+    service = UpstreamConfigService(
+        _NoopUpstreamStore(),  # type: ignore[arg-type]
+        cm,
+        registry,
+        connection_store,
+    )
+
+    await service.remove_upstream(org_id, upstream_id)
+
+    assert await connection_store.get_client_info(
+        org_id, upstream_id, "alice@acme.com",
+    ) is None
+    assert await connection_store.get_oauth_metadata(
+        org_id, upstream_id, "alice@acme.com",
+    ) is None
+    assert await connection_store.get_refresh_failures(
+        org_id, upstream_id, "alice@acme.com",
+    ) is None
+    # Disabled marker gone → a re-add starts enabled, not silently off.
+    assert await connection_store.is_enabled(org_id, upstream_id) is True
+
+
+@pytest.mark.asyncio
 async def test_delete_all_upstream_tokens_returns_count(tmp_path: Path) -> None:
     store = FileConnectionStore(tmp_path)
     org_id = "acme"

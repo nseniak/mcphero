@@ -50,6 +50,8 @@ from mcpolis.domain.services.upstream_connection_service import (
     _noop_callback,  # pyright: ignore[reportPrivateUsage]
     _noop_redirect,  # pyright: ignore[reportPrivateUsage]
     _synthesize_silent_reconnect_signature,  # pyright: ignore[reportPrivateUsage]
+    _TERMINAL_AUTH_ERROR_CODES,  # pyright: ignore[reportPrivateUsage]
+    purge_user_oauth_state,
 )
 
 
@@ -416,8 +418,8 @@ async def refresh_token_for_user(
         # The reconnect path's ``_classify_reconnect_failure`` already
         # deletes on this exact signal; mirror it here so loops with no
         # active session converge instead of looping forever.
-        if signature.error_code == "invalid_grant":
-            # §5.2: notify the user *before* the delete below tears down
+        if signature.error_code in _TERMINAL_AUTH_ERROR_CODES:
+            # §5.2: notify the user *before* the purge below tears down
             # the token row + signature the notifier reads. Reuse the
             # shared notifier so the decide / mark-notified logic lives
             # in one place (DRY with the hourly health-email sweep).
@@ -456,13 +458,14 @@ async def refresh_token_for_user(
                 upstream_id=upstream.id,
                 user=user_id,
                 org_id=org_id,
-                reason="invalid_grant",
+                reason=signature.error_code,
             )
-            await connection_store.delete_user_token(
-                org_id, user_id, upstream.id,
-            )
-            await connection_store.reset_refresh_failures(
-                org_id, upstream.id, user_id,
+            # Purge the whole per-user state. For ``invalid_client`` the
+            # DCR client_info is dead too; dropping it (safe now the token
+            # is gone) is what lets the next consent re-register instead
+            # of re-presenting the dead client_id forever.
+            await purge_user_oauth_state(
+                connection_store, org_id, upstream.id, user_id,
             )
     else:
         # Raised from DEBUG to INFO so the periodic loop's "no-op tick"

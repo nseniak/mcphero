@@ -135,15 +135,20 @@ class UpstreamConfigService:
         await self._registry.unregister_upstream(upstream_id)
         if self._tool_router is not None:
             self._tool_router.unregister_upstream(upstream_id)
-        deleted = await self._connection_store.delete_all_upstream_tokens(
+        # Comprehensive purge: not just tokens but the whole key family
+        # (client_info, oauth_metadata, enabled marker, failure counters,
+        # …). A narrower token-only delete would let a re-add on the same
+        # slug resurrect a dead DCR client_info and 400 with
+        # ``invalid_client`` forever.
+        deleted = await self._connection_store.delete_all_for_upstream(
             org_id, upstream_id
         )
         if deleted:
             logger.info(
-                "upstream.removed.tokens_deleted",
+                "upstream.removed.state_purged",
                 upstream_id=upstream_id,
                 org_id=org_id,
-                deleted_token_count=deleted,
+                deleted_key_count=deleted,
             )
         # Cascade: env vars don't outlive their owning upstream.
         if self._template_var_repo is not None:

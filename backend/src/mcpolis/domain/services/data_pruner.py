@@ -19,8 +19,24 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 # All connections.json key prefixes that include an upstream_id, and whether
 # they also include a user_id (and at what colon offset).
-_PER_UPSTREAM_KEYS_WITH_USER = ("user:", "client_info:", "pending_code:")
-_PER_UPSTREAM_KEYS_NO_USER = ("admin:", "error:", "enabled:")
+# Keep these exhaustive: a prefix omitted here leaks past every prune,
+# which is how dead ``client_info`` / ``oauth_metadata`` rows survive a
+# user/upstream removal and re-brick a re-add. Must mirror the
+# ``_*_key`` helpers in the connection stores.
+_PER_UPSTREAM_KEYS_WITH_USER = (
+    "user:",
+    "client_info:",
+    "oauth_metadata:",
+    "pending_code:",
+    "failures:",
+    "notified:",
+)
+_PER_UPSTREAM_KEYS_NO_USER = (
+    "admin:",
+    "error:",
+    "enabled:",
+    "started_config_hash:",
+)
 
 
 def _prune_connections_file(
