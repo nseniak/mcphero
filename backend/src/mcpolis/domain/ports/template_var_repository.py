@@ -88,3 +88,9 @@ class TemplateVarRepository(Protocol):
     ) -> None:
         """Cascade delete on upstream removal. Idempotent."""
         ...
+
+    async def delete_all_for_org(self, org_id: str) -> int:
+        """Remove every template variable for the org, across all
+        upstreams (org-deletion cascade). Returns the number of rows
+        removed. Idempotent."""
+        ...

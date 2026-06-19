@@ -180,6 +180,27 @@ async def test_paused_only_ref_round_trips(backend: str) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
+async def test_creating_marker_both_none_ref_round_trips(backend: str) -> None:
+    """The E2B in-flight-create "creating" marker is a ref with BOTH
+    ``sandbox_id`` and ``paused_snapshot_id`` None — a state the normal
+    lifecycle never produces, which the reconciler uses as its
+    in-flight discriminator. It must round-trip cleanly (the Mongo strict
+    deserializer must NOT reject a both-None ref as malformed), or BUG-2's
+    fix silently breaks on the cloud backend."""
+    async with _make_repo(backend) as repo:
+        marker = make_ref(sandbox_id=None, paused_snapshot_id=None)
+        await repo.upsert(marker)
+        loaded = await repo.get(
+            org_id=marker.org_id, upstream_id=marker.upstream_id,
+        )
+        assert loaded is not None
+        assert loaded.sandbox_id is None
+        assert loaded.paused_snapshot_id is None
+        assert loaded.mcpolis_instance == marker.mcpolis_instance
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
 async def test_instance_field_round_trips(backend: str) -> None:
     """``mcpolis_instance`` is the multi-instance safety key — it must
     round-trip exactly so the reconciler can distinguish "my refs"

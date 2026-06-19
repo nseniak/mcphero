@@ -123,7 +123,13 @@ async def start_server(port: int) -> tuple[uvicorn.Server, asyncio.Task[None]]:
             try:
                 await client.get(f"http://127.0.0.1:{port}/mcp")
                 return server, task
-            except httpx.ConnectError:
+            except (httpx.TransportError, OSError):
+                # Catch the full transport/OS surface, not just
+                # ConnectError: a CPU-starved loopback connect under
+                # make test-all raises ``httpx.ConnectTimeout``, which
+                # is a *sibling* of ConnectError (both under
+                # TransportError), not a subclass — the old narrow
+                # except let it escape and failed the test.
                 await asyncio.sleep(0.05)
     raise AssertionError(f"upstream server on :{port} never came up")
 

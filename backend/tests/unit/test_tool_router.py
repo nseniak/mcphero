@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import mcp.types as mcp_types
 import pytest
+import structlog
 
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
 from mcpolis.adapters.repositories.file_audit_repository import FileAuditRepository
@@ -76,6 +77,35 @@ async def test_route_call_proxies_to_correct_upstream(tmp_path: Path) -> None:
     assert result.content[0].type == "text"
     # Verify the mock session was called with the right args
     mock_session.call_tool.assert_awaited_once_with("create_issue", {"title": "Bug"})
+
+
+@pytest.mark.asyncio
+async def test_route_call_emits_tool_analytics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3 (contrast to the resources/prompts gate): a tool call DOES emit
+    the ``tool_called`` analytics event — the observability that
+    read_resource / get_prompt must NOT emit."""
+    from mcpolis.domain.services import tool_router as tr_module
+
+    tracked: list[tuple[Any, ...]] = []
+
+    class _Stub:
+        def track_async(self, *a: Any, **k: Any) -> None:
+            tracked.append((a, k))
+
+    monkeypatch.setattr(tr_module, "get_analytics", lambda: _Stub())
+    router, _, _ = make_tool_router(tmp_path)
+    await router.route_call(
+        org_id=DEFAULT_ORG_ID,
+        prefixed_name="github__create_issue",
+        arguments={"title": "Bug"},
+        user_id="alice",
+        session_id="sess1",
+    )
+    assert len(tracked) == 1, "a tool call must emit exactly one analytics event"
+    event_name = tracked[0][0][1]
+    assert event_name == "tool_called"
 
 
 @pytest.mark.asyncio
@@ -298,3 +328,173 @@ async def test_route_call_heals_but_does_not_retry_non_idempotent_tool(
     assert result.isError, "non-idempotent stall returns an error, not a silent retry"
     assert client_manager.fresh_calls == 1, "stall must still heal the session"
     assert call_tool.await_count == 1, "non-idempotent tool must not be retried"
+
+
+# --- cancellation, heal-failure, and R8 markers (review reconciliation) --------
+
+
+@pytest.mark.asyncio
+async def test_route_call_cancelled_midflight_audited_cancelled_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review item 1: a client that cancels the gateway request mid-dispatch
+    must NOT be audited as a successful call (CancelledError is a
+    BaseException that bypasses ``except Exception``, so the finally used to
+    default to "success"), must NOT heal the session (cancellation isn't a
+    transport stall), and the abandoned op must be cancelled."""
+    from mcpolis.domain.services import tool_router as tr_module
+
+    upstream = make_upstream_definition(id="mee6")  # service_account
+    op_started = asyncio.Event()
+    op_cancelled = asyncio.Event()
+
+    async def hang(*_a: Any, **_k: Any) -> Any:
+        op_started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            op_cancelled.set()
+            raise
+
+    session = MagicMock()
+    session.call_tool = AsyncMock(side_effect=hang)
+    session.send_ping = AsyncMock(return_value=mcp_types.EmptyResult())
+    cm = _FakeStallManager(session)
+    registry = ToolRegistry([upstream], cast(Any, cm))
+    registry._tools = [
+        make_discovered_tool(upstream_id="mee6", original_name="do_thing"),
+    ]
+    audit = FileAuditRepository(tmp_path / "audit.jsonl")
+    router = ToolRouter(
+        registry, cast(Any, cm), audit, [upstream],
+        policy_engine=PolicyEngine(SettingsConfig()),
+    )
+
+    tracked: list[tuple[Any, ...]] = []
+
+    class _Stub:
+        def track_async(self, *a: Any, **_k: Any) -> None:
+            tracked.append(a)
+
+    monkeypatch.setattr(tr_module, "get_analytics", lambda: _Stub())
+
+    task = asyncio.create_task(router.route_call(
+        org_id=DEFAULT_ORG_ID, prefixed_name="mee6__do_thing",
+        arguments={}, user_id="alice", session_id=None,
+    ))
+    await asyncio.wait_for(op_started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert op_cancelled.is_set(), "the abandoned op must be cancelled"
+    assert cm.fresh_calls == 0, "cancellation is not a stall — no heal"
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["response_status"] == "cancelled", (
+        "a cancelled dispatch must not be audited as success"
+    )
+    assert tracked and tracked[0][2]["response_status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_route_call_heal_failure_returns_opaque_error_not_raw(
+    tmp_path: Path,
+) -> None:
+    """Review item 2: if the heal itself fails (E2B unreachable during the
+    fresh reconnect), the router must RETURN an opaque error result — never
+    let the heal's raw exception propagate (leaking detail) — and audit it as
+    an error, not "success"."""
+    upstream = make_upstream_definition(id="mee6")
+    session = MagicMock()
+    session.call_tool = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    class _HealFailsManager(_FakeStallManager):
+        async def reconnect_shared_fresh(self, upstream: Any) -> None:
+            raise RuntimeError("E2B unreachable at secret-host:5432")
+
+    cm = _HealFailsManager(session)
+    registry = ToolRegistry([upstream], cast(Any, cm))
+    registry._tools = [
+        make_discovered_tool(
+            upstream_id="mee6", original_name="do_thing",
+            annotations=ToolAnnotations(idempotentHint=True),  # retry_safe
+        ),
+    ]
+    audit = FileAuditRepository(tmp_path / "audit.jsonl")
+    router = ToolRouter(
+        registry, cast(Any, cm), audit, [upstream],
+        policy_engine=PolicyEngine(SettingsConfig()),
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID, prefixed_name="mee6__do_thing",
+        arguments={}, user_id="alice", session_id=None,
+    )
+
+    assert result.isError, "a heal failure must surface as an error result"
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "Reference:" in text
+    assert "secret-host" not in text, "the heal's raw exception must not leak"
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert rows[-1]["response_status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_route_call_emits_recovered_marker_on_stall_retry(
+    tmp_path: Path,
+) -> None:
+    """R8 (review item 9): a stall+heal+retry that succeeds emits
+    ``upstream.dispatch.recovered`` (so its inflated latency reads as a
+    recovery, not a slow upstream) and tags the tool-completion log with
+    attempts/stalled."""
+    ok = mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text="ok")], isError=False,
+    )
+    router, _call_tool, _cm = make_stall_router(
+        tmp_path,
+        annotations=ToolAnnotations(idempotentHint=True),
+        call_behaviours=[asyncio.TimeoutError(), ok],
+    )
+    with structlog.testing.capture_logs() as logs:
+        result = await router.route_call(
+            org_id=DEFAULT_ORG_ID, prefixed_name="mee6__do_thing",
+            arguments={}, user_id="alice", session_id="s1",
+        )
+    assert not result.isError
+    recovered = [e for e in logs if e.get("event") == "upstream.dispatch.recovered"]
+    assert len(recovered) == 1, "a recovered call must emit the R8 marker"
+    assert recovered[0]["attempts"] == 2
+    completed = [e for e in logs if e.get("event") == "upstream.tool_call.completed"]
+    assert len(completed) == 1
+    assert completed[0]["stalled"] is True
+    assert completed[0]["attempts"] == 2
+
+
+@pytest.mark.asyncio
+async def test_route_call_no_recovered_marker_on_clean_call(
+    tmp_path: Path,
+) -> None:
+    """A clean (non-stalled) call must NOT emit the recovery marker, and its
+    completion log marks stalled=False / attempts=1."""
+    router, _, _ = make_tool_router(tmp_path)
+    with structlog.testing.capture_logs() as logs:
+        await router.route_call(
+            org_id=DEFAULT_ORG_ID, prefixed_name="github__create_issue",
+            arguments={"title": "Bug"}, user_id="alice", session_id="s1",
+        )
+    assert not any(
+        e.get("event") == "upstream.dispatch.recovered" for e in logs
+    )
+    completed = [e for e in logs if e.get("event") == "upstream.tool_call.completed"]
+    assert len(completed) == 1
+    assert completed[0]["stalled"] is False
+    assert completed[0]["attempts"] == 1

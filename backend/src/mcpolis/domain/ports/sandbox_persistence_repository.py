@@ -131,6 +131,11 @@ class SandboxPersistenceRepository(Protocol):
         """Remove a ref. No-op when the ref didn't exist."""
         ...
 
+    async def delete_all_for_org(self, *, org_id: str) -> int:
+        """Remove every ref for the org, across all upstreams
+        (org-deletion cascade). Returns the count removed. Idempotent."""
+        ...
+
     async def list_for_org(self, *, org_id: str) -> list[SandboxPersistedRef]:
         """Return every ref for a single org. Used by org-scoped
         reconciliation paths."""

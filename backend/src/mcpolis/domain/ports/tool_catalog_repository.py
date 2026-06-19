@@ -59,3 +59,8 @@ class ToolCatalogRepository(Protocol):
     ) -> None:
         """Remove the persisted snapshot for one upstream."""
         ...
+
+    async def delete_all_for_org(self, org_id: str) -> None:
+        """Remove every persisted catalog snapshot for the org
+        (org-deletion cascade). Idempotent."""
+        ...

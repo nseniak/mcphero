@@ -286,21 +286,41 @@ class McpGatewayOAuthProvider:
         if pending is None:
             raise ValueError("Invalid or expired OAuth state")
 
-        # Exchange Google code for tokens
+        # Exchange Google code for tokens. A misbehaving token endpoint
+        # (5xx, transport timeout) is a third-party fault we must *handle*:
+        # map any httpx failure to the same ValueError family the no-id_token
+        # path raises, so the callback route renders a clean error instead of
+        # letting a raw httpx exception escape as an unhandled 500.
         callback_url = f"{self.server_url.rstrip('/')}/mcp/oauth/google/callback"
-        async with httpx.AsyncClient() as http_client:
-            resp = await http_client.post(
-                GOOGLE_TOKEN_URL,
-                data={
-                    "code": code,
-                    "client_id": self.google_client_id,
-                    "client_secret": self.google_client_secret,
-                    "redirect_uri": callback_url,
-                    "grant_type": "authorization_code",
-                },
+        try:
+            async with httpx.AsyncClient() as http_client:
+                resp = await http_client.post(
+                    GOOGLE_TOKEN_URL,
+                    data={
+                        "code": code,
+                        "client_id": self.google_client_id,
+                        "client_secret": self.google_client_secret,
+                        "redirect_uri": callback_url,
+                        "grant_type": "authorization_code",
+                    },
+                )
+                resp.raise_for_status()
+                token_data = resp.json()
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            # httpx.HTTPError covers status (raise_for_status) + transport
+            # (timeout/connect) faults; json.JSONDecodeError covers a 200
+            # with a malformed body. Map all of them to the clean ValueError
+            # family the no-id_token path raises — don't rely on the
+            # callback route's ``except ValueError`` happening to catch a
+            # raw JSONDecodeError.
+            logger.warning(
+                "gateway_oauth.google_token_exchange_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
             )
-            resp.raise_for_status()
-            token_data = resp.json()
+            raise ValueError(
+                "Google token exchange failed; please retry authentication"
+            ) from exc
 
         # Extract email from ID token (Google returns a JWT)
         id_token = token_data.get("id_token")

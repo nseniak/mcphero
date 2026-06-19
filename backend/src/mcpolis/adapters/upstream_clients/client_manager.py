@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections.abc import Callable
 
 import httpx
@@ -40,6 +41,7 @@ from mcpolis.domain.ports.sandbox_persistence_repository import (
     SandboxPersistenceRepository,
 )
 from mcpolis.domain.services.system_variables import (
+    DEFAULT_SANDBOX_HOME,
     system_variables_for_sandbox,
 )
 from mcpolis.domain.services.template_var_substitution import (
@@ -245,6 +247,33 @@ class UpstreamClientManager:
         # CONNECTING — ``CONNECTING`` is reserved for admin-clicked
         # Reconnect, which is cross-tab visible.
         self._lazy_connect_tasks: dict[str, asyncio.Task[None]] = {}
+
+        # ── Orthogonal: single-flight heal infra (R1) ──────────────
+        # ``reconnect_shared_fresh`` (the stall-heal) deletes the
+        # persisted sandbox ref and force-creates a fresh sandbox.
+        # It bypasses ``_lazy_connect_tasks`` (it never goes through
+        # ``ensure_shared_connected``), so without its own single-flight,
+        # N gateway dispatches that all stalled on the SAME poisoned
+        # shared session and raced into the heal at once would each
+        # force a fresh E2B sandbox — N-1 immediately orphaned — and
+        # race the ref delete/re-persist. Concurrent healers coalesce
+        # onto the first in-flight reconnect here instead.
+        self._reconnect_fresh_tasks: dict[str, asyncio.Task[None]] = {}
+
+        # ── Per-upstream shared-connect mutex (R1) ─────────────────
+        # The two single-flights above each coalesce their OWN kind, but
+        # ``ensure_shared_connected`` (lazy acquire) and
+        # ``reconnect_shared_fresh`` (heal) BOTH call ``connect_shared``
+        # on the shared service_account session — which otherwise has no
+        # mutual exclusion. A heal mid-connect (``connect_shared`` has
+        # already nulled the session via ``_close_shared_inplace``)
+        # racing a concurrent lazy acquire would start a SECOND
+        # ``connect_shared`` → two sandboxes (one orphaned) + a ref
+        # delete/re-persist race. This per-upstream lock serializes the
+        # connect across BOTH paths; the lazy path also re-checks
+        # liveness after acquiring it, so a waiter that finds the heal
+        # already produced a live session skips its own connect.
+        self._shared_connect_locks: dict[str, asyncio.Lock] = {}
 
         # Optional callbacks invoked when an upstream reports that its
         # tools / resources / prompts list has changed. Wired from above
@@ -1103,7 +1132,10 @@ class UpstreamClientManager:
         self._state.clear()
 
     async def _resolve_sandbox_files(
-        self, upstream: UpstreamDefinition,
+        self,
+        upstream: UpstreamDefinition,
+        *,
+        sandbox_home: str = DEFAULT_SANDBOX_HOME,
     ) -> list[MaterializeFile]:
         """Render every Sandbox file's ``target_path`` against system
         + user Variables and return the materialise list for the
@@ -1129,7 +1161,7 @@ class UpstreamClientManager:
         )
         if not files:
             return []
-        sys_vars = system_variables_for_sandbox()
+        sys_vars = system_variables_for_sandbox(sandbox_home)
 
         # Pre-fetch every user-var referenced in any target_path so
         # the sync resolver doesn't have to ``await`` per match.
@@ -1167,7 +1199,10 @@ class UpstreamClientManager:
         return materialized
 
     async def _resolve_upstream_template_vars(
-        self, upstream: UpstreamDefinition
+        self,
+        upstream: UpstreamDefinition,
+        *,
+        sandbox_home: str = DEFAULT_SANDBOX_HOME,
     ) -> UpstreamDefinition:
         """Return a copy of ``upstream`` with ``${NAME}`` refs resolved.
 
@@ -1226,7 +1261,7 @@ class UpstreamClientManager:
         # ``${HOME}/.../path`` literals on both sides (file
         # ``target_path`` and the env-var value), preserving a single
         # mental model for what ``${X}`` means everywhere.
-        sys_vars = system_variables_for_sandbox()
+        sys_vars = system_variables_for_sandbox(sandbox_home)
 
         resolved: dict[str, str | None] = {}
         for name in referenced:
@@ -1336,10 +1371,16 @@ class UpstreamClientManager:
         bearer_token: str | None = None,
         auth: httpx.Auth | None = None,
     ) -> tuple[ClientSession, ConnectionTask]:
-        # Resolve ``${NAME}`` refs in env / headers before either
-        # connection task ever sees them, so the SandboxService and
-        # HTTP adapter only ever handle concrete values.
-        upstream = await self._resolve_upstream_template_vars(upstream)
+        # Resolve ``${NAME}`` refs in env / headers / target_paths
+        # before either connection task sees them, so the SandboxService
+        # and HTTP adapter only ever handle concrete values. ``${HOME}``
+        # must resolve to the home the spawned process actually gets,
+        # which is provider-specific — so for stdio we resolve the
+        # provider first and substitute against its per-session home;
+        # HTTP runs in no sandbox and uses the default home.
+        #
+        # ``upstream.id`` is never templated, so the change callbacks can
+        # be built from it before substitution.
         on_tools_changed = self._build_tool_change_cb(upstream.id)
         on_resources_changed = self._build_resource_change_cb(upstream.id)
         on_prompts_changed = self._build_prompt_change_cb(upstream.id)
@@ -1353,9 +1394,20 @@ class UpstreamClientManager:
                     f"sandbox provider {provider!r} resolved but not"
                     f" registered; have {sorted(self._sandbox_services)}",
                 ) from exc
+            # Mint the session id here so the home we substitute
+            # ``${HOME}`` with is the exact value ``service.session``
+            # recomputes for the spawned process (E2B's fixed
+            # /home/user, or a local-subprocess per-session temp dir).
+            session_id = uuid.uuid4().hex
+            sandbox_home = service.sandbox_home(session_id=session_id)
+            upstream = await self._resolve_upstream_template_vars(
+                upstream, sandbox_home=sandbox_home,
+            )
             resources = _resources_for(upstream)
             service.validate_resources(resources)
-            materialize_files = await self._resolve_sandbox_files(upstream)
+            materialize_files = await self._resolve_sandbox_files(
+                upstream, sandbox_home=sandbox_home,
+            )
             task: ConnectionTask = SandboxConnectionTask(
                 upstream,
                 user_id=user_id,
@@ -1370,8 +1422,10 @@ class UpstreamClientManager:
                 sandbox_persistence=self._sandbox_persistence,
                 mcpolis_instance=self._mcpolis_instance,
                 materialize_files=materialize_files,
+                session_id=session_id,
             )
         else:
+            upstream = await self._resolve_upstream_template_vars(upstream)
             task = HttpConnectionTask(
                 upstream,
                 user_id=user_id,
@@ -1430,6 +1484,17 @@ class UpstreamClientManager:
             upstream_id=upstream.id,
         )
 
+    def _shared_connect_lock(self, upstream_id: str) -> asyncio.Lock:
+        """Per-upstream mutex serializing ``connect_shared`` of the shared
+        session across the lazy-acquire and heal paths (R1). Created
+        lazily; the get-then-set is await-free, so it's atomic under the
+        single-threaded event loop."""
+        lock = self._shared_connect_locks.get(upstream_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._shared_connect_locks[upstream_id] = lock
+        return lock
+
     async def reconnect_shared_fresh(
         self,
         upstream: UpstreamDefinition,
@@ -1451,23 +1516,59 @@ class UpstreamClientManager:
         The stale/flaky sandbox is closed by ``connect_shared``'s
         close-then-open sequence and reaped by the reconciler; the cost
         of a fresh create on the rare stall buys a reliable session.
+
+        Single-flight per upstream id (R1): concurrent healers — several
+        gateway dispatches that all stalled on the SAME poisoned shared
+        session and detected it at once — COALESCE onto the first
+        in-flight reconnect instead of each force-creating its own
+        sandbox. Without this, the dispatch-stall recovery would turn N
+        simultaneous stalls into N fresh sandboxes (N-1 orphaned) plus a
+        ref delete/re-persist race. A heal that arrives *after* a prior
+        reconnect already completed starts its own (correct: it reflects
+        a genuinely later stall, and the straggler window is bounded +
+        reaper-cleaned).
         """
-        if self._sandbox_persistence is not None:
-            try:
-                await self._sandbox_persistence.delete(
-                    org_id=self._org_id, upstream_id=upstream.id,
-                )
-            except Exception:
-                logger.warning(
-                    "upstream.client.reconnect_fresh.ref_delete_failed",
+        existing = self._reconnect_fresh_tasks.get(upstream.id)
+        if existing is not None and not existing.done():
+            await existing
+            return
+
+        async def _do_reconnect_fresh() -> None:
+            # Serialize the connect against a concurrent lazy
+            # ``ensure_shared_connected`` (R1): both call ``connect_shared``
+            # on the shared session. The heal is unconditional (the current
+            # session is poisoned, so force a fresh one even if it still
+            # looks live).
+            async with self._shared_connect_lock(upstream.id):
+                if self._sandbox_persistence is not None:
+                    try:
+                        await self._sandbox_persistence.delete(
+                            org_id=self._org_id, upstream_id=upstream.id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "upstream.client.reconnect_fresh.ref_delete_failed",
+                            upstream_id=upstream.id,
+                            exc_info=True,
+                        )
+                logger.info(
+                    "upstream.client.reconnect_shared_fresh",
                     upstream_id=upstream.id,
-                    exc_info=True,
                 )
-        logger.info(
-            "upstream.client.reconnect_shared_fresh",
-            upstream_id=upstream.id,
-        )
-        await self.connect_shared(upstream, bearer_token=bearer_token, auth=auth)
+                await self.connect_shared(
+                    upstream, bearer_token=bearer_token, auth=auth,
+                )
+
+        task = asyncio.create_task(_do_reconnect_fresh())
+        self._reconnect_fresh_tasks[upstream.id] = task
+        try:
+            await task
+        finally:
+            # Clear only when the entry still points at our task —
+            # protects against a later healer that overwrote it after
+            # ours completed (mirrors ``ensure_shared_connected``).
+            if self._reconnect_fresh_tasks.get(upstream.id) is task:
+                self._reconnect_fresh_tasks.pop(upstream.id, None)
 
     async def _persist_cached_metadata(self, upstream_id: str) -> None:
         """Write ``server_info`` + ``self_description`` back to the
@@ -1560,34 +1661,47 @@ class UpstreamClientManager:
             # three component events (envd_ready + reconnect.ok +
             # shared_session.created) by hand.
             started = asyncio.get_running_loop().time()
-            try:
-                await self.connect_shared(upstream)
-                logger.info(
-                    "upstream.client.lazy_connect.success",
-                    upstream_id=upstream.id,
-                    total_duration_ms=int(
-                        (asyncio.get_running_loop().time() - started) * 1000,
-                    ),
-                )
-            except Exception as exc:
-                # Lazy attach failed: the upstream isn't usable. Mark
-                # FAILED so the dashboard refetch shows the truth.
-                # The user's tool call will surface the underlying
-                # error; the next dispatch retries via this same
-                # method.
-                await self.transition_to_failed(
-                    upstream.id,
-                    last_failure=str(exc),
-                    reason="lazy_attach_failed",
-                )
-                logger.exception(
-                    "upstream.client.lazy_connect.failed",
-                    upstream_id=upstream.id,
-                    total_duration_ms=int(
-                        (asyncio.get_running_loop().time() - started) * 1000,
-                    ),
-                )
-                raise
+            # Serialize against a concurrent heal (R1). After acquiring
+            # the lock, double-check: a ``reconnect_shared_fresh`` that ran
+            # while we waited may already have produced a live shared
+            # session — reuse it instead of opening a second sandbox.
+            async with self._shared_connect_lock(upstream.id):
+                state = self._state.get(upstream.id)
+                if state is not None and state.shared_session is not None:
+                    task = state.shared_task
+                    if task is None or task.is_transport_alive():
+                        logger.info(
+                            "upstream.client.lazy_connect.coalesced",
+                            upstream_id=upstream.id,
+                        )
+                        return
+                try:
+                    await self.connect_shared(upstream)
+                    logger.info(
+                        "upstream.client.lazy_connect.success",
+                        upstream_id=upstream.id,
+                        total_duration_ms=int(
+                            (asyncio.get_running_loop().time() - started) * 1000,
+                        ),
+                    )
+                except Exception as exc:
+                    # Lazy attach failed: the upstream isn't usable. Mark
+                    # FAILED so the dashboard refetch shows the truth. The
+                    # user's tool call will surface the underlying error;
+                    # the next dispatch retries via this same method.
+                    await self.transition_to_failed(
+                        upstream.id,
+                        last_failure=str(exc),
+                        reason="lazy_attach_failed",
+                    )
+                    logger.exception(
+                        "upstream.client.lazy_connect.failed",
+                        upstream_id=upstream.id,
+                        total_duration_ms=int(
+                            (asyncio.get_running_loop().time() - started) * 1000,
+                        ),
+                    )
+                    raise
 
         task = asyncio.create_task(_do_connect())
         self._lazy_connect_tasks[upstream.id] = task
@@ -2325,6 +2439,28 @@ class UpstreamClientManager:
             return None
         candidates.sort(key=lambda x: x[0])
         return candidates[0][1]
+
+    def first_user_with_session(self, upstream_id: str) -> str | None:
+        """Return the user_id owning any live per-user session for
+        ``upstream_id``, or None.
+
+        The identity-returning sibling of
+        ``any_user_session_for_upstream`` (same deterministic ordering).
+        The admin-MCP refresh-with-recovery path needs the *owner*, not
+        just the session: ``acquire_and_refresh_with_recovery`` is
+        identity-coupled (one ``effective_user``), and admin discovery
+        is identity-agnostic — the live session may belong to a user
+        other than the calling admin, so a stall must be healed under
+        that user's identity to reconnect from the right stored tokens.
+        """
+        candidates = [
+            user_id
+            for (user_id, uid) in self._user_sessions
+            if uid == upstream_id
+        ]
+        if not candidates:
+            return None
+        return sorted(candidates)[0]
 
     def get_upstream(self, upstream_id: str) -> UpstreamDefinition | None:
         return self._upstreams.get(upstream_id)

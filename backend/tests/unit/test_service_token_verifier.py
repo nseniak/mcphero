@@ -65,6 +65,44 @@ async def test_composite_dispatches_svct_prefix_to_registry_not_oauth_store(
 
 
 @pytest.mark.asyncio
+async def test_composite_prefix_only_token_stays_on_registry_returns_none(
+    tmp_path: Path,
+) -> None:
+    """AUTH-2 (composite): a bare ``svct_`` prefix (no secret body)
+    is dispatched to the registry, never the OAuth store, and misses
+    → None. The dispatch is on the literal prefix; an empty secret is
+    not an OAuth token, so it must never fall through to OAuth."""
+    service = make_service(tmp_path)
+    composite = CompositeGatewayTokenVerifier(
+        ServiceTokenVerifier(service),
+        _RefusingOAuthProvider(),
+    )
+    assert await composite.verify_token("svct_") is None
+
+
+@pytest.mark.asyncio
+async def test_composite_oauth_shaped_token_with_svct_prefix_never_reaches_oauth(
+    tmp_path: Path,
+) -> None:
+    """AUTH-3: an OAuth-shaped bearer that *coincidentally* starts with
+    ``svct_`` is misrouted to the registry by the prefix dispatcher and
+    — being absent there — resolves to None. The OAuth provider is
+    never consulted. This documents the standing invariant that OAuth
+    tokens must NEVER carry the ``svct_`` prefix: if one did, it would
+    be silently rejected here rather than verified, because dispatch is
+    total and prefix-based, not a fallback chain."""
+    service = make_service(tmp_path)
+    oauth = _RecordingOAuthProvider()
+    composite = CompositeGatewayTokenVerifier(
+        ServiceTokenVerifier(service), oauth,
+    )
+    oauth_shaped = "svct_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig"
+    assert await composite.verify_token(oauth_shaped) is None
+    # The OAuth provider never saw it — prefix dispatch is total.
+    assert oauth.seen == []
+
+
+@pytest.mark.asyncio
 async def test_composite_routes_oauth_tokens_past_registry(
     tmp_path: Path,
 ) -> None:

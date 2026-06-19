@@ -349,6 +349,9 @@ def _fake_sandbox_service(name: str = "e2b") -> MagicMock:
     svc = MagicMock(name=f"SandboxService.{name}")
     svc.kill_persisted_session = AsyncMock()
     svc.on_upstream_removed = AsyncMock()
+    # Return a real string (not a MagicMock) so any path that resolves
+    # ``${HOME}`` via this fake gets a usable home value.
+    svc.sandbox_home = MagicMock(return_value="/home/user")
     return svc
 
 

@@ -31,6 +31,7 @@ One sandbox + a fresh create per recovered stall; ~2-4 min, a few cents.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from typing import Any
@@ -186,3 +187,143 @@ async def test_refresh_recovers_from_reattach_stall_under_stress() -> None:
             await manager.disconnect_upstream(upstream.id)
         except Exception:
             pass
+
+
+def _make_everything_upstream(suffix: str) -> Any:
+    upstream = make_upstream_definition(
+        id=f"e2e-{suffix}-{TEST_RUN_ID}", command="npx",
+    )
+    upstream.stdio.args = [  # type: ignore[union-attr]
+        "-y", "@modelcontextprotocol/server-everything",
+    ]
+    upstream.stdio.env = {}  # type: ignore[union-attr]
+    return upstream
+
+
+@pytest.mark.asyncio
+async def test_concurrent_heal_coalesces_to_one_fresh_sandbox() -> None:
+    """R1 (BLOCKER): N dispatches that stalled on the SAME poisoned shared
+    session and raced into the heal must COALESCE onto ONE fresh E2B
+    reconnect — not create N sandboxes (N-1 orphaned). Pins the per-upstream
+    single-flight on ``reconnect_shared_fresh`` against a live sandbox; a
+    mock can't prove the race is actually serialized."""
+    org_id = f"acme-r1-{TEST_RUN_ID}"
+    upstream = _make_everything_upstream("r1")
+    manager = make_e2b_manager(upstream, org_id)
+
+    # Count real fresh-sandbox creates (connect_shared), which is what a
+    # missing single-flight would multiply.
+    connect_calls = [0]
+    orig_connect = manager.connect_shared
+
+    async def _counting_connect(up: Any, *a: Any, **k: Any) -> None:
+        connect_calls[0] += 1
+        await orig_connect(up, *a, **k)
+
+    manager.connect_shared = _counting_connect  # type: ignore[method-assign]
+
+    try:
+        await manager.connect_shared(upstream)  # initial create
+        service: Any = manager._sandbox_services["e2b"]  # type: ignore[reportPrivateUsage]
+        # Poison the live shared session: pause it so every later send
+        # stalls — the exact state concurrent healers race from.
+        await _pause_live_sandbox(service, manager, upstream.id)
+
+        baseline = connect_calls[0]
+        healers = [
+            asyncio.create_task(manager.reconnect_shared_fresh(upstream))
+            for _ in range(6)
+        ]
+        await asyncio.gather(*healers)
+        created = connect_calls[0] - baseline
+        print(f"R1: 6 concurrent healers → {created} fresh sandbox create(s)")
+        assert created == 1, (
+            f"6 concurrent healers must coalesce to ONE fresh sandbox, "
+            f"got {created}"
+        )
+
+        # The healed shared session must be usable.
+        session = manager.get_session(upstream.id)
+        result = await asyncio.wait_for(session.list_tools(), timeout=30)
+        assert result.tools, "the coalesced fresh session must be live"
+    except E2BSDKError as exc:
+        if is_template_missing_error(exc):
+            pytest.skip(
+                "mcpolis E2B templates not published on the active account — "
+                "run `cd runner/e2b-templates && make build`.",
+            )
+        raise
+    finally:
+        try:
+            await manager.disconnect_upstream(upstream.id)
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_slow_tool_is_not_torn_down_by_liveness_ping() -> None:
+    """R2: a genuinely slow but LIVE tool must run to completion — the
+    ping-on-timeout liveness check keeps waiting while the server still
+    answers pings, instead of tearing the call down mid-execution (which
+    on a non-idempotent tool would risk a double-execute on retry). A mock
+    can't prove the server answers pings concurrently with a slow tool on a
+    real transport."""
+    from mcpolis.domain.services.tool_router import dispatch_with_liveness
+
+    org_id = f"acme-r2-{TEST_RUN_ID}"
+    upstream = _make_everything_upstream("r2")
+    manager = make_e2b_manager(upstream, org_id)
+    try:
+        await manager.connect_shared(upstream)
+        session = manager.get_session(upstream.id)
+
+        # ``trigger-long-running-operation`` sleeps ``duration`` seconds
+        # across ``steps``, yielding the server event loop between steps so
+        # pings are answered while it runs. With a 2s probe interval the 8s
+        # op triggers several liveness pings — none of which may tear it
+        # down. (Discover the name defensively: the everything server has
+        # renamed it across versions.)
+        list_result = await asyncio.wait_for(session.list_tools(), timeout=30)
+        slow_tool = next(
+            (t.name for t in list_result.tools if "long-running" in t.name),
+            "trigger-long-running-operation",
+        )
+        result = await dispatch_with_liveness(
+            session,
+            lambda: session.call_tool(slow_tool, {"duration": 8, "steps": 4}),
+            op_label=slow_tool,
+            org_id=org_id,
+            upstream_id=upstream.id,
+            probe_interval=2.0,
+            ping_timeout=10.0,
+        )
+        assert not result.isError, (
+            f"a slow-but-alive tool must complete, not be torn down: {result}"
+        )
+        print("R2: slow tool completed without teardown")
+    except E2BSDKError as exc:
+        if is_template_missing_error(exc):
+            pytest.skip(
+                "mcpolis E2B templates not published on the active account — "
+                "run `cd runner/e2b-templates && make build`.",
+            )
+        raise
+    finally:
+        try:
+            await manager.disconnect_upstream(upstream.id)
+        except Exception:
+            pass
+
+
+# NOTE (review item 10): a deterministic real-E2B test of the *silent
+# dispatch stall → ping-detected heal* path is intentionally NOT here. A
+# paused E2B sandbox AUTO-RESUMES on the next dispatch (the documented
+# ``commands.connect`` auto_resume), so a single pause+call reliably
+# SUCCEEDS rather than going silent — the #1128 stall is intermittent
+# (~50%), which is why the stress test above LOOPS. The ping-detection
+# mechanism is instead pinned deterministically against the real MCP SDK by
+# ``tests/unit/test_dispatch_with_liveness.py``
+# ::test_silent_real_client_session_detected_by_ping (a real ``ClientSession``
+# over a silent peer — real send_ping/send_request/demux, exactly the stall
+# shape minus E2B's auto-resume confound). The stress test here already
+# proves real-E2B stall + heal recovery on the refresh path.

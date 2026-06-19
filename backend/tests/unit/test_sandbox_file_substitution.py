@@ -35,6 +35,15 @@ def test_system_variables_include_home() -> None:
     assert sv["HOME"] == DEFAULT_SANDBOX_HOME
 
 
+def test_system_variables_home_is_provider_overridable() -> None:
+    """``${HOME}`` resolves to the provider's home, not a hardcoded
+    constant. The manager passes the active provider's
+    ``sandbox_home`` so substitution matches the spawned process's
+    real ``$HOME`` (e.g. a local-subprocess per-session temp dir)."""
+    sv = system_variables_for_sandbox("/tmp/mcpolis-local-home-abc123")
+    assert sv["HOME"] == "/tmp/mcpolis-local-home-abc123"
+
+
 def test_system_variable_names_reserved() -> None:
     assert "HOME" in system_variable_names()
     assert is_system_variable_name("HOME")

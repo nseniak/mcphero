@@ -41,6 +41,11 @@ class MongoAuditRepository(LegacyAuditRepository, AuditRepository):
                 org_id, Event(type="audit_entry", payload=entry.model_dump()),
             )
 
+    async def delete_for_org(self, org_id: str) -> int:
+        # Org-deletion cascade. ``OrgScopedCollection`` scopes the empty
+        # filter to this org, so no other tenant's audit rows are touched.
+        return await self._coll.delete_many(org_id, {})
+
     async def search(
         self,
         org_id: str,

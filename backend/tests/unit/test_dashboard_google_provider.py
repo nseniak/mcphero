@@ -162,6 +162,75 @@ async def test_complete_login_raises_when_token_endpoint_errors(
 
 
 @pytest.mark.asyncio
+async def test_complete_login_raises_value_error_on_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BUG-8: a transport-level fault talking to Google (timeout, connect
+    refused) must surface as the clean ValueError the callback route maps
+    to a 400 — never a raw httpx exception escaping as an unhandled 500."""
+    provider = make_provider()
+
+    class FakeClient:
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def post(self, _url: str, data: dict[str, str]) -> object:
+            del data
+            raise httpx.ConnectTimeout("timed out")
+
+    monkeypatch.setattr(
+        "mcpolis.adapters.auth.google_oauth_provider.httpx.AsyncClient",
+        lambda: FakeClient(),
+    )
+
+    with pytest.raises(ValueError, match="Failed to exchange code"):
+        await provider.complete_login(
+            code="c", state="s", redirect_uri="https://example.test/cb",
+        )
+
+
+@pytest.mark.asyncio
+async def test_complete_login_raises_value_error_on_malformed_200_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BUG-8: a 200 with a non-JSON body must also map to the clean
+    ValueError, not let a raw json.JSONDecodeError ride out on the route's
+    ``except ValueError``."""
+    provider = make_provider()
+
+    class FakeResponse:
+        status_code = 200
+        text = "not json"
+
+        def json(self) -> dict[str, str]:
+            return json.loads("<not json>")  # raises JSONDecodeError
+
+    class FakeClient:
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def post(self, _url: str, data: dict[str, str]) -> FakeResponse:
+            del data
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "mcpolis.adapters.auth.google_oauth_provider.httpx.AsyncClient",
+        lambda: FakeClient(),
+    )
+
+    with pytest.raises(ValueError, match="Failed to exchange code"):
+        await provider.complete_login(
+            code="c", state="s", redirect_uri="https://example.test/cb",
+        )
+
+
+@pytest.mark.asyncio
 async def test_complete_login_raises_when_id_token_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

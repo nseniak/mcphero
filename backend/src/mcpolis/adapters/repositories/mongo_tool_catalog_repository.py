@@ -67,3 +67,8 @@ class MongoToolCatalogRepository(ToolCatalogRepository):
         await self._coll.delete_one(
             org_id, {"upstream_id": upstream_id},
         )
+
+    async def delete_all_for_org(self, org_id: str) -> None:
+        # Org-deletion cascade. ``OrgScopedCollection`` scopes the empty
+        # filter to this org, so no other tenant's snapshots are touched.
+        await self._coll.delete_many(org_id, {})

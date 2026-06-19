@@ -32,14 +32,25 @@ from __future__ import annotations
 DEFAULT_SANDBOX_HOME: str = "/home/user"
 
 
-def system_variables_for_sandbox() -> dict[str, str]:
+def system_variables_for_sandbox(
+    home: str = DEFAULT_SANDBOX_HOME,
+) -> dict[str, str]:
     """Build the system-Variable map injected at substitution time.
+
+    ``home`` is the absolute path ``${HOME}`` resolves to. It MUST equal
+    the ``$HOME`` the spawned MCP process actually gets, so a
+    ``${HOME}``-templated ``target_path`` (or env value) and the process
+    agree. Callers pass the active provider's
+    :meth:`SandboxService.sandbox_home`; the default is E2B's fixed
+    ``/home/user`` (also the right value for HTTP upstreams and the
+    display-only system-variable listing, neither of which runs in a
+    sandbox).
 
     Returns a fresh dict (callers free to mutate). v1 ships a single
     entry; future additions (`USER`, `SANDBOX_ID`, …) plug in here
     without touching the substitution layer.
     """
-    return {"HOME": DEFAULT_SANDBOX_HOME}
+    return {"HOME": home}
 
 
 def system_variable_names() -> set[str]:

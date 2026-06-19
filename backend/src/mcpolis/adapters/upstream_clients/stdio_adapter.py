@@ -199,6 +199,7 @@ class SandboxConnectionTask(ConnectionTaskBase):
         sandbox_persistence: "SandboxPersistenceRepository | None" = None,
         mcpolis_instance: str | None = None,
         materialize_files: "list[MaterializeFile] | None" = None,
+        session_id: str | None = None,
     ) -> None:
         super().__init__(
             upstream,
@@ -207,6 +208,7 @@ class SandboxConnectionTask(ConnectionTaskBase):
             on_tool_list_changed=on_tool_list_changed,
             on_resource_list_changed=on_resource_list_changed,
             on_prompt_list_changed=on_prompt_list_changed,
+            session_id=session_id,
         )
         # sandbox-only state.
         self._service = service
@@ -376,6 +378,19 @@ class SandboxConnectionTask(ConnectionTaskBase):
                 # manager can reconnect a dead shared session instead
                 # of reusing the zombie (see ``is_transport_alive``).
                 self._transport_failed = sandbox_session.transport_failed
+                # NOTE (R5): deliberately NO ``read_timeout_seconds`` here.
+                # The dispatch stall-recovery path (ToolRouter) bounds slow
+                # / silently-stalled requests with ``asyncio.wait_for`` +
+                # a ping liveness probe, whose timeout raises
+                # ``asyncio.TimeoutError`` — which ``is_transport_stall``
+                # classifies as a stall, so the gateway heals + retries.
+                # Setting ``read_timeout_seconds`` on the ClientSession
+                # instead would raise ``McpError(408 REQUEST_TIMEOUT)``,
+                # which ``is_transport_stall`` does NOT classify (only
+                # negative/positive 32600 "Session terminated" and
+                # CONNECTION_CLOSED) — silently defeating recovery. Pick
+                # one path; this is the wait_for path. See
+                # tool_registry.is_transport_stall and tool_router.
                 session = ClientSession(
                     sandbox_session.read_stream,
                     sandbox_session.write_stream,

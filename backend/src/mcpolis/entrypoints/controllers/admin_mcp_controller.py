@@ -53,7 +53,11 @@ from mcpolis.domain.services.sandbox_service import (
 )
 from mcpolis.domain.services.settings_resolver import resolve_settings
 from mcpolis.domain.services.upstream_connection_service import (
+    SessionUnavailable,
+    acquire_and_refresh_with_recovery,
     initiate_oauth_connection,
+    recovery_effective_user,
+    refresh_all_with_recovery,
 )
 from mcpolis.domain.services.url_safety import (
     UnsafeUpstreamUrl,
@@ -600,17 +604,50 @@ def create_admin_mcp_server(
         org_id = current_org_id.get()
         runtime = await runtime_manager.get(org_id)
         if mcp_id:
+            upstream = await runtime.config_service.get_upstream(org_id, mcp_id)
+            if upstream is None:
+                return f"Upstream MCP '{mcp_id}' not found."
+            # Establish an OAuth session under the caller (no-op for
+            # service_account or when one already exists), then refresh
+            # WITH transport-stall recovery so an E2B post-reattach stall
+            # heals + retries instead of persisting a partial catalogue
+            # (R6). This BLOCKS the admin's MCP client (worst case
+            # ~2×(establish+timeout)); unlike the dashboard's non-blocking
+            # refresh (c54c0b3) that is intended — this tool's contract is
+            # to return the discovered tool COUNT synchronously, which a
+            # backgrounded refresh can't do.
             await _ensure_oauth_session(mcp_id)
             try:
-                tools = await runtime.tool_registry.refresh_upstream(mcp_id)
+                tools = await acquire_and_refresh_with_recovery(
+                    org_id=org_id,
+                    upstream=upstream,
+                    effective_user=recovery_effective_user(
+                        runtime.client_manager, upstream,
+                    ),
+                    connection_store=connection_store,
+                    client_manager=runtime.client_manager,
+                    tool_registry=runtime.tool_registry,
+                    server_url=server_url,
+                )
                 return (
                     f"Refreshed {len(tools)} tools "
                     f"from upstream MCP '{mcp_id}'."
                 )
+            except SessionUnavailable as e:
+                return (
+                    f"Error refreshing '{mcp_id}': could not reattach "
+                    f"session ({e.reason})."
+                )
             except Exception as e:
                 return f"Error refreshing '{mcp_id}': {e}"
         else:
-            await runtime.tool_registry.refresh_all()
+            await refresh_all_with_recovery(
+                org_id=org_id,
+                connection_store=connection_store,
+                client_manager=runtime.client_manager,
+                tool_registry=runtime.tool_registry,
+                server_url=server_url,
+            )
             total = len(runtime.tool_registry.get_all_tools())
             return (
                 f"Refreshed all upstream MCPs. Total: {total} tools."

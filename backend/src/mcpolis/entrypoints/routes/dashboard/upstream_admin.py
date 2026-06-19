@@ -45,10 +45,9 @@ from mcpolis.domain.services.plan_gates import (
 )
 from mcpolis.domain.services.upstream_connection_service import (
     OAuthFailureReason,
-    SessionUnavailable,
-    acquire_and_refresh_with_recovery,
     connect_and_refresh_tools,
     reconnect_all_oauth_upstreams,
+    refresh_tools_in_background,
 )
 from mcpolis.domain.services.url_safety import (
     UnsafeUpstreamUrl,
@@ -466,30 +465,26 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
             org_id=org_id,
         )
 
-        try:
-            # Reattach the live session exactly as a tool call does —
-            # shared helper, so refresh and dispatch never drift. For
-            # OAuth the slot owner (the admin holding the token) is the
-            # effective user; service_account ignores it. Never prompts
-            # a browser flow; raises SessionUnavailable if it can't.
-            # ``_with_recovery`` retries on a transport stall (E2B's
-            # post-reattach stdout stall) by reconnecting on a fresh
-            # session, so a flaky reattach yields a complete catalogue
-            # instead of a partial one or a 30s hang.
-            await acquire_and_refresh_with_recovery(
-                org_id=org_id,
-                upstream=upstream,
-                effective_user=slot_owner or admin_email,
-                connection_store=deps.connection_store,
-                client_manager=runtime.client_manager,
-                tool_registry=runtime.tool_registry,
-                server_url=deps.server_url,
+        async def _on_success() -> None:
+            if deps.connection_store is not None:
+                await deps.connection_store.clear_connection_error(
+                    org_id, upstream_id,
+                )
+            notify_policy_change(deps)
+            await log_admin_action(
+                deps,
+                action="refresh_tools",
+                upstream_id=upstream_id,
+                admin_email=admin_email,
+                outcome="success",
             )
-        except Exception as e:
-            if isinstance(e, SessionUnavailable):
-                error_msg = f"could not reattach session: {e.reason}"
-            else:
-                error_msg = str(e) or e.__class__.__name__
+            logger.info(
+                "dashboard.api.admin.upstream.refresh_tools.success",
+                upstream_id=upstream_id,
+                org_id=org_id,
+            )
+
+        async def _on_error(error_msg: str) -> None:
             # Record + broadcast so the dashboard shows the failure
             # (error banner + popup). Non-destructive on purpose.
             if deps.connection_store is not None:
@@ -511,24 +506,28 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
                 org_id=org_id,
                 error=error_msg,
             )
-            return ConnectResponse(connected=False, error=error_msg)
 
-        if deps.connection_store is not None:
-            await deps.connection_store.clear_connection_error(
-                org_id, upstream_id,
-            )
-        notify_policy_change(deps)
-        await log_admin_action(
-            deps,
-            action="refresh_tools",
-            upstream_id=upstream_id,
-            admin_email=admin_email,
-            outcome="success",
-        )
-        logger.info(
-            "dashboard.api.admin.upstream.refresh_tools.success",
-            upstream_id=upstream_id,
+        # Non-blocking: the acquire+refresh (which can stall ~15s and
+        # reconnect on a fresh session after an E2B auto-pause) runs in a
+        # background task so the request returns immediately. The
+        # dashboard shows the "Fetching info" pill (mark_refreshing flips
+        # synchronously) and learns the outcome via tools/list_changed +
+        # the per-upstream connection-error state. This is the fix for the
+        # 2026-06-18 prod incident, where the SYNCHRONOUS refresh surfaced
+        # a TimeoutError for a refresh that actually succeeded in the
+        # background. Reattach uses the slot owner for OAuth (the admin
+        # holding the token); service_account ignores it. Never prompts a
+        # browser flow.
+        refresh_tools_in_background(
             org_id=org_id,
+            upstream=upstream,
+            effective_user=slot_owner or admin_email,
+            connection_store=deps.connection_store,
+            client_manager=runtime.client_manager,
+            tool_registry=runtime.tool_registry,
+            server_url=deps.server_url,
+            on_success=_on_success,
+            on_error=_on_error,
         )
         return ConnectResponse(connected=True, upstream_id=upstream_id)
 

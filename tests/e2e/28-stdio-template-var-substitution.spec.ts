@@ -55,7 +55,7 @@ const INLINE_MCP_SCRIPT =
   + "    return os.environ.get(name, '')\n"
   + "@s.tool()\n"
   + "def read_file(path: str) -> str:\n"
-  + "    return open(path).read()\n"
+  + "    return open(os.path.expanduser(path)).read()\n"
   + "s.run(transport='stdio')\n";
 
 // Cold-pull of the python E2B template + ``uvx install mcp`` runs
@@ -154,19 +154,18 @@ test.describe("Stdio template-var substitution + Sandbox files — runtime", () 
     const api = await adminApi(request);
     const upstreamId = uniqueId("subst-file");
     const expected = `e2e-file-body-${Date.now().toString(36)}`;
-    // Host-portable target path, writable under BOTH the E2B sandbox
-    // (Linux) and the local-subprocess backend (the test host). We
-    // deliberately avoid ``${HOME}`` here: it resolves to the E2B
-    // template's ``/home/user``, which the local-subprocess host cannot
-    // create (macOS ``/home`` is autofs-managed → ENOTSUP), so the file
-    // would never materialize off-E2B and this test would only pass when
-    // a stray E2B key routed it to a real sandbox. ``${HOME}`` resolution
-    // is covered by the display specs (20a / 22a); this test's job is the
-    // materialize → MCP-read round-trip, which a literal absolute path
-    // (accepted by the target_path validator) exercises on any backend.
-    // Per-test-unique so parallel shards sharing the host don't collide.
-    const targetPath = `/tmp/mcpolis-e2e-sbx/${upstreamId}/e2e-cred.txt`;
-    const expectedResolvedPath = targetPath;
+    // Exercise ``${HOME}`` end-to-end on whatever backend runs. The
+    // file's target_path templates ``${HOME}``; the MCP reads it back
+    // via its OWN ``$HOME`` (``read_file`` expands ``~``). The test
+    // passes only if the materialize home (``${HOME}`` substitution) and
+    // the spawned process's ``$HOME`` agree — exactly the provider-aware
+    // resolution this proves. On E2B that home is ``/home/user``; on the
+    // local-subprocess backend it's a per-session temp dir (isolated, so
+    // no per-shard path collision). The MCP read path is ``~``-relative,
+    // not the literal resolved path, since the per-session home is
+    // unknowable to the test.
+    const targetPath = "${HOME}/.config/e2e-cred.txt";
+    const readPath = "~/.config/e2e-cred.txt";
 
     const createUpstream = await api.post(
       `${BACKEND_URL}/api/admin/upstreams`,
@@ -206,7 +205,7 @@ test.describe("Stdio template-var substitution + Sandbox files — runtime", () 
       client = await makeMcpClient(token, ORG, "mcp");
       const resp = await client.callTool({
         name: `${ORG}__${upstreamId}__read_file`,
-        arguments: { path: expectedResolvedPath },
+        arguments: { path: readPath },
       });
       const text = JSON.stringify(resp.content);
       expect(text).toContain(expected);

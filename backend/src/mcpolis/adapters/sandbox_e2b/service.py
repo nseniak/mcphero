@@ -40,6 +40,9 @@ from mcpolis.adapters.sandbox_e2b.template_grid import (
 from datetime import datetime, timezone
 
 from mcpolis.domain.services.exit_reason import ExitReason
+from mcpolis.domain.services.sandbox_path import confine_to_sandbox_home
+from mcpolis.domain.services.stdout_framing import BoundedLineBuffer
+from mcpolis.domain.services.system_variables import DEFAULT_SANDBOX_HOME
 from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.domain.ports.sandbox_persistence_repository import (
     SandboxPersistedRef,
@@ -268,6 +271,14 @@ class E2BSandboxService:
                 "disk_gb", resources.disk_gb, allowed=(0,),
             )
 
+    def sandbox_home(self, *, session_id: str) -> str:
+        # Every published mcpolis template inherits the stock E2B SDK
+        # user (``user`` with ``HOME=/home/user``); the container home
+        # is fixed regardless of session, so ``session_id`` is ignored.
+        # Guarded by ``test_e2b_template_home_consistency.py``.
+        _ = session_id
+        return DEFAULT_SANDBOX_HOME
+
     # ---------- session ----------
 
     def session(
@@ -361,16 +372,14 @@ class E2BSandboxService:
                 pass
 
         # Stdout demux: re-assemble newline-framed JSON-RPC into
-        # SessionMessages. Same shape as the own-runner's
-        # remote_stdio_client uses.
-        stdout_buffer: list[str] = [""]
+        # SessionMessages. The bounded buffer caps the in-progress
+        # leftover so a newline-free stream can't grow per-session memory
+        # without bound (SBX-7 / BUG-6).
+        stdout_lines = BoundedLineBuffer()
 
         async def on_stdout(chunk: bytes) -> None:
             text = chunk.decode("utf-8", errors="replace")
-            combined = stdout_buffer[0] + text
-            *complete_lines, leftover = combined.split("\n")
-            stdout_buffer[0] = leftover
-            for line in complete_lines:
+            for line in stdout_lines.feed(text):
                 if not line:
                     continue
                 try:
@@ -855,27 +864,53 @@ class E2BSandboxService:
                 return reconnect[0], reconnect[1], True
 
         # Path 3: fresh create. The default flow.
-        sandbox = await self._open_sandbox(
-            org_id=org_id, upstream=upstream, resources=resources,
-            resume_from=None,
+        #
+        # Persist a "creating" marker BEFORE create_sandbox makes the
+        # sandbox provider-visible, so a reconcile racing into the
+        # create/persist window recognizes the sandbox as actively-managed
+        # and leaves it alone (SBX-CONC-4). The marker only matters when
+        # persistence + reuse is wired (the reconciler runs only then);
+        # ``session()`` overwrites it with the real ref via
+        # ``_persist_live_ref`` once create succeeds. On any failure here
+        # we restore the prior ref / drop the marker so a later reconcile
+        # can reap the leaked sandbox.
+        write_marker = (
+            self._reuse_sandboxes_on_restart and self._persistence is not None
         )
-        await self._materialize_files(
-            sandbox=sandbox,
-            upstream_id=upstream.id,
-            materialize_files=materialize_files,
-        )
-        # docker-language sandboxes have the Docker engine installed but
-        # no running daemon — start it now before the MCP command runs.
-        # Resume (path 1) and reconnect (path 2) skip this: resume
-        # restores the frozen microVM state (dockerd survives the
-        # snapshot), and reconnect reattaches to an already-live sandbox.
-        cfg = upstream.stdio
-        if cfg is not None and language_for_command(cfg.command) == "docker":
-            await self._start_docker_daemon(sandbox)
-        process = await sandbox.run_command(
-            argv, env=merged_env,
-            on_stdout=on_stdout, on_stderr=on_stderr,
-        )
+        prior_ref: SandboxPersistedRef | None = None
+        if write_marker:
+            prior_ref = await self._persist_creating_marker(
+                org_id=org_id, upstream=upstream,
+            )
+        try:
+            sandbox = await self._open_sandbox(
+                org_id=org_id, upstream=upstream, resources=resources,
+                resume_from=None,
+            )
+            await self._materialize_files(
+                sandbox=sandbox,
+                upstream_id=upstream.id,
+                materialize_files=materialize_files,
+            )
+            # docker-language sandboxes have the Docker engine installed
+            # but no running daemon — start it now before the MCP command
+            # runs. Resume (path 1) and reconnect (path 2) skip this:
+            # resume restores the frozen microVM state (dockerd survives
+            # the snapshot), and reconnect reattaches to an already-live
+            # sandbox.
+            cfg = upstream.stdio
+            if cfg is not None and language_for_command(cfg.command) == "docker":
+                await self._start_docker_daemon(sandbox)
+            process = await sandbox.run_command(
+                argv, env=merged_env,
+                on_stdout=on_stdout, on_stderr=on_stderr,
+            )
+        except BaseException:
+            if write_marker:
+                await self._restore_or_clear_creating_marker(
+                    org_id=org_id, upstream=upstream, prior=prior_ref,
+                )
+            raise
         return sandbox, process, False
 
     async def _try_reconnect(
@@ -1061,6 +1096,78 @@ class E2BSandboxService:
             last_updated=datetime.now(tz=timezone.utc),
         )
         await self._persistence.upsert(ref)
+
+    async def _persist_creating_marker(
+        self, *, org_id: str, upstream: UpstreamDefinition,
+    ) -> SandboxPersistedRef | None:
+        """Write a "creating" marker for ``(org, upstream)`` BEFORE a
+        fresh ``create_sandbox`` makes the sandbox provider-visible.
+
+        The marker is a ref with BOTH ``sandbox_id`` and
+        ``paused_snapshot_id`` ``None`` — a state the normal lifecycle
+        never produces (a ref always carries one or the other), so the
+        reconciler can recognize it unambiguously. A boot/periodic
+        reconcile that races into the create/persist window then sees an
+        actively-managed ``(org, upstream)`` and skips the running
+        sandbox (matched by its ``mcpolis_org`` / ``mcpolis_upstream``
+        metadata) instead of killing it as an orphan.
+
+        Returns the PRIOR ref (if any) so the caller can restore it if
+        the create then fails — the marker upsert clobbers a prior
+        paused-snapshot ref, and a failed create must not lose it. On a
+        successful session ``_persist_live_ref`` overwrites the marker
+        with the real live identity tuple.
+        """
+        assert self._persistence is not None
+        existing = await self._persistence.get(
+            org_id=org_id, upstream_id=upstream.id,
+        )
+        marker = SandboxPersistedRef(
+            provider="e2b",
+            org_id=org_id,
+            upstream_id=upstream.id,
+            mcpolis_instance=self._mcpolis_instance,
+            sandbox_id=None,
+            paused_snapshot_id=None,
+            pid=None,
+            metadata=dict(existing.metadata) if existing is not None else {},
+            cached_server_info=(
+                existing.cached_server_info if existing is not None else None
+            ),
+            cached_self_description=(
+                existing.cached_self_description
+                if existing is not None else None
+            ),
+            last_updated=datetime.now(tz=timezone.utc),
+        )
+        await self._persistence.upsert(marker)
+        return existing
+
+    async def _restore_or_clear_creating_marker(
+        self,
+        *,
+        org_id: str,
+        upstream: UpstreamDefinition,
+        prior: SandboxPersistedRef | None,
+    ) -> None:
+        """Undo a creating marker after a failed fresh create: restore
+        the prior ref if there was one (so a clobbered paused-snapshot
+        ref survives), else delete the marker so a later reconcile can
+        reap the leaked sandbox."""
+        if self._persistence is None:
+            return
+        try:
+            if prior is not None:
+                await self._persistence.upsert(prior)
+            else:
+                await self._persistence.delete(
+                    org_id=org_id, upstream_id=upstream.id,
+                )
+        except Exception:
+            logger.warning(
+                "sandbox.e2b.creating_marker.cleanup_failed",
+                org_id=org_id, upstream_id=upstream.id, exc_info=True,
+            )
 
     async def _start_docker_daemon(self, sandbox: E2BSandboxHandle) -> None:
         """Ensure a usable dockerd inside a docker-language sandbox.
@@ -1346,18 +1453,25 @@ class E2BSandboxService:
         """
         if not materialize_files:
             return
+        # ``session_id`` is ignored by ``sandbox_home`` on E2B (the
+        # container home is fixed at ``/home/user``).
+        home = self.sandbox_home(session_id="")
         for entry in materialize_files:
+            # Confine the operator-controlled target_path to the sandbox
+            # home before writing — a ``..`` traversal or an absolute
+            # system path that escapes ``${HOME}`` is rejected (SBX-11).
+            confined_path = confine_to_sandbox_home(entry.target_path, home)
             size = len(entry.contents.encode("utf-8"))
             logger.info(
                 "sandbox.e2b.materialize_file",
                 upstream_id=upstream_id,
                 name=entry.name,
-                target_path=entry.target_path,
+                target_path=confined_path,
                 size_bytes=size,
             )
             try:
                 await sandbox.write_file(
-                    path=entry.target_path,
+                    path=confined_path,
                     contents=entry.contents,
                     mode=0o600,
                 )

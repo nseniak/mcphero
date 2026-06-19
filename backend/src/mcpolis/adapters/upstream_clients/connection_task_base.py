@@ -66,10 +66,15 @@ class ConnectionTaskBase(ABC):
         on_tool_list_changed: OnToolListChanged | None = None,
         on_resource_list_changed: OnResourceListChanged | None = None,
         on_prompt_list_changed: OnPromptListChanged | None = None,
+        session_id: str | None = None,
     ) -> None:
         self._upstream = upstream
         self._user_id = user_id
-        self._session_id = uuid.uuid4().hex
+        # Caller may pre-mint the session id (the sandbox manager does,
+        # so the home it substitutes ``${HOME}`` with matches the one
+        # ``service.session`` derives from this id). Default to a fresh
+        # one for HTTP / tests that don't care.
+        self._session_id = session_id or uuid.uuid4().hex
         self._bearer_token = bearer_token
         self._on_tool_list_changed = on_tool_list_changed
         self._on_resource_list_changed = on_resource_list_changed

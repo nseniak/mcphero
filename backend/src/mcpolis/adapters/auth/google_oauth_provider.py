@@ -74,25 +74,48 @@ class DashboardGoogleProvider:
         redirect_uri: str,
     ) -> CompletedLogin:
         del state  # state validation is the route's job
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                GOOGLE_TOKEN_URL,
-                data={
-                    "code": code,
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                    "redirect_uri": redirect_uri,
-                    "grant_type": "authorization_code",
-                },
-            )
-            if resp.status_code != 200:
-                logger.warning(
-                    "dashboard.auth.google_token_exchange.failed",
-                    status_code=resp.status_code,
-                    response_text=resp.text,
+        # A transport-level fault talking to Google (timeout, connection
+        # refused) is a third-party failure the callback route maps to a
+        # clean 400 via the ValueError family — never let a raw httpx
+        # exception escape as an unhandled 500 (same class as the gateway
+        # provider's handle_google_callback).
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    GOOGLE_TOKEN_URL,
+                    data={
+                        "code": code,
+                        "client_id": self._client_id,
+                        "client_secret": self._client_secret,
+                        "redirect_uri": redirect_uri,
+                        "grant_type": "authorization_code",
+                    },
                 )
-                raise ValueError("Failed to exchange code with Google")
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "dashboard.auth.google_token_exchange.failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            raise ValueError("Failed to exchange code with Google") from exc
+        if resp.status_code != 200:
+            logger.warning(
+                "dashboard.auth.google_token_exchange.failed",
+                status_code=resp.status_code,
+                response_text=resp.text,
+            )
+            raise ValueError("Failed to exchange code with Google")
+        try:
             token_data = resp.json()
+        except json.JSONDecodeError as exc:
+            # A 200 with a malformed body — map to the ValueError family the
+            # callback route maps to a clean 400, rather than letting a raw
+            # JSONDecodeError ride out on the route's ``except ValueError``.
+            logger.warning(
+                "dashboard.auth.google_token_exchange.failed",
+                error=str(exc),
+            )
+            raise ValueError("Failed to exchange code with Google") from exc
 
         id_token = token_data.get("id_token")
         if not id_token:

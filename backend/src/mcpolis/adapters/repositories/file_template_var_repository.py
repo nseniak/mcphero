@@ -194,3 +194,15 @@ class FileTemplateVarRepository(TemplateVarRepository):
             if not org_block:
                 data.pop(org_id, None)
             self._write(data)
+
+    async def delete_all_for_org(self, org_id: str) -> int:
+        # Org-deletion cascade. Top-level keyed by org_id, so pop the
+        # whole block; count the leaf (upstream, name) rows removed.
+        async with self._lock:
+            data = self._read()
+            org_block = data.pop(org_id, None)
+            if org_block is None:
+                return 0
+            removed = sum(len(names) for names in org_block.values())
+            self._write(data)
+            return removed

@@ -65,6 +65,32 @@ class FileAuditRepository(AuditRepository):
                 payload=data,
             ))
 
+    async def delete_for_org(self, org_id: str) -> int:
+        """Drop every audit line belonging to ``org_id`` (org-deletion
+        cascade). Rewrites each JSONL file keeping only other orgs' rows,
+        so a multi-org file (unusual in standalone, but possible in tests)
+        stays intact for the survivors. Returns the count removed."""
+        removed = 0
+        async with self._lock:
+            for log_file in self._all_log_files():
+                lines = log_file.read_text().splitlines()
+                kept: list[str] = []
+                for line in lines:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        kept.append(line)
+                        continue
+                    if entry.get("org_id") == org_id:
+                        removed += 1
+                    else:
+                        kept.append(line)
+                if len(kept) != len(lines):
+                    log_file.write_text(
+                        "\n".join(kept) + ("\n" if kept else "")
+                    )
+        return removed
+
     def _all_log_files(self) -> list[Path]:
         """Return all audit log files (current + rotated), newest first."""
         base = str(self._log_path)

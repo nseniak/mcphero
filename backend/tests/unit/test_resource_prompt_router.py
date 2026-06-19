@@ -7,9 +7,11 @@ audit + error-shape contract. ``_resolve_session`` is shared with
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import mcp.types as mcp_types
 import pytest
@@ -28,11 +30,45 @@ from mcpolis.domain.model.settings import SettingsConfig
 from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
-from mcpolis.domain.services.tool_router import (
+from mcpolis.domain.services.tool_router import (  # pyright: ignore[reportPrivateUsage]
     ToolRouter,
     UpstreamRouterError,
+    _session_error_text,
+    _SessionResult,
 )
 from tests.unit.factories import make_upstream_definition
+
+
+# --- _session_error_text (shared by read_resource / get_prompt / the
+#     session-error surface): a non-text/empty first block must degrade to
+#     a generic message, never crash (ROUTE-1 / BUG-3). ----------------
+
+
+def test_session_error_text_returns_text_first_block() -> None:
+    err = mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text="please re-auth")],
+        isError=True,
+    )
+    assert _session_error_text(err) == "please re-auth"
+
+
+def test_session_error_text_non_text_block_degrades_to_generic() -> None:
+    err = mcp_types.CallToolResult(
+        content=[
+            mcp_types.ImageContent(
+                type="image", data="aGVsbG8=", mimeType="image/png",
+            ),
+        ],
+        isError=True,
+    )
+    out = _session_error_text(err)
+    assert isinstance(out, str) and out  # a clean string, not a crash
+    assert "not currently available" in out
+
+
+def test_session_error_text_empty_content_degrades_to_generic() -> None:
+    err = mcp_types.CallToolResult(content=[], isError=True)
+    assert "not currently available" in _session_error_text(err)
 
 
 async def make_router(
@@ -289,6 +325,51 @@ async def test_read_resource_upstream_error_returns_opaque_message(
     assert "Reference:" in exc_info.value.message
 
 
+@pytest.mark.asyncio
+async def test_read_resource_session_error_non_text_block_surfaces_clean(
+    tmp_path: Path,
+) -> None:
+    """ROUTE-1 [BUG?]: ``read_resource``'s ``_on_session_error`` does
+    ``assert isinstance(err.content[0], TextContent)``. If
+    ``_resolve_session`` ever returns a session-unavailable
+    ``CallToolResult`` whose first content block is NOT text (e.g.
+    ``ImageContent``), that assertion crashes the request with an
+    ``AssertionError`` (an internal invariant leak) instead of surfacing a
+    clean, user-facing ``UpstreamRouterError``.
+
+    INTENDED: a non-text session-error block degrades to an
+    ``UpstreamRouterError`` the gateway can render as a clean
+    ``ReadResourceResult`` — never an ``AssertionError``."""
+    router, _, _, _ = await make_router(
+        tmp_path, auth_mode=AuthMode.service_account,
+    )
+
+    image_error = mcp_types.CallToolResult(
+        content=[
+            mcp_types.ImageContent(
+                type="image", data="aGVsbG8=", mimeType="image/png",
+            ),
+        ],
+        isError=True,
+    )
+
+    async def _resolve_with_image_error(
+        org_id: str, upstream: Any, user_id: str,
+    ) -> _SessionResult:
+        return _SessionResult(error=image_error)
+
+    # The only seam to inject a non-text session-error result: there's no
+    # production path that builds one today, so replace the resolver to
+    # exercise the defensive surface ``_on_session_error`` should have.
+    router._resolve_session = _resolve_with_image_error  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(UpstreamRouterError):
+        await router.read_resource(
+            org_id=DEFAULT_ORG_ID, upstream_id="notion",
+            original_uri="test://hello", user_id="alice", session_id=None,
+        )
+
+
 # --- get_prompt ---------------------------------------------------------------
 
 
@@ -374,3 +455,178 @@ async def test_get_prompt_unknown_upstream_raises(tmp_path: Path) -> None:
             user_id="alice",
             session_id=None,
         )
+
+
+# --- shared stall recovery + observability (R3 / R4) --------------------------
+#
+# The hoist into ``_dispatch_with_recovery`` closes the "forgot to heal"
+# gap: resources/read and prompts/get now inherit the SAME ping-gated
+# stall recovery the tool path has — but tool-only observability stays
+# tool-only (R3), the per-verb actionable/opaque error shapes are
+# preserved (R4), and a session-unavailable first attempt still emits no
+# audit row (R4 no-audit gate).
+
+
+class _FakeStallManager:
+    """service_account manager slice the router touches for a stall:
+    ``ensure_shared_connected`` / ``get_session`` / ``reconnect_shared_fresh``.
+    ``reconnect_shared_fresh`` is the service_account heal."""
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self.fresh_calls = 0
+
+    async def ensure_shared_connected(self, upstream: Any) -> None:
+        pass
+
+    def get_session(self, upstream_id: str, user_id: str | None = None) -> Any:
+        return self._session
+
+    async def reconnect_shared_fresh(self, upstream: Any) -> None:
+        self.fresh_calls += 1
+
+
+def make_stall_router(
+    tmp_path: Path, *, upstream_id: str = "notion",
+) -> tuple[ToolRouter, MagicMock, _FakeStallManager, FileAuditRepository]:
+    upstream = make_upstream_definition(id=upstream_id)  # service_account
+    session = MagicMock()
+    client_manager = _FakeStallManager(session)
+    registry = ToolRegistry([upstream], cast(Any, client_manager))
+    audit = FileAuditRepository(tmp_path / "audit.jsonl")
+    router = ToolRouter(
+        registry, cast(Any, client_manager), audit, [upstream],
+        policy_engine=PolicyEngine(SettingsConfig()),
+    )
+    return router, session, client_manager, audit
+
+
+@pytest.mark.asyncio
+async def test_read_resource_heals_and_retries_on_transport_stall(
+    tmp_path: Path,
+) -> None:
+    """R3 gap closed: a stalled resources/read heals the shared session
+    (fresh reconnect) and retries on a clean transport — the recovery the
+    tool path had but read_resource lacked. ``retry_safe=True`` for
+    resources (risk-b: no readOnlyHint exists for them)."""
+    router, session, cm, _ = make_stall_router(tmp_path)
+    ok = mcp_types.ReadResourceResult(
+        contents=[
+            mcp_types.TextResourceContents(
+                uri=AnyUrl("test://hello"), mimeType="text/plain", text="hi",
+            ),
+        ],
+    )
+    session.read_resource = AsyncMock(side_effect=[asyncio.TimeoutError(), ok])
+
+    result = await router.read_resource(
+        org_id=DEFAULT_ORG_ID, upstream_id="notion",
+        original_uri="test://hello", user_id="alice", session_id=None,
+    )
+
+    assert isinstance(result, mcp_types.ReadResourceResult)
+    assert cm.fresh_calls == 1, "the stall must heal the shared session"
+    assert session.read_resource.await_count == 2, "read must be retried"
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_heals_and_retries_on_transport_stall(
+    tmp_path: Path,
+) -> None:
+    """Counterpart for prompts/get."""
+    router, session, cm, _ = make_stall_router(tmp_path)
+    ok = mcp_types.GetPromptResult(
+        description="x",
+        messages=[
+            mcp_types.PromptMessage(
+                role="user",
+                content=mcp_types.TextContent(type="text", text="hi"),
+            ),
+        ],
+    )
+    session.get_prompt = AsyncMock(side_effect=[asyncio.TimeoutError(), ok])
+
+    result = await router.get_prompt(
+        org_id=DEFAULT_ORG_ID, upstream_id="notion",
+        original_name="greet", arguments=None, user_id="alice", session_id=None,
+    )
+
+    assert isinstance(result, mcp_types.GetPromptResult)
+    assert cm.fresh_calls == 1, "the stall must heal the shared session"
+    assert session.get_prompt.await_count == 2, "prompt must be retried"
+
+
+@pytest.mark.asyncio
+async def test_read_resource_does_not_emit_tool_analytics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3: resources/read must stay OUT of tool analytics + slow-tool
+    dashboards — no ``tool_called`` event."""
+    from mcpolis.domain.services import tool_router as tr_module
+
+    tracked: list[tuple[Any, ...]] = []
+
+    class _Stub:
+        def track_async(self, *a: Any, **k: Any) -> None:
+            tracked.append((a, k))
+
+    monkeypatch.setattr(tr_module, "get_analytics", lambda: _Stub())
+    router, _, _, _ = await make_router(tmp_path)
+    await router.read_resource(
+        org_id=DEFAULT_ORG_ID, upstream_id="notion",
+        original_uri="test://hello", user_id="alice", session_id="s1",
+    )
+    assert tracked == [], "resources/read must not emit tool_called analytics"
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_does_not_emit_tool_analytics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3: prompts/get must likewise stay out of tool analytics."""
+    from mcpolis.domain.services import tool_router as tr_module
+
+    tracked: list[tuple[Any, ...]] = []
+
+    class _Stub:
+        def track_async(self, *a: Any, **k: Any) -> None:
+            tracked.append((a, k))
+
+    monkeypatch.setattr(tr_module, "get_analytics", lambda: _Stub())
+    router, _, _, _ = await make_router(tmp_path)
+    await router.get_prompt(
+        org_id=DEFAULT_ORG_ID, upstream_id="notion",
+        original_name="greet", arguments={"who": "world"},
+        user_id="alice", session_id="s1",
+    )
+    assert tracked == [], "prompts/get must not emit tool_called analytics"
+
+
+@pytest.mark.asyncio
+async def test_read_resource_session_unavailable_writes_no_audit(
+    tmp_path: Path,
+) -> None:
+    """R4 no-audit gate: a session-unavailable read raises the actionable
+    message on the FIRST attempt and emits NO audit row (it raises before
+    any call ran), mirroring route_call's ``did_call`` gate."""
+    upstream = make_upstream_definition(
+        id="notion",
+        auth=UpstreamAuthConfig(mode=AuthMode.per_user_oauth),
+    )
+    cm = UpstreamClientManager([upstream])
+    audit = FileAuditRepository(tmp_path / "audit.jsonl")
+    registry = ToolRegistry([upstream], cm)
+    router = ToolRouter(
+        registry, cm, audit, [upstream],
+        policy_engine=PolicyEngine(SettingsConfig()),
+        connection_store=None,
+    )
+    with pytest.raises(UpstreamRouterError):
+        await router.read_resource(
+            org_id=DEFAULT_ORG_ID, upstream_id="notion",
+            original_uri="test://x", user_id="alice", session_id=None,
+        )
+    log_path = audit._log_path  # pyright: ignore[reportPrivateUsage]
+    assert not log_path.exists() or log_path.read_text().strip() == "", (
+        "session-unavailable on the first attempt must not write an audit row"
+    )

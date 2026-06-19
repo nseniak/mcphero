@@ -1015,10 +1015,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # memberships when serving the multi-org cloud /mcp URL. The
     # second wiring step further down (set_org_service on the OAuth
     # provider) reuses the same instance.
+    # Wire EVERY org-scoped repo so ``delete_organization`` can purge
+    # the whole tenant. The set mirrors the org-scoped fields on
+    # ``StorageBundle`` (storage_factory.py) — keep it complete: an
+    # omitted repo silently leaks that collection on org deletion. The
+    # runtime-teardown hook is registered further down, once the slug
+    # cache exists. (``oauth_state`` is global, not org-scoped; ``locks``
+    # is ephemeral — both deliberately excluded.)
     org_service = OrgServiceCls(
         org_repo=storage.organization_repo,
         config_repo=storage.config_repo,
         service_token_repo=storage.service_token_repo,
+        connection_repo=storage.connection_repo,
+        upstream_config_repo=storage.upstream_config_repo,
+        tool_catalog_repo=storage.tool_catalog_repo,
+        sandbox_persistence_repo=storage.sandbox_persistence_repo,
+        template_var_repo=storage.template_var_repo,
+        sandbox_file_repo=storage.sandbox_file_repo,
+        audit_repo=storage.audit_repo,
     )
 
     # Create low-level MCP server (gateway)
@@ -1898,6 +1912,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         runtime_manager.register_display_name(new_org.id, new_org.display_name)
         runtime_manager.register_slug(new_org.id, new_org.slug)
 
+    async def _teardown_org_runtime(org_id: str) -> None:
+        # Run by ``OrgService.delete_organization`` before the persistence
+        # purge: stop the org's live upstream clients, then invalidate the
+        # shared slug cache so the deleted slug stops resolving. Wired here
+        # (not at OrgService construction) because the slug cache only
+        # exists at this point in composition.
+        await runtime_manager.teardown(org_id)
+        slug_cache.invalidate()
+
+    org_service.set_runtime_teardown(_teardown_org_runtime)
+
     app.include_router(
         create_org_router(
             settings,
@@ -2054,6 +2079,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             superadmin_mcp = create_superadmin_mcp_server(
                 org_repo=storage.organization_repo,
                 runtime_manager=runtime_manager,
+                org_service=org_service,
             )
             superadmin_starlette = superadmin_mcp.streamable_http_app()
 

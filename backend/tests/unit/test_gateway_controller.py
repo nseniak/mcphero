@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -8,6 +9,12 @@ import mcp.types as mcp_types
 import pytest
 
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
+from mcpolis.domain.model.service_token import (
+    SCOPE_ORG_PREFIX,
+    SCOPE_ROLE_PREFIX,
+    SCOPE_SVC,
+    service_identity,
+)
 from mcpolis.domain.model.settings import (
     ArgumentConstraint,
     McpAccessConfig,
@@ -283,3 +290,193 @@ async def test_allowed_call_writes_single_audit_entry(tmp_path: Path) -> None:
     entries = await router._audit.search("default", limit=100)
     assert len(entries) == 1
     assert entries[0]["policy_decision"] == "allowed"
+
+
+# ---------------------------------------------------------------------------
+# EXPO-1 / EXPO-2 — exposure under a service-token boundary role.
+#
+# A service token's ``svc:<label>`` identity has no ``config.users`` entry
+# by design; its role is carried in the auth scopes
+# (``[SCOPE_SVC, mcpolis:role:<role>, mcpolis:org:<org>]``) and read back
+# by ``_get_boundary_role`` → handed to the PolicyEngine. These tests pin
+# that the gateway controller honors that boundary role on every exposure
+# surface — tools/list, tools/call (allowed + denied), and the bare-name /
+# bare-URI fallbacks — and audits the call under the svc identity.
+# ---------------------------------------------------------------------------
+
+SVC_LABEL = "expo-bot"
+SVC_IDENTITY = service_identity(SVC_LABEL)
+
+
+def _svc_scoped_config() -> SettingsConfig:
+    """Two roles, no svc user entry: ``reader`` grants only ``github``;
+    ``none`` grants nothing. The boundary role decides exposure."""
+    return SettingsConfig(
+        roles={
+            "reader": RoleDefinition(
+                settings=RoleSettings(
+                    mcp_access=McpAccessConfig(mcps={"github": True}),
+                ),
+            ),
+            "none": RoleDefinition(
+                is_default=True,
+                settings=RoleSettings(mcp_access=McpAccessConfig(mcps={})),
+            ),
+        },
+        users={},
+    )
+
+
+def _set_svc_auth(role: str = "reader", org: str = "default") -> Any:
+    """Set request-scoped auth context for the service-token identity,
+    carrying the boundary role in the SDK ``AccessToken.scopes`` channel."""
+    from mcp.server.auth.middleware.auth_context import auth_context_var
+    from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+    from mcp.server.auth.provider import AccessToken
+
+    auth_user = AuthenticatedUser(
+        AccessToken(
+            token="svct_fake",
+            client_id=SVC_IDENTITY,  # → AuthenticatedUser.display_name
+            scopes=[
+                SCOPE_SVC,
+                SCOPE_ROLE_PREFIX + role,
+                SCOPE_ORG_PREFIX + org,
+            ],
+            expires_at=int(time.time()) + 3600,
+        )
+    )
+    return auth_context_var.set(auth_user)
+
+
+def _reset_auth(token: Any) -> None:
+    from mcp.server.auth.middleware.auth_context import auth_context_var
+    auth_context_var.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_list_tools_filtered_to_boundary_role(tmp_path: Path) -> None:
+    """tools/list under a service-token ``reader`` boundary role is
+    filtered to that role's upstream (``github``), even though the svc
+    identity is absent from ``config.users``."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    rm = make_runtime_manager(
+        PolicyEngine(_svc_scoped_config()),
+        tool_registry=registry, tool_router=router,
+    )
+    server = create_mcp_server(rm)
+    handler = server.request_handlers[mcp_types.ListToolsRequest]
+
+    auth_token = _set_svc_auth(role="reader")
+    try:
+        result = cast(Any, await handler(None))
+    finally:
+        _reset_auth(auth_token)
+    names = [t.name for t in cast(list[mcp_types.Tool], result.root.tools)]
+    assert names == ["github__create_issue"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_allowed_under_boundary_role_audits_svc_identity(
+    tmp_path: Path,
+) -> None:
+    """An allowed call under the ``reader`` boundary role reaches the
+    routed upstream and writes a single ``allowed`` audit row keyed to
+    the ``svc:<label>`` identity."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    rm = make_runtime_manager(
+        PolicyEngine(_svc_scoped_config()),
+        tool_registry=registry, tool_router=router,
+    )
+    server = create_mcp_server(rm)
+    handler = server.request_handlers[mcp_types.CallToolRequest]
+
+    auth_token = _set_svc_auth(role="reader")
+    try:
+        call_result = await _call(
+            handler, "github__create_issue", {"title": "ok"},
+        )
+    finally:
+        _reset_auth(auth_token)
+    assert not call_result.isError
+    text = cast(mcp_types.TextContent, call_result.content[0]).text
+    assert text == "done"
+
+    entries = await router._audit.search("default", limit=100)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["policy_decision"] == "allowed"
+    assert entry["user_id"] == SVC_IDENTITY
+    assert entry["tool"] == "github__create_issue"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_denied_under_boundary_role_audits_svc_identity(
+    tmp_path: Path,
+) -> None:
+    """A call to an upstream outside the ``reader`` boundary role
+    (``slack``) is denied and writes a ``denied`` audit row under the
+    ``svc:<label>`` identity."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    rm = make_runtime_manager(
+        PolicyEngine(_svc_scoped_config()),
+        tool_registry=registry, tool_router=router,
+    )
+    server = create_mcp_server(rm)
+    handler = server.request_handlers[mcp_types.CallToolRequest]
+
+    auth_token = _set_svc_auth(role="reader")
+    try:
+        call_result = await _call(
+            handler, "slack__send_message", {"text": "hi"},
+        )
+    finally:
+        _reset_auth(auth_token)
+    assert call_result.isError
+    text = cast(mcp_types.TextContent, call_result.content[0]).text
+    assert "Access denied" in text
+
+    entries = await router._audit.search("default", limit=100)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["policy_decision"] == "denied"
+    assert entry["user_id"] == SVC_IDENTITY
+    assert entry["upstream_id"] == "slack"
+    assert entry["tool"] == "slack__send_message"
+
+
+@pytest.mark.asyncio
+async def test_bare_tool_name_resolution_honors_boundary_role(
+    tmp_path: Path,
+) -> None:
+    """EXPO-2: a bare tool name (MCP-Apps widget callback shape) resolves
+    only against the boundary role's allowed upstreams.
+
+    ``create_issue`` (owned by the allowed ``github``) resolves and the
+    call goes through; ``send_message`` (owned by the disallowed
+    ``slack``) is unknown to the boundary role, so the bare-name resolver
+    reports it as unknown rather than reaching ``slack``."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    rm = make_runtime_manager(
+        PolicyEngine(_svc_scoped_config()),
+        tool_registry=registry, tool_router=router,
+    )
+    server = create_mcp_server(rm)
+    handler = server.request_handlers[mcp_types.CallToolRequest]
+
+    auth_token = _set_svc_auth(role="reader")
+    try:
+        allowed = await _call(handler, "create_issue", {"title": "ok"})
+        denied = await _call(handler, "send_message", {"text": "hi"})
+    finally:
+        _reset_auth(auth_token)
+
+    # Allowed upstream's bare name resolves and routes through.
+    assert not allowed.isError
+    assert cast(mcp_types.TextContent, allowed.content[0]).text == "done"
+
+    # Disallowed upstream's bare name is invisible to the boundary role:
+    # the resolver can't see ``slack``, so it reports the tool unknown.
+    assert denied.isError
+    denied_text = cast(mcp_types.TextContent, denied.content[0]).text
+    assert "Unknown tool 'send_message'" in denied_text

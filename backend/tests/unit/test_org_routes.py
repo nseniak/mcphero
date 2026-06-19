@@ -168,6 +168,36 @@ def test_delete_org_rejected_in_standalone(tmp_path: Path) -> None:
     assert resp.status_code in (400, 500)
 
 
+def test_create_app_wires_every_org_scoped_repo_into_org_service(
+    tmp_path: Path,
+) -> None:
+    """Guard against silent deletion leaks: ``create_app`` must inject
+    EVERY org-scoped repo (and the runtime-teardown hook) into the
+    OrgService, or that collection survives org deletion. The repos are
+    optional kwargs on ``OrgService`` — a forgotten one still constructs
+    fine, so only this assertion catches the omission. Keep this list in
+    sync with the org-scoped fields on ``StorageBundle``."""
+    client = make_test_client(tmp_path)
+    org_service = client.app.state.org_service  # type: ignore[attr-defined]
+    for attr in (
+        "_service_token_repo",
+        "_connection_repo",
+        "_upstream_config_repo",
+        "_tool_catalog_repo",
+        "_sandbox_persistence_repo",
+        "_template_var_repo",
+        "_sandbox_file_repo",
+        "_audit_repo",
+    ):
+        assert getattr(org_service, attr) is not None, (
+            f"create_app did not wire OrgService.{attr} — that collection "
+            f"would leak on org deletion"
+        )
+    # The teardown hook (runtime stop + slug-cache invalidation) is
+    # late-bound via set_runtime_teardown; it must be wired too.
+    assert org_service._runtime_teardown is not None
+
+
 # --- Admin gate uses is_admin flag, not the literal role name "admin" ---
 
 

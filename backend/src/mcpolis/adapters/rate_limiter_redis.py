@@ -21,6 +21,8 @@ Redis clients. Lua avoids pipelining races where two backends observe
 """
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from typing import cast
 from urllib.parse import urlparse
 
@@ -84,16 +86,22 @@ def _client_from_url(url: str) -> coredis.Redis[str]:
 
 
 class RedisRateLimiter:
-    def __init__(self, url: str) -> None:
+    def __init__(
+        self, url: str, *, now: Callable[[], float] = time.time,
+    ) -> None:
         self._client: coredis.Redis[str] = _client_from_url(url)
         self._script = self._client.register_script(_CHECK_SCRIPT)
         self._counter = 0  # unique suffix for ZSET members
+        # Injectable clock — the Lua script receives ``now`` as ARGV, so
+        # the whole sliding window is driven by this. Tests inject a
+        # controllable clock so the window can't slide on wall-clock
+        # elapsed time between starved round-trips. Prod uses ``time.time``.
+        self._now = now
 
     async def check(
         self, key: str, *, limit: int, window_seconds: float,
     ) -> RateLimitResult:
-        import time as _time
-        now = _time.time()
+        now = self._now()
         self._counter = (self._counter + 1) % 1_000_000
         member = f"{now}:{self._counter}"
         full_key = f"{_KEY_PREFIX}:{key}"

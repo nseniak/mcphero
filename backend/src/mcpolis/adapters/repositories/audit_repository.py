@@ -37,3 +37,8 @@ class AuditRepository:
 
     async def get_filter_values(self, org_id: str) -> dict[str, list[str]]:
         raise NotImplementedError
+
+    async def delete_for_org(self, org_id: str) -> int:
+        """Delete every audit entry for this org (org-deletion cascade).
+        Returns the number of entries removed. Idempotent."""
+        raise NotImplementedError

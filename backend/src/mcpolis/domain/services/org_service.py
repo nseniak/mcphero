@@ -14,9 +14,21 @@ never branches on it.
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import structlog
 
+# Org deletion orchestrates a purge across every org-scoped repository.
+# The legacy abstract bases (``ConnectionStore`` / ``UpstreamConfigStore``
+# / ``AuditRepository``) live in the adapters layer; importing them here
+# mirrors the existing precedent in ``org_runtime`` (same service layer)
+# and lets the app wire ``StorageBundle`` fields in without casts.
+from mcpolis.adapters.repositories.audit_repository import (
+    AuditRepository as LegacyAuditRepository,
+)
+from mcpolis.adapters.repositories.connection_store import ConnectionStore
+from mcpolis.adapters.repositories.upstream_config_store import UpstreamConfigStore
 from mcpolis.domain.model.reserved_slugs import RESERVED_ORG_SLUGS
 from mcpolis.domain.model.settings import UserDefinition
 from mcpolis.domain.ports import (
@@ -27,6 +39,12 @@ from mcpolis.domain.ports import (
     OrganizationRepository,
     ServiceTokenRepository,
 )
+from mcpolis.domain.ports.sandbox_file_repository import SandboxFileRepository
+from mcpolis.domain.ports.sandbox_persistence_repository import (
+    SandboxPersistenceRepository,
+)
+from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
+from mcpolis.domain.ports.tool_catalog_repository import ToolCatalogRepository
 from mcpolis.domain.services.settings_resolver import resolve_settings
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
@@ -106,10 +124,43 @@ class OrgService:
         org_repo: OrganizationRepository,
         config_repo: ConfigRepository,
         service_token_repo: ServiceTokenRepository | None = None,
+        *,
+        connection_repo: ConnectionStore | None = None,
+        upstream_config_repo: UpstreamConfigStore | None = None,
+        tool_catalog_repo: ToolCatalogRepository | None = None,
+        sandbox_persistence_repo: SandboxPersistenceRepository | None = None,
+        template_var_repo: TemplateVarRepository | None = None,
+        sandbox_file_repo: SandboxFileRepository | None = None,
+        audit_repo: LegacyAuditRepository | None = None,
     ) -> None:
         self._org_repo = org_repo
         self._config_repo = config_repo
         self._service_token_repo = service_token_repo
+        # Additional org-scoped repos for the deletion cascade. Optional
+        # so the many call sites that only exercise create/membership
+        # logic stay terse; production (``create_app``) wires every one,
+        # matching the org-scoped fields on ``StorageBundle``. A repo left
+        # ``None`` is simply skipped during the purge.
+        self._connection_repo = connection_repo
+        self._upstream_config_repo = upstream_config_repo
+        self._tool_catalog_repo = tool_catalog_repo
+        self._sandbox_persistence_repo = sandbox_persistence_repo
+        self._template_var_repo = template_var_repo
+        self._sandbox_file_repo = sandbox_file_repo
+        self._audit_repo = audit_repo
+        # Late-bound by ``create_app`` (after the slug cache exists) to
+        # stop the in-memory runtime + invalidate the slug cache on
+        # deletion. Kept as a callback so the domain layer stays
+        # decoupled from ``OrgRuntimeManager``.
+        self._runtime_teardown: Callable[[str], Awaitable[None]] | None = None
+
+    def set_runtime_teardown(
+        self, teardown: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Register the in-memory teardown hook run before the persistence
+        purge in ``delete_organization`` (mirrors the gateway provider's
+        ``set_org_service`` late-binding pattern in ``create_app``)."""
+        self._runtime_teardown = teardown
 
     # --- Creation ---
 
@@ -271,23 +322,117 @@ class OrgService:
     async def list_members(self, org_id: str) -> list[Membership]:
         return await self._org_repo.list_memberships(org_id)
 
-    async def delete_organization(self, org_id: str) -> None:
-        """Delete an organization, its memberships, and its service tokens.
+    async def _purge(
+        self,
+        org_id: str,
+        collection: str,
+        op: Callable[[], Awaitable[Any]] | None,
+    ) -> int:
+        """Run one collection's per-org delete, best-effort.
 
-        The token cascade matters: service tokens bypass membership
-        gating (they carry their org in the credential), so a token
-        surviving its org would keep working through the gateway's
-        org-pin path and be unrevocable — the org's dashboard no
-        longer exists.
+        ``op`` is ``None`` when the repo wasn't wired (skip). A failure
+        logs a warning and returns 0 rather than aborting — org deletion
+        is terminal, so one collection failing must not strand the rest.
+        Returns the row count when the delete reports one, else 0.
+        """
+        if op is None:
+            return 0
+        try:
+            result = await op()
+        except Exception:
+            logger.warning(
+                "org.delete.purge_failed",
+                org_id=org_id,
+                collection=collection,
+                exc_info=True,
+            )
+            return 0
+        return result if isinstance(result, int) else 0
+
+    async def delete_organization(self, org_id: str) -> None:
+        """Delete an organization and PURGE every collection scoped to it.
+
+        Without this, a deleted tenant's encrypted OAuth tokens, config,
+        template-var secrets, sandbox files, and tool catalog would
+        linger in storage forever — a privacy leak.
+
+        Order is deliberate:
+
+        1. ``org_repo.delete_organization`` **first**. In standalone mode
+           the file repo raises here, so a stray ``DELETE /api/orgs/default``
+           is rejected before any runtime teardown or purge runs (it can't
+           tear down the live single-tenant runtime or wipe file data).
+           In cloud mode this removes the org doc + memberships.
+        2. Tear down the in-memory runtime (stop live upstream clients,
+           invalidate the slug cache) so nothing writes a row back
+           mid-purge.
+        3. Purge each org-scoped repo, best-effort.
+
+        Service tokens matter specially: they carry their org in the
+        credential and bypass membership gating, so a survivor would keep
+        working through the gateway's org-pin path and be unrevocable —
+        the org's dashboard no longer exists.
         """
         await self._org_repo.delete_organization(org_id)
-        revoked_tokens = 0
-        if self._service_token_repo is not None:
-            revoked_tokens = await self._service_token_repo.delete_for_org(
-                org_id,
-            )
+
+        if self._runtime_teardown is not None:
+            try:
+                await self._runtime_teardown(org_id)
+            except Exception:
+                logger.warning(
+                    "org.delete.runtime_teardown_failed",
+                    org_id=org_id,
+                    exc_info=True,
+                )
+
+        st = self._service_token_repo
+        cr = self._connection_repo
+        uc = self._upstream_config_repo
+        tc = self._tool_catalog_repo
+        sp = self._sandbox_persistence_repo
+        tv = self._template_var_repo
+        sf = self._sandbox_file_repo
+        au = self._audit_repo
+        counts = {
+            "service_tokens": await self._purge(
+                org_id, "service_tokens",
+                (lambda: st.delete_for_org(org_id)) if st else None,
+            ),
+            "connections": await self._purge(
+                org_id, "connections",
+                (lambda: cr.delete_all_for_org(org_id)) if cr else None,
+            ),
+            "config": await self._purge(
+                org_id, "config",
+                lambda: self._config_repo.delete_for_org(org_id),
+            ),
+            "upstreams": await self._purge(
+                org_id, "upstreams",
+                (lambda: uc.delete_all_for_org(org_id)) if uc else None,
+            ),
+            "tool_catalog": await self._purge(
+                org_id, "tool_catalog",
+                (lambda: tc.delete_all_for_org(org_id)) if tc else None,
+            ),
+            "sandbox_refs": await self._purge(
+                org_id, "sandbox_refs",
+                (lambda: sp.delete_all_for_org(org_id=org_id)) if sp else None,
+            ),
+            "template_vars": await self._purge(
+                org_id, "template_vars",
+                (lambda: tv.delete_all_for_org(org_id)) if tv else None,
+            ),
+            "sandbox_files": await self._purge(
+                org_id, "sandbox_files",
+                (lambda: sf.delete_all_for_org(org_id)) if sf else None,
+            ),
+            "audit": await self._purge(
+                org_id, "audit",
+                (lambda: au.delete_for_org(org_id)) if au else None,
+            ),
+        }
         logger.info(
             "org.deleted",
             org_id=org_id,
-            revoked_service_tokens=revoked_tokens,
+            **{f"purged_{name}": n for name, n in counts.items()},
         )

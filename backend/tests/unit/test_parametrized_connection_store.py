@@ -740,3 +740,105 @@ async def test_delete_all_for_user_purges_user_axis_only(
         ) == "hash-1"
 
         assert await store.delete_all_for_user(DEFAULT_ORG_ID, "alice@co.com") == 0
+
+
+async def _seed_full_state_org(
+    store: ConnectionStore, org_id: str, upstream: str, user: str,
+) -> None:
+    """Like ``_seed_full_state`` but for an explicit org — used to prove
+    ``delete_all_for_org`` is org-scoped on the multi-tenant backend."""
+    await store.put_user_token(org_id, user, upstream, _token())
+    await store.put_admin_token(
+        org_id, upstream, _token(), authorized_by="admin@co.com",
+    )
+    await store.put_client_info(
+        org_id, upstream, user, {"client_id": f"cid-{upstream}-{user}"},
+    )
+    await store.put_oauth_metadata(
+        org_id, upstream, user, {"issuer": f"iss-{upstream}"},
+    )
+    await store.put_pending_code(org_id, upstream, user, "code", "state")
+    await store.record_refresh_failure(org_id, upstream, user)
+    await store.mark_notified(org_id, upstream, user)
+    await store.set_disabled(org_id, upstream)
+    await store.set_connection_error(org_id, upstream, "boom")
+    await store.set_started_config_hash(org_id, upstream, "hash-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_delete_all_for_org_purges_every_key_shape(
+    backend: str, tmp_path: Path,
+) -> None:
+    """``delete_all_for_org`` must drop EVERY row for the org — across
+    all upstreams and users, on both axes — leaving the store empty.
+    This is the org-deletion cascade for the connection collection."""
+    async with _make_store(backend, tmp_path) as store:
+        await _seed_full_state(store, "github", "alice@co.com")
+        await _seed_full_state(store, "slack", "bob@co.com")
+
+        deleted = await store.delete_all_for_org(DEFAULT_ORG_ID)
+        assert deleted > 0
+
+        for upstream, user in (
+            ("github", "alice@co.com"),
+            ("slack", "bob@co.com"),
+        ):
+            assert await store.get_user_token(DEFAULT_ORG_ID, user, upstream) is None
+            assert await store.get_admin_token(DEFAULT_ORG_ID, upstream) is None
+            assert await store.get_client_info(
+                DEFAULT_ORG_ID, upstream, user,
+            ) is None
+            assert await store.get_oauth_metadata(
+                DEFAULT_ORG_ID, upstream, user,
+            ) is None
+            assert await store.get_refresh_failures(
+                DEFAULT_ORG_ID, upstream, user,
+            ) is None
+            assert await store.was_notified(DEFAULT_ORG_ID, upstream, user) is False
+            assert await store.pop_pending_code(
+                DEFAULT_ORG_ID, upstream, user,
+            ) is None
+            assert await store.is_enabled(DEFAULT_ORG_ID, upstream) is True
+            assert await store.get_connection_error(
+                DEFAULT_ORG_ID, upstream,
+            ) is None
+            assert await store.get_started_config_hash(
+                DEFAULT_ORG_ID, upstream,
+            ) is None
+
+        # Idempotent: nothing left to remove.
+        assert await store.delete_all_for_org(DEFAULT_ORG_ID) == 0
+
+
+@pytest.mark.skipif(not mongo_available(), reason="Mongo not reachable")
+@pytest.mark.asyncio
+async def test_delete_all_for_org_is_org_scoped() -> None:
+    """On the multi-tenant Mongo backend, deleting one org leaves a
+    second org's connection rows completely intact — even when both
+    orgs share the same ``(upstream, user)`` synthetic keys."""
+    async with temp_mongo_database() as db:
+        encryptor = FieldEncryptor.from_master_secret("unit-test-key")
+        coll = OrgScopedCollection(
+            db[COLL_CONNECTIONS], COLL_CONNECTIONS, encryptor=encryptor,
+        )
+        store = MongoConnectionRepository(coll)
+        await _seed_full_state_org(store, "org-doomed", "github", "alice@co.com")
+        await _seed_full_state_org(store, "org-alive", "github", "alice@co.com")
+
+        deleted = await store.delete_all_for_org("org-doomed")
+        assert deleted > 0
+
+        assert await store.get_admin_token("org-doomed", "github") is None
+        assert await store.get_client_info(
+            "org-doomed", "github", "alice@co.com",
+        ) is None
+
+        # org-alive is fully intact.
+        assert await store.get_admin_token("org-alive", "github") is not None
+        assert await store.get_client_info(
+            "org-alive", "github", "alice@co.com",
+        ) is not None
+        assert await store.get_user_token(
+            "org-alive", "alice@co.com", "github",
+        ) is not None

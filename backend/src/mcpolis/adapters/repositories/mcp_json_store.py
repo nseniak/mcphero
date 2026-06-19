@@ -86,3 +86,9 @@ class McpJsonStore:
                 raise ValueError(f"MCP '{mcp_id}' not found")
             del servers[mcp_id]
             self._write(servers)
+
+    async def clear(self, org_id: str) -> None:
+        """Remove every MCP server definition. Single-org file store, so
+        this clears the whole file. Idempotent (org-deletion cascade)."""
+        async with self._lock:
+            self._write({})

@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+import tempfile
 from collections.abc import AsyncIterator, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
@@ -34,6 +36,8 @@ from mcp.shared.message import SessionMessage
 
 from mcpolis.adapters.sandbox_services.exit_signal import ExitSignalImpl
 from mcpolis.domain.services.exit_reason import ExitReason
+from mcpolis.domain.services.sandbox_path import confine_to_sandbox_home
+from mcpolis.domain.services.stdout_framing import BoundedLineBuffer
 from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.domain.services.sandbox_service import (  # noqa: I001
     SandboxResourceCombo,
@@ -103,6 +107,20 @@ class LocalSubprocessSandboxService:
                 "disk_gb", resources.disk_gb, allowed=_ALLOWED_DISK_GB,
             )
 
+    def sandbox_home(self, *, session_id: str) -> str:
+        # Per-session isolated home under the host temp dir. The
+        # subprocess runs unsandboxed on the host, so we must NOT let
+        # ``${HOME}`` resolve to E2B's ``/home/user`` (unwritable here —
+        # on macOS ``/home`` is autofs → ENOTSUP) nor pollute the
+        # operator's real ``$HOME``. ``session()`` creates this dir,
+        # forces the subprocess's ``HOME`` to it, and removes it on
+        # teardown. Deterministic in ``session_id`` so the manager's
+        # ``${HOME}`` substitution and this session compute the same
+        # path.
+        return os.path.join(
+            tempfile.gettempdir(), f"mcpolis-local-home-{session_id}",
+        )
+
     def session(
         self,
         *,
@@ -116,28 +134,46 @@ class LocalSubprocessSandboxService:
         extra_env: dict[str, str] | None = None,
         materialize_files: Sequence[MaterializeFile] | None = None,
     ) -> AbstractAsyncContextManager[SandboxSession]:
-        # session_id is informational here; this backend has no
-        # snapshot machinery to register a handle under.
-        _ = session_id, resources, denylist
+        _ = resources, denylist
         if resume_from is not None:
             raise NotImplementedError(
                 "local-subprocess does not support pause/resume",
             )
+        # Per-session isolated home (see ``sandbox_home``). Create it so
+        # ``$HOME`` exists even when no files are materialized; the
+        # ``${HOME}`` in each ``target_path`` already substituted to this
+        # same path in the manager, so files land under it.
+        sandbox_home = self.sandbox_home(session_id=session_id)
+        os.makedirs(sandbox_home, exist_ok=True)
         # ``local-subprocess`` runs the MCP as a real host subprocess
         # so file materialization is a real ``open(path, "w")`` —
         # parent dirs created as needed, mode 0600 to match the E2B
         # path. The operator is in dev-only territory here (the
-        # cloud-mode startup validator rejects this backend); files
-        # land in the host's filesystem at whatever ``target_path``
-        # resolved to. Writes happen synchronously before the
-        # subprocess starts so the spawned MCP can read its
-        # credentials at startup.
+        # cloud-mode startup validator rejects this backend). Writes
+        # happen synchronously before the subprocess starts so the
+        # spawned MCP can read its credentials at startup.
         if materialize_files:
-            for f in materialize_files:
-                p = Path(f.target_path)
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(f.contents, encoding="utf-8")
-                p.chmod(0o600)
+            try:
+                for f in materialize_files:
+                    # Confine the operator-controlled target_path to the
+                    # per-session home before writing — a ``..`` traversal
+                    # or an absolute path that escapes lands a real file on
+                    # the host otherwise (SBX-11).
+                    confined = confine_to_sandbox_home(
+                        f.target_path, sandbox_home,
+                    )
+                    p = Path(confined)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(f.contents, encoding="utf-8")
+                    p.chmod(0o600)
+            except BaseException:
+                # The materialize loop runs BEFORE the session context is
+                # entered, so neither the spawn ``except`` nor the teardown
+                # ``finally`` would tear down the temp home created above. A
+                # confinement rejection OR an unwritable destination must
+                # not leak it (SBX-10). Clean up and re-raise.
+                shutil.rmtree(sandbox_home, ignore_errors=True)
+                raise
             logger.info(
                 "sandbox.local_subprocess.materialize_files.wrote",
                 upstream_id=upstream.id,
@@ -148,6 +184,7 @@ class LocalSubprocessSandboxService:
             upstream=upstream,
             errlog=errlog,
             extra_env=extra_env,
+            sandbox_home=sandbox_home,
         )
 
     @asynccontextmanager
@@ -158,6 +195,7 @@ class LocalSubprocessSandboxService:
         upstream: UpstreamDefinition,
         errlog: TextIO | None,
         extra_env: dict[str, str] | None,
+        sandbox_home: str,
     ) -> AsyncIterator[SandboxSession]:
         cfg = upstream.stdio
         if cfg is None:
@@ -165,18 +203,23 @@ class LocalSubprocessSandboxService:
                 f"upstream {upstream.id!r} has transport=stdio but"
                 " stdio config is missing",
             )
-        # Merge upstream env on top of the host's so PATH / HOME /
-        # locale survive. Without this an operator who supplies any
-        # env value at all (the common case) loses the ability to
-        # locate ``python3`` / ``npx`` / ``uvx`` on PATH and the
-        # spawn fails with ``ModuleNotFoundError`` or "command not
-        # found" before init. Operator-provided keys win on collision
-        # so they can still scrub a sensitive host var by setting
-        # it explicitly.
+        # Merge upstream env on top of the host's so PATH / locale
+        # survive. Without this an operator who supplies any env value
+        # at all (the common case) loses the ability to locate
+        # ``python3`` / ``npx`` / ``uvx`` on PATH and the spawn fails
+        # with ``ModuleNotFoundError`` or "command not found" before
+        # init. Operator-provided keys win on collision so they can
+        # still scrub a sensitive host var by setting it explicitly.
         spawn_env: dict[str, str] = dict(os.environ)
         spawn_env.update(cfg.env)
         if extra_env:
             spawn_env.update(extra_env)
+        # Force ``HOME`` to the per-session sandbox home LAST so it wins
+        # over the host's and any operator-set value. The sandbox
+        # abstraction owns ``HOME``: ``${HOME}`` already substituted to
+        # this exact path in the manager, so the subprocess's ``$HOME``
+        # MUST match for ``${HOME}``-templated files to round-trip.
+        spawn_env["HOME"] = sandbox_home
 
         logger.info(
             "sandbox.local_subprocess.session.start",
@@ -209,6 +252,10 @@ class LocalSubprocessSandboxService:
                 env=spawn_env,
             )
         except FileNotFoundError as exc:
+            # Spawn died before the ``yield`` try/finally — clean the
+            # session home up here so a bad command doesn't leak a temp
+            # dir.
+            shutil.rmtree(sandbox_home, ignore_errors=True)
             # The raw OSError is just "[Errno 2] No such file or
             # directory" — it never names the command, so a new user has
             # no way to know e.g. ``npx`` isn't installed. Surface the
@@ -220,6 +267,7 @@ class LocalSubprocessSandboxService:
                 "server's PATH."
             ) from exc
         except PermissionError as exc:
+            shutil.rmtree(sandbox_home, ignore_errors=True)
             raise PermissionError(
                 f"Command {cfg.command!r} is not executable in the "
                 "sandbox environment."
@@ -232,17 +280,18 @@ class LocalSubprocessSandboxService:
         assert process.stderr is not None
 
         async def stdout_pump() -> None:
-            buffer = ""
+            # Bounded buffer caps the in-progress leftover so a
+            # newline-free stream can't grow per-session memory without
+            # bound (SBX-7 / BUG-6).
+            stdout_lines = BoundedLineBuffer()
             try:
                 assert process.stdout is not None
                 while True:
                     chunk = await process.stdout.read(4096)
                     if not chunk:
                         break
-                    buffer += chunk.decode("utf-8", errors="replace")
-                    *complete_lines, leftover = buffer.split("\n")
-                    buffer = leftover
-                    for line in complete_lines:
+                    text = chunk.decode("utf-8", errors="replace")
+                    for line in stdout_lines.feed(text):
                         if not line:
                             continue
                         try:
@@ -401,6 +450,11 @@ class LocalSubprocessSandboxService:
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
+
+            # Remove the per-session isolated home (and any materialized
+            # files under it). Best-effort: a leftover dir is harmless
+            # dev-only temp, but cleaning keeps ``$TMPDIR`` tidy.
+            shutil.rmtree(sandbox_home, ignore_errors=True)
 
             logger.info(
                 "sandbox.local_subprocess.session.end",

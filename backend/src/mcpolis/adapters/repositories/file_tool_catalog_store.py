@@ -85,3 +85,10 @@ class FileToolCatalogStore(ToolCatalogRepository):
             if upstream_id in data:
                 data.pop(upstream_id)
                 self._write(org_id, data)
+
+    async def delete_all_for_org(self, org_id: str) -> None:
+        # One file per org; removing it drops the whole catalog
+        # (org-deletion cascade). Idempotent. The per-org directory is
+        # shared with other repos (e.g. OAuth state), so leave it in place.
+        async with self._lock:
+            self._path(org_id).unlink(missing_ok=True)

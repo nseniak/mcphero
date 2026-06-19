@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Callable
 
 import pytest
 
@@ -64,6 +65,36 @@ async def test_inprocess_close_is_noop() -> None:
 def _skip_unless_redis() -> None:
     if not redis_available():
         pytest.skip("Redis not reachable — start the dev compose profile")
+
+
+async def _publish_until(
+    publisher: RedisEventStream,
+    org: str,
+    event: Event,
+    *,
+    until: Callable[[], bool],
+    deadline_s: float = 15.0,
+) -> None:
+    """Re-publish ``event`` until ``until()`` holds (or the deadline).
+
+    Redis pub/sub drops messages published before a subscriber's
+    SUBSCRIBE has registered. The old tests slept a fixed 0.2 s before
+    a single publish and hoped both subscriber tasks had been scheduled
+    and finished their SUBSCRIBE round-trip by then. Under ``make
+    test-all`` CPU starvation that wasn't always true — the publish
+    raced ahead of the subscribe and the event was lost *forever* (no
+    receive-deadline could recover it; the symptom was a
+    ``CancelledError`` when the 3 s ``wait_for`` gave up). Re-publishing
+    on a short cadence until delivery removes the race entirely without
+    depending on any wall-clock guess. Subscribers return after their
+    first event, so extra publishes land on a closed generator and are
+    harmlessly dropped — the ``== 1`` inbox assertions still hold.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + deadline_s
+    while not until() and loop.time() < deadline:
+        publisher.publish(org, event)
+        await asyncio.sleep(0.1)
 
 
 async def test_redis_channel_pattern_is_org_scoped() -> None:
@@ -128,20 +159,21 @@ async def test_redis_cross_subscriber_delivery() -> None:
         collect(subscriber_b, "bob@test.com", received_b),
     )
 
-    # Give both subscribers a moment to open their PubSub channels
-    # and issue SUBSCRIBE. Redis pub/sub drops messages for anyone
-    # who isn't subscribed yet — we don't want the publish to race
-    # the subscribe.
-    await asyncio.sleep(0.2)
-
-    publisher.publish(org, Event(
+    # Re-publish the broadcast until both inboxes fill, so a slow
+    # SUBSCRIBE under load can't drop the lone publish (see
+    # ``_publish_until``). A subscriber returns after its first event,
+    # so each inbox still ends with exactly one.
+    broadcast = Event(
         type="policy_changed",
         user_email=None,  # broadcast
         payload={"role": "admin"},
-    ))
-
+    )
     try:
-        await asyncio.wait_for(asyncio.gather(task_a, task_b), timeout=3.0)
+        await _publish_until(
+            publisher, org, broadcast,
+            until=lambda: bool(received_a) and bool(received_b),
+        )
+        await asyncio.wait_for(asyncio.gather(task_a, task_b), timeout=5.0)
     finally:
         await publisher.close()
         await subscriber_a.close()
@@ -182,16 +214,20 @@ async def test_redis_user_scoped_delivery_filtered() -> None:
         collect(bob_sub, "bob@test.com", bob_received),
     )
 
-    await asyncio.sleep(0.2)
-
-    publisher.publish(org, Event(
+    # Re-publish alice's event until she receives it (see
+    # ``_publish_until``). The event targets alice, so bob is filtered
+    # out server-side no matter how many times we publish.
+    alice_event = Event(
         type="upstream_tokens_acquired",
         user_email="alice@test.com",
         payload={"upstream_id": "mixpanel"},
-    ))
-
+    )
     try:
-        await asyncio.wait_for(task_alice, timeout=3.0)
+        await _publish_until(
+            publisher, org, alice_event,
+            until=lambda: bool(alice_received),
+        )
+        await asyncio.wait_for(task_alice, timeout=5.0)
     finally:
         # Bob's task will never complete — cancel it and assert his
         # inbox is empty.

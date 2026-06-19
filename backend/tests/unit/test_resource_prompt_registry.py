@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import mcp.types as mcp_types
 import pytest
+import structlog
 from mcp.shared.exceptions import McpError
 from pydantic import AnyUrl
 
@@ -24,6 +25,7 @@ from mcpolis.domain.services.tool_registry import (
     ITEM_CAP_PER_UPSTREAM,
     ToolRegistry,
 )
+from tests.unit._state_seed import seed_shared_session
 from tests.unit.factories import make_upstream_definition
 
 
@@ -395,3 +397,171 @@ def test_resolve_prompt_returns_none_for_unknown() -> None:
     registry = ToolRegistry([upstream], MagicMock())
     assert registry.resolve_prompt("unknown__greet") is None
     assert registry.resolve_prompt("no-separator") is None
+
+
+# ── ROUTE-3: a non-advancing pagination cursor must hit the item cap ──
+#
+# Pagination is "keep fetching until ``nextCursor is None``". A
+# misbehaving (or malicious) upstream that returns a CONSTANT non-None
+# cursor would loop forever and exhaust memory — an unbounded-growth /
+# DoS surface. ``ITEM_CAP_PER_UPSTREAM`` is the backstop: discovery
+# stops at the cap and logs a WARNING so the truncation is visible.
+
+
+def _make_constant_cursor_resources_session() -> Any:
+    """A session whose ``list_resources`` returns ONE resource and the SAME
+    non-None cursor on every call — the cursor never advances, so without
+    the item cap the pagination loop would never terminate."""
+    session = MagicMock()
+    calls = {"n": 0}
+
+    async def list_resources(
+        *, params: mcp_types.PaginatedRequestParams | None = None,
+    ) -> mcp_types.ListResourcesResult:
+        calls["n"] += 1
+        # Distinct URI per page so the cap counts real items, never a
+        # never-ending stream of duplicates collapsing.
+        uri = f"test://r/{calls['n']}"
+        return mcp_types.ListResourcesResult(
+            resources=[
+                mcp_types.Resource(
+                    uri=AnyUrl(uri), name=f"r{calls['n']}",
+                    description="x", mimeType="text/plain",
+                ),
+            ],
+            nextCursor="STUCK",  # never advances, never None
+        )
+
+    session.list_resources = AsyncMock(side_effect=list_resources)
+    session.list_resource_templates = AsyncMock(
+        return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[]),
+    )
+    session.list_prompts = AsyncMock(
+        return_value=mcp_types.ListPromptsResult(prompts=[]),
+    )
+    return session
+
+
+@pytest.mark.asyncio
+async def test_discover_resources_stops_at_cap_on_non_advancing_cursor() -> None:
+    """ROUTE-3: a constant, never-None cursor that adds one resource per
+    page is bounded by ``ITEM_CAP_PER_UPSTREAM`` (no infinite loop) and the
+    truncation is logged at WARNING — the unbounded-pagination DoS guard."""
+    session = _make_constant_cursor_resources_session()
+    registry, _ = make_registry_with_session(session=session)
+    with structlog.testing.capture_logs() as logs:
+        resources, _ = await registry._discover_resources("notion")  # pyright: ignore[reportPrivateUsage]
+    assert len(resources) == ITEM_CAP_PER_UPSTREAM, (
+        "discovery must stop exactly at the cap, not loop forever"
+    )
+    cap_warnings = [
+        e for e in logs if e.get("event") == "resource.registry.cap_reached"
+    ]
+    assert len(cap_warnings) == 1, "the cap truncation must be logged"
+    assert cap_warnings[0]["cap"] == ITEM_CAP_PER_UPSTREAM
+    assert cap_warnings[0]["log_level"] == "warning"
+
+
+# ── ROUTE-4 / ROUTE-12: refresh_upstream is all-or-nothing on a failing
+#    phase — a stalled (or cancelled) discovery phase must NOT persist a
+#    half-catalogue. The tools phase succeeding doesn't license writing a
+#    partial catalogue when resources stalled.
+
+
+def _make_refresh_session(
+    *,
+    tools: list[mcp_types.Tool],
+    resources_error: BaseException | None = None,
+    prompts_error: BaseException | None = None,
+) -> Any:
+    """A session whose ``list_tools`` succeeds, with optional injected
+    failures on the resources / prompts phases."""
+    session = MagicMock()
+    session.list_tools = AsyncMock(
+        return_value=mcp_types.ListToolsResult(tools=tools),
+    )
+
+    async def list_resources(
+        *, params: mcp_types.PaginatedRequestParams | None = None,
+    ) -> mcp_types.ListResourcesResult:
+        if resources_error is not None:
+            raise resources_error
+        return mcp_types.ListResourcesResult(resources=[])
+
+    async def list_prompts(
+        *, params: mcp_types.PaginatedRequestParams | None = None,
+    ) -> mcp_types.ListPromptsResult:
+        if prompts_error is not None:
+            raise prompts_error
+        return mcp_types.ListPromptsResult(prompts=[])
+
+    session.list_resources = AsyncMock(side_effect=list_resources)
+    session.list_resource_templates = AsyncMock(
+        return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[]),
+    )
+    session.list_prompts = AsyncMock(side_effect=list_prompts)
+    return session
+
+
+@pytest.mark.asyncio
+async def test_refresh_upstream_resources_stall_raises_and_leaves_catalogue() -> None:
+    """ROUTE-4: ``list_tools`` succeeds but ``list_resources`` raises a
+    transport stall (TimeoutError). ``refresh_upstream`` must RAISE (the
+    stall isn't a normal MethodNotFound the helper swallows) and must NOT
+    mutate the cached catalogue — no half-written tools-only state."""
+    upstream = make_upstream_definition(id="notion")
+    cm = UpstreamClientManager([upstream])
+    session = _make_refresh_session(
+        tools=[
+            mcp_types.Tool(
+                name="t1", description="d",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+        ],
+        resources_error=asyncio.TimeoutError(),
+    )
+    seed_shared_session(cm, "notion", session=session)
+    registry = ToolRegistry([upstream], cm)
+
+    # Pre-seed a known catalogue so we can prove it's untouched on failure.
+    pre_tools = list(registry.get_all_tools())
+    pre_resources = registry.get_resources_for_upstreams(["notion"])
+
+    with pytest.raises(asyncio.TimeoutError):
+        await registry.refresh_upstream("notion")
+
+    assert registry.get_all_tools() == pre_tools, (
+        "a stalled resources phase must not persist the tools it did fetch"
+    )
+    assert registry.get_resources_for_upstreams(["notion"]) == pre_resources
+
+
+@pytest.mark.asyncio
+async def test_refresh_upstream_phase_cancelled_reraises_and_leaves_catalogue() -> None:
+    """ROUTE-12: a discovery phase raising ``CancelledError`` (a
+    BaseException, gathered via ``return_exceptions=True``) must re-raise
+    out of ``refresh_upstream`` and leave the catalogue untouched — a
+    cancelled refresh is degraded, never a half-written catalogue."""
+    upstream = make_upstream_definition(id="notion")
+    cm = UpstreamClientManager([upstream])
+    session = _make_refresh_session(
+        tools=[
+            mcp_types.Tool(
+                name="t1", description="d",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+        ],
+        prompts_error=asyncio.CancelledError(),
+    )
+    seed_shared_session(cm, "notion", session=session)
+    registry = ToolRegistry([upstream], cm)
+    pre_tools = list(registry.get_all_tools())
+    pre_prompts = registry.get_prompts_for_upstreams(["notion"])
+
+    with pytest.raises(asyncio.CancelledError):
+        await registry.refresh_upstream("notion")
+
+    assert registry.get_all_tools() == pre_tools, (
+        "a cancelled phase must not persist a partial catalogue"
+    )
+    assert registry.get_prompts_for_upstreams(["notion"]) == pre_prompts

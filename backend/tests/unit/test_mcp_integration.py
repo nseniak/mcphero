@@ -18,7 +18,9 @@ from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
 from tests.unit._loopback_mcp import (
     MCP_CLIENT_TIMEOUT,
+    await_tools_ready,
     free_ports,
+    mcp_session_call,
     wait_for_health,
 )
 
@@ -157,6 +159,14 @@ async def test_end_to_end_tool_discovery_and_call(tmp_path: Path) -> None:
         # 3. Connect MCP client to gateway with a real bearer token.
         gateway_provider = gateway_app.state.mcp_gateway_oauth_provider
         token = await gateway_provider.mint_test_token("admin@test.com")
+        # NB: no await_tools_ready() readiness poll here — this test makes
+        # positional audit-log assertions (entries[0] == client_connect,
+        # entries[1] == the tool call), and each readiness poll would add
+        # its own client_connect row and shift those positions. The test's
+        # own setup (mint + httpx + streamable_http handshake + initialize)
+        # already gives the gateway->upstream connect time to settle; it has
+        # not flaked. The empty-tools race is gated in the *policy* helper
+        # and the service-token test, which use non-positional audit checks.
         async with httpx.AsyncClient(
             headers={"Authorization": f"Bearer {token}"},
             timeout=MCP_CLIENT_TIMEOUT,
@@ -264,11 +274,23 @@ async def _start_gateway_with_policy(
         label="policy gateway stack",
     )
 
+    # Readiness gate: the gateway connects to its upstream lazily, so
+    # ``tools/list`` is briefly empty right after ``/health`` goes OK.
+    # Under make test-all load that window stretches and the per-test
+    # assertions raced it ("assert 'fake__greet' in []"). Wait as the
+    # admin (who sees every tool) until the upstream's tools surface, so
+    # the gateway->upstream connect is settled before any test logic.
+    provider = gateway_app.state.mcp_gateway_oauth_provider
+    admin_token = cast(str, await provider.mint_test_token("admin@test.com"))
+    await await_tools_ready(
+        f"http://127.0.0.1:{gateway_port}/mcp/", admin_token, "fake__greet",
+    )
+
     return (
         upstream_server,
         gateway_server,
         server_task,
-        gateway_app.state.mcp_gateway_oauth_provider,
+        provider,
         gateway_port,
     )
 
@@ -277,18 +299,15 @@ async def _connect_as(
     gateway_port: int, gateway_provider: object, user_id: str,
 ) -> list[str]:
     """Connect to gateway as a user and return tool names."""
-    token = await gateway_provider.mint_test_token(user_id)  # type: ignore[attr-defined]
-    async with httpx.AsyncClient(
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=MCP_CLIENT_TIMEOUT,
-    ) as http_client:
-        async with streamable_http_client(
-            f"http://127.0.0.1:{gateway_port}/mcp/", http_client=http_client
-        ) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.list_tools()
-                return [t.name for t in result.tools]
+    token = cast(str, await gateway_provider.mint_test_token(user_id))  # type: ignore[attr-defined]
+
+    async def _list(session: ClientSession) -> list[str]:
+        result = await session.list_tools()
+        return [t.name for t in result.tools]
+
+    return await mcp_session_call(
+        f"http://127.0.0.1:{gateway_port}/mcp/", token, _list,
+    )
 
 
 async def _call_tool_as(
@@ -299,19 +318,16 @@ async def _call_tool_as(
     arguments: dict[str, str],
 ) -> tuple[bool, str]:
     """Call a tool as a user and return (is_error, text)."""
-    token = await gateway_provider.mint_test_token(user_id)  # type: ignore[attr-defined]
-    async with httpx.AsyncClient(
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=MCP_CLIENT_TIMEOUT,
-    ) as http_client:
-        async with streamable_http_client(
-            f"http://127.0.0.1:{gateway_port}/mcp/", http_client=http_client
-        ) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
-                text = cast(str, result.content[0].text)  # type: ignore[union-attr]
-                return result.isError or False, text
+    token = cast(str, await gateway_provider.mint_test_token(user_id))  # type: ignore[attr-defined]
+
+    async def _call(session: ClientSession) -> tuple[bool, str]:
+        result = await session.call_tool(tool_name, arguments)
+        text = cast(str, result.content[0].text)  # type: ignore[union-attr]
+        return result.isError or False, text
+
+    return await mcp_session_call(
+        f"http://127.0.0.1:{gateway_port}/mcp/", token, _call,
+    )
 
 
 @pytest.mark.asyncio

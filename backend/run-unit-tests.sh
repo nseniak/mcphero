@@ -86,8 +86,35 @@ if [ "$JOBS" != "1" ]; then
     PARALLEL_ARGS=(-n "$JOBS" --dist loadfile)
 fi
 
+# Rerun safety net for transient connection blips under load — the unit
+# leg's analogue of the e2e suite's Playwright ``retries``. OFF by
+# default (UNIT_RERUNS=0) so a standalone run stays deterministic and a
+# real flake is visible to whoever's debugging; ``make test-all`` sets
+# UNIT_RERUNS>0 (see run-all-tests.py) for the oversubscribed
+# cross-suite run, where a CPU-/Docker-VM-starved box intermittently
+# refuses or times out the connect to Redis (coredis), Mongo (pymongo),
+# or an in-process loopback server (httpx) — the exact analogue of the
+# e2e socket blips.
+#
+# Reruns are UNSCOPED (no ``--only-rerun``), matching the e2e leg's
+# retries exactly. An earlier scoped attempt was abandoned after
+# verifying ``--only-rerun`` matches only the OUTER exception's text:
+# these connection failures surface WRAPPED (anyio BrokenResourceError,
+# ExceptionGroup, pymongo TimeoutError), so scoping silently missed them.
+# The safety against masking a real bug is structural, not pattern-based:
+# (a) UNIT_RERUNS=0 standalone, so dev/debug runs never rerun; (b) the
+# deterministic logic flakes are fixed at the source (clock injection,
+# subscribe-ready, readiness gates), so reruns are not papering over a
+# logic race; (c) a deterministic failure still fails every attempt.
+RERUN_ARGS=()
+UNIT_RERUNS="${UNIT_RERUNS:-0}"
+if [ "$UNIT_RERUNS" != "0" ]; then
+    RERUN_ARGS=(--reruns "$UNIT_RERUNS" --reruns-delay 1)
+fi
+
 exec python -m pytest \
     "${PARALLEL_ARGS[@]+"${PARALLEL_ARGS[@]}"}" \
+    "${RERUN_ARGS[@]+"${RERUN_ARGS[@]}"}" \
     --junitxml="$JUNIT_OUT" \
     --json-report --json-report-file="$JSON_OUT" --json-report-omit=keywords,streams \
     "${PASSTHRU[@]+"${PASSTHRU[@]}"}"

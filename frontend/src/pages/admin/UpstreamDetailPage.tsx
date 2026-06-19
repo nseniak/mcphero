@@ -290,9 +290,12 @@ export function UpstreamDetailPage() {
 
   // Re-pull the live session's tool list on demand. The button is
   // gated on the upstream being active (below), and the backend
-  // refuses (409) rather than connecting. On failure the backend
-  // disconnects + records the error, so ``reload`` paints the red
-  // status + banner; on success it paints the fresh tool list.
+  // refuses (409) rather than connecting. The refresh is NON-BLOCKING:
+  // the POST returns immediately ("started") and the acquire+refresh
+  // runs in the background, so an E2B-pause stall can't time out the
+  // click (2026-06-18 incident). Completion — success OR a recorded
+  // error — arrives via ``policy_changed`` -> ``reload``, which repaints
+  // the fresh tool list or the red status + error banner.
   const handleRefreshTools = async () => {
     if (!id) return;
     setRefreshingTools(true);
@@ -300,8 +303,10 @@ export function UpstreamDetailPage() {
     let failureMessage: string | null = null;
     try {
       const res = await refreshUpstreamTools(id);
-      // Backend reports a failed refresh as connected=false + error
-      // (HTTP 200); a non-2xx (e.g. 409 not-active) throws below.
+      // Non-blocking refresh returns connected=true ("started"); the
+      // outcome lands later via policy_changed -> reload (badge/banner).
+      // This connected=false branch is a defensive fallback; a non-2xx
+      // (e.g. 409 not-active) still throws below into the popup path.
       if (!res.connected) {
         failureMessage = res.error ?? t("upstreamDetail.refreshFailed");
       }

@@ -7,9 +7,11 @@ assert path / contents / mode.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from mcpolis.adapters.sandbox_e2b import E2BSandboxService
+from mcpolis.adapters.sandbox_e2b import E2BSandboxService, E2BSDKError
 from mcpolis.domain.services.sandbox_service import (
     MaterializeFile,
     SandboxResources,
@@ -105,3 +107,63 @@ async def test_materialize_files_no_op_when_none() -> None:
     ):
         pass
     assert client.file_writes == []
+
+
+# ---------- SBX-9: materialize write failure (E2B) ----------
+
+
+@pytest.mark.asyncio
+async def test_sbx9_materialize_write_failure_aborts_session_with_sdk_message(
+) -> None:
+    """SBX-9 (P1): a ``write_file`` that raises an ``E2BSDKError`` during
+    materialization is FATAL — ``_materialize_files`` re-raises so
+    session creation fails with the SDK's raw message surfaced (it
+    reaches the dashboard's "Couldn't connect" line). The MCP process
+    must NOT have started. Pins service.py:1367-1381."""
+    client = make_mock_e2b_client()
+    service = E2BSandboxService(
+        client, mcpolis_instance="t", on_timeout_seconds=60,
+    )
+    upstream = make_upstream_definition(id="ups", command="npx")
+
+    sdk_message = "files.write failed: disk quota exceeded"
+
+    async def _raise_write(
+        _self: Any, *, path: str, contents: str, mode: int = 0o600, **_k: Any,
+    ) -> None:
+        del _self, path, contents, mode
+        raise E2BSDKError("E2BSDKError", sdk_message)
+
+    # Override write_file on the handle the next create returns. The mock
+    # builds a fresh MockE2BSandboxHandle per create; patch the class-level
+    # method so the one created inside session() raises.
+    from tests.unit.sandbox_e2b_mock import MockE2BSandboxHandle
+
+    original_write = MockE2BSandboxHandle.write_file
+    MockE2BSandboxHandle.write_file = _raise_write  # type: ignore[method-assign,assignment]
+    try:
+        with pytest.raises(E2BSDKError) as exc:
+            async with service.session(
+                session_id="s1",
+                org_id="acme",
+                upstream=upstream,
+                resources=_make_resources(),
+                denylist=(),
+                materialize_files=[
+                    MaterializeFile(
+                        name="cred", contents="body",
+                        target_path="/home/user/.config/cred.txt",
+                    ),
+                ],
+            ):
+                pass
+    finally:
+        MockE2BSandboxHandle.write_file = original_write  # type: ignore[method-assign,assignment]
+
+    assert sdk_message in exc.value.detail, (
+        f"the SDK message must surface to the caller; got {exc.value.detail!r}"
+    )
+    # The MCP command never ran — materialization aborted before exec.
+    assert client.commands == [], (
+        "run_command must not fire when materialization fails"
+    )

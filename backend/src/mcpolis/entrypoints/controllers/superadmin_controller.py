@@ -8,6 +8,7 @@ from mcp.types import ToolAnnotations
 
 from mcpolis.domain.ports.organization_repository import OrganizationRepository
 from mcpolis.domain.services.org_runtime import OrgRuntimeManager
+from mcpolis.domain.services.org_service import OrgService
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
@@ -18,11 +19,17 @@ DESTRUCTIVE = ToolAnnotations(destructiveHint=True, idempotentHint=False)
 def create_superadmin_mcp_server(
     org_repo: OrganizationRepository,
     runtime_manager: OrgRuntimeManager,
+    org_service: OrgService,
 ) -> FastMCP:
     """Create the instance-level superadmin MCP server (cloud mode only).
 
     Provides cross-org management tools. Auth is handled by the caller
     (email allowlist middleware in app.py).
+
+    Deletion routes through ``org_service.delete_organization`` — the
+    single complete path shared with the dashboard, so the two can't
+    drift on what they purge. ``org_repo`` / ``runtime_manager`` remain
+    for the read tools and the dry-run preview.
     """
     server = FastMCP(name="MCP Hero Superadmin", streamable_http_path="/")
 
@@ -121,12 +128,10 @@ def create_superadmin_mcp_server(
                 f"Pass confirm=true to proceed."
             )
 
-        # Tear down runtime (stops all connections)
-        await runtime_manager.teardown(org.id)
-
-        # Remove all memberships
-        for m in members:
-            await org_repo.remove_membership(org.id, m.email)
+        # Single complete delete path — tears down the runtime, removes
+        # the org doc + memberships + service tokens, and purges every
+        # org-scoped collection. Shared with the dashboard route.
+        await org_service.delete_organization(org.id)
 
         logger.info(
             "superadmin.organization.deleted",

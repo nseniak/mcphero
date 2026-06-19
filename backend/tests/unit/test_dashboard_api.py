@@ -9,9 +9,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from mcpolis.domain.services.upstream_connection_service import (
-    SessionUnavailable,
-)
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
 from tests.unit._dev_stub_login import login_as
@@ -459,14 +456,8 @@ def test_admin_reconnect_service_account_clears_disabled_marker(
     )
 
 
-# The refresh endpoint goes through one boundary —
-# ``acquire_and_refresh_with_recovery`` — which reattaches in-band (same
-# helper the tool router uses) and retries on a transport stall by
-# reconnecting on a fresh session. These mock that boundary.
-_RECOVERY = (
-    "mcpolis.entrypoints.routes.dashboard.upstream_admin"
-    ".acquire_and_refresh_with_recovery"
-)
+# Boundaries the refresh-endpoint tests mock. The refresh itself is
+# kicked off via ``refresh_tools_in_background`` (``_REFRESH_BG`` below).
 _IS_CONNECTED = (
     "mcpolis.adapters.upstream_clients.client_manager"
     ".UpstreamClientManager.is_connected"
@@ -478,6 +469,16 @@ _DISCONNECT = (
 _READINESS = (
     "mcpolis.entrypoints.routes.dashboard.upstream_admin"
     ".resolve_upstream_readiness"
+)
+# The refresh endpoint is non-blocking: it kicks off the acquire+refresh
+# in a background task (so an E2B-pause stall can't blow the request
+# budget — the 2026-06-18 incident) and returns immediately. Endpoint
+# tests patch this and invoke the captured on_success/on_error callbacks
+# to exercise the outcome glue deterministically (no bg-task timing); the
+# refresh logic itself is covered in test_refresh_tools_in_background.py.
+_REFRESH_BG = (
+    "mcpolis.entrypoints.routes.dashboard.upstream_admin"
+    ".refresh_tools_in_background"
 )
 
 
@@ -494,79 +495,59 @@ def test_admin_refresh_tools_409_when_not_active(tmp_path: Path) -> None:
     patched out in make_test_client, so github has no live session.
     """
     client = make_test_client(tmp_path)
-    with patch(_RECOVERY, new_callable=AsyncMock) as recovery:
+    with patch(_REFRESH_BG) as refresh_bg:
         resp = client.post("/api/admin/upstreams/github/refresh-tools")
     assert resp.status_code == 409, resp.text
-    recovery.assert_not_called()
+    refresh_bg.assert_not_called()
 
 
 def test_admin_refresh_tools_success(tmp_path: Path) -> None:
-    """An active upstream reattaches in-band then re-pulls its catalog,
-    staying connected. Regression: a DEFERRED_ATTACH service_account
-    upstream previously hit "No active session" and got its sandbox
-    killed — now it goes through the same acquire path a tool call uses.
-    """
+    """An active upstream returns immediately (refresh runs in the
+    background) and the success callback clears any prior error. The
+    endpoint is non-blocking so an E2B-pause stall can't time out the
+    click (2026-06-18 incident); the actual acquire+refresh is covered in
+    test_refresh_tools_in_background.py."""
+    import asyncio
+
     client = make_test_client(tmp_path)
     with patch(_IS_CONNECTED, return_value=True), patch(
         _DISCONNECT, new_callable=AsyncMock,
-    ) as disconnect, patch(
-        _RECOVERY, new_callable=AsyncMock,
-    ) as recovery:
+    ) as disconnect, patch(_REFRESH_BG) as refresh_bg:
         resp = client.post("/api/admin/upstreams/github/refresh-tools")
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["connected"] is True
     assert body["upstream_id"] == "github"
-    recovery.assert_awaited_once()
+    refresh_bg.assert_called_once()
     disconnect.assert_not_called()
-    # No error recorded on success.
+    # The captured success callback must clear any prior connection error.
+    asyncio.run(refresh_bg.call_args.kwargs["on_success"]())
     assert "error:github" not in _read_connections(tmp_path)
 
 
-def test_admin_refresh_tools_discovery_failure_records_error_no_disconnect(
+def test_admin_refresh_tools_failure_records_error_no_disconnect(
     tmp_path: Path,
 ) -> None:
-    """A session was acquired but tools/list failed: record the reason
-    (error banner + popup) without tearing the session down — killing a
-    warm sandbox or signing an OAuth admin out over a transient list
-    error would be worse than the error itself."""
+    """A background refresh failure records the reason (error banner +
+    popup) without tearing the session down — killing a warm sandbox or
+    signing an OAuth admin out over a transient error would be worse. The
+    endpoint returns 200 immediately; the error surfaces via the on_error
+    callback + connection-error state, not the HTTP response."""
+    import asyncio
+
     client = make_test_client(tmp_path)
     with patch(_IS_CONNECTED, return_value=True), patch(
-        _RECOVERY,
-        new_callable=AsyncMock,
-        side_effect=RuntimeError("list_tools blew up"),
-    ), patch(_DISCONNECT, new_callable=AsyncMock) as disconnect:
+        _DISCONNECT, new_callable=AsyncMock,
+    ) as disconnect, patch(_REFRESH_BG) as refresh_bg:
         resp = client.post("/api/admin/upstreams/github/refresh-tools")
     assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["connected"] is False
-    assert "list_tools blew up" in (body["error"] or "")
+    assert resp.json()["connected"] is True
+    # Drive the captured error callback as the background task would.
+    asyncio.run(refresh_bg.call_args.kwargs["on_error"]("list_tools blew up"))
     disconnect.assert_not_called()
     error_entry = _read_connections(tmp_path).get("error:github")
     assert isinstance(error_entry, dict)
     assert "list_tools blew up" in error_entry["error"]
-
-
-def test_admin_refresh_tools_reattach_failure_records_error(
-    tmp_path: Path,
-) -> None:
-    """When the session can't be reattached (SessionUnavailable), record
-    the reason — non-destructive, no disconnect."""
-    client = make_test_client(tmp_path)
-    with patch(_IS_CONNECTED, return_value=True), patch(
-        _RECOVERY,
-        new_callable=AsyncMock,
-        side_effect=SessionUnavailable("connect_failed"),
-    ), patch(_DISCONNECT, new_callable=AsyncMock) as disconnect:
-        resp = client.post("/api/admin/upstreams/github/refresh-tools")
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["connected"] is False
-    assert "connect_failed" in (body["error"] or "")
-    disconnect.assert_not_called()
-    error_entry = _read_connections(tmp_path).get("error:github")
-    assert isinstance(error_entry, dict)
-    assert "connect_failed" in error_entry["error"]
 
 
 def test_admin_refresh_tools_oauth_not_ready_409(tmp_path: Path) -> None:
@@ -582,17 +563,21 @@ def test_admin_refresh_tools_oauth_not_ready_409(tmp_path: Path) -> None:
 
 
 def test_admin_refresh_tools_oauth_ready_success(tmp_path: Path) -> None:
-    """A ready OAuth upstream refreshes via the shared acquire path."""
+    """A ready OAuth upstream returns immediately and kicks off the
+    background refresh (effective user = the slot owner)."""
     client = make_test_client(tmp_path)
     with patch(
         _READINESS,
         new_callable=AsyncMock,
         return_value=(True, "admin@example.com"),
-    ), patch(_RECOVERY, new_callable=AsyncMock) as recovery:
+    ), patch(_REFRESH_BG) as refresh_bg:
         resp = client.post("/api/admin/upstreams/mixpanel/refresh-tools")
     assert resp.status_code == 200, resp.text
     assert resp.json()["connected"] is True
-    recovery.assert_awaited_once()
+    refresh_bg.assert_called_once()
+    assert (
+        refresh_bg.call_args.kwargs["effective_user"] == "admin@example.com"
+    )
 
 
 def test_admin_connect_rejects_service_account(tmp_path: Path) -> None:

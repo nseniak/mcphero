@@ -102,3 +102,12 @@ class FileUpstreamConfigStore(UpstreamConfigStore):
         """Remove from both mcp.json and config.json."""
         await self._mcp_store.remove(org_id, upstream_id)
         await self._config_store.remove_upstream_options(org_id, upstream_id)
+
+    async def delete_all_for_org(self, org_id: str) -> None:
+        """Drop every upstream definition (org-deletion cascade). Clears
+        the mcp.json server block; the upstream options living in the
+        config doc are purged by ``ConfigRepository.delete_for_org``,
+        which shares the same ``config_store`` instance, so this method
+        deliberately does not touch config (it would over-delete roles
+        and users)."""
+        await self._mcp_store.clear(org_id)

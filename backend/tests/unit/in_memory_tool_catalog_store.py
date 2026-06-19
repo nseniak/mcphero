@@ -38,6 +38,10 @@ class InMemoryToolCatalogStore(ToolCatalogRepository):
     ) -> None:
         self._snapshots.pop((org_id, upstream_id), None)
 
+    async def delete_all_for_org(self, org_id: str) -> None:
+        for key in [k for k in self._snapshots if k[0] == org_id]:
+            del self._snapshots[key]
+
 
 def make_tool_catalog_store() -> InMemoryToolCatalogStore:
     return InMemoryToolCatalogStore()

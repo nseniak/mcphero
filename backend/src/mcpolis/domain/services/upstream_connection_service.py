@@ -253,6 +253,14 @@ MIN_TRANSIENT_FAILURE_WINDOW_SECONDS = 30 * 60
 # re-registers, rather than churning the same rejection every tick.
 _TERMINAL_AUTH_ERROR_CODES = ("invalid_grant", "invalid_client")
 
+# Step-3 connect cap for the gateway tool-call dead-token reconnect probe
+# (``settle_oauth_state_after_stall``). Tighter than the default 15s
+# reconnect budget: the dead-token case the probe targets fails fast, so
+# this only bounds the rare transient-unreachable case, where a
+# non-retry-safe caller would otherwise wait the full budget for an error
+# whose outcome is already decided.
+PROBE_RECONNECT_TIMEOUT = 8
+
 
 async def purge_user_oauth_state(
     connection_store: ConnectionStore,
@@ -1524,6 +1532,72 @@ async def heal_stalled_session(
     )
 
 
+async def settle_oauth_state_after_stall(
+    *,
+    org_id: str,
+    upstream: UpstreamDefinition,
+    effective_user: str,
+    connection_store: ConnectionStore | None,
+    client_manager: UpstreamClientManager,
+    server_url: str,
+) -> None:
+    """Run the dead-token reconnect probe a non-retry-safe stall can't.
+
+    A gateway tool call runs on a CACHED live OAuth session whose SDK
+    provider uses ``_noop_callback``. When the upstream revokes the bearer
+    the SDK's mid-call silent refresh fails and the transport goes silent,
+    so the dispatch sees a transport STALL (not the buried
+    ``SilentReconnectAuthRequired``). ``heal_stalled_session`` evicts the
+    dead session, but a NON-retry-safe verb (``max_attempts == 1``) never
+    reconnects — so §5.1's classify-and-delete (which only runs inside
+    ``reconnect_with_stored_tokens``) never fires, the stored token row
+    survives, and ``resolve_upstream_readiness`` keeps the dashboard
+    showing "Ready" though every call now fails with re-auth.
+
+    A retry-SAFE verb closes this gap for free: its retry's
+    ``_resolve_session`` reconnects (and classifies dead tokens) on the
+    next attempt. This helper gives the non-retry-safe path the SAME
+    reconnect probe — re-establishing the session on a transient stall, or
+    classifying-and-deleting on genuinely revoked tokens — without
+    re-running the (non-idempotent) op.
+
+    OAuth-only: ``service_account`` stalls already fresh-reconnect inside
+    ``heal_stalled_session``.
+    """
+    # Local import mirrors the existing deferral in this module to avoid a
+    # policy↔service cycle.
+    from mcpolis.domain.model.policy import AuthMode
+
+    if connection_store is None:
+        return
+    if upstream.auth.mode == AuthMode.service_account:
+        return
+    try:
+        await reconnect_with_stored_tokens(
+            org_id=org_id,
+            upstream=upstream,
+            effective_user=effective_user,
+            connection_store=connection_store,
+            client_manager=client_manager,
+            server_url=server_url,
+            # The dead-token case the probe targets fails FAST (the SDK
+            # falls into authorization_code grant immediately, no network
+            # wait), so the dashboard is settled before the failed call
+            # returns. A tighter-than-default timeout caps the rare
+            # transient-unreachable case so a non-retry-safe caller isn't
+            # made to wait the full default reconnect budget for an error
+            # whose outcome is already decided.
+            timeout=PROBE_RECONNECT_TIMEOUT,
+        )
+    except Exception:
+        logger.exception(
+            "upstream.dispatch.oauth_reconnect_probe_failed",
+            org_id=org_id,
+            upstream_id=upstream.id,
+            user=effective_user,
+        )
+
+
 async def acquire_and_refresh_with_recovery(
     *,
     org_id: str,
@@ -1590,6 +1664,98 @@ async def acquire_and_refresh_with_recovery(
     # Loop always returns or raises; this satisfies the type checker.
     assert last_exc is not None
     raise last_exc
+
+
+def recovery_effective_user(
+    client_manager: UpstreamClientManager,
+    upstream: UpstreamDefinition,
+) -> str:
+    """The ``effective_user`` an admin-MCP refresh should reattach under
+    when routed through ``acquire_and_refresh_with_recovery`` (R6).
+
+    ``acquire_and_refresh_with_recovery`` is identity-coupled (one
+    ``effective_user``) whereas admin discovery is identity-AGNOSTIC — it
+    reuses any user's live session. So:
+
+    - ``service_account`` → the shared session (``""``).
+    - OAuth → the user who actually OWNS the live discovery session,
+      which may NOT be the calling admin (``_ensure_oauth_session`` skips
+      establishing one when any user already has a session). A stall must
+      heal under that user to reconnect from the RIGHT stored tokens;
+      passing the caller would evict/reconnect the wrong identity.
+
+    Falls back to ``""`` when no per-user session exists — the recovery
+    then surfaces ``SessionUnavailable``, the same outcome a plain
+    refresh against a missing session would produce.
+    """
+    from mcpolis.domain.model.policy import AuthMode
+
+    if upstream.auth.mode == AuthMode.service_account:
+        return ""
+    return client_manager.first_user_with_session(upstream.id) or ""
+
+
+async def refresh_all_with_recovery(
+    *,
+    org_id: str,
+    connection_store: ConnectionStore | None,
+    client_manager: UpstreamClientManager,
+    tool_registry: ToolRegistry,
+    server_url: str,
+) -> None:
+    """``refresh_all`` with per-upstream transport-stall recovery (R6).
+
+    Like ``ToolRegistry.refresh_all`` it refreshes every currently-connected
+    upstream and tolerates per-upstream failures so one bad upstream doesn't
+    abort the sweep — but routes each refresh through
+    ``acquire_and_refresh_with_recovery`` so an E2B post-reattach stall heals
+    (fresh reconnect for service_account, per-user eviction for OAuth) and
+    retries instead of persisting a half-empty catalogue.
+
+    Runs the per-upstream refreshes CONCURRENTLY (review item 5), mirroring
+    ``reconnect_all_oauth_upstreams``: each upstream has its own session /
+    sandbox / per-upstream connect lock, so they don't contend, and the
+    admin-MCP caller blocks for the SLOWEST single upstream rather than the
+    SUM — bounding the worst case from N×2×(establish+timeout) to one. The
+    block is still intended: the ``refresh_upstream_tools`` tool's contract
+    is to report the discovered tool count synchronously (unlike the
+    dashboard's non-blocking refresh, c54c0b3), so it cannot be backgrounded.
+    A mid-sweep client cancellation leaves the already-completed upstreams
+    refreshed (each ``refresh_upstream`` writes through the catalog as it
+    finishes) and the rest stale — degraded, not corrupt; the admin re-runs.
+    """
+    async def _one(upstream_id: str) -> None:
+        upstream = client_manager.get_upstream(upstream_id)
+        if upstream is None:
+            return
+        try:
+            await acquire_and_refresh_with_recovery(
+                org_id=org_id,
+                upstream=upstream,
+                effective_user=recovery_effective_user(
+                    client_manager, upstream,
+                ),
+                connection_store=connection_store,
+                client_manager=client_manager,
+                tool_registry=tool_registry,
+                server_url=server_url,
+            )
+        except Exception:
+            logger.exception(
+                "tool.registry.refresh.failed",
+                org_id=org_id,
+                upstream_id=upstream_id,
+            )
+
+    tasks = [
+        _one(upstream_id)
+        for upstream_id in list(client_manager.connected_upstream_ids)
+    ]
+    if tasks:
+        # return_exceptions=True belt-and-braces — ``_one`` already swallows
+        # its own failures, but this guarantees one surprising raise can't
+        # cancel the sibling refreshes mid-flight.
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # Minimum time the "Fetching info" pill stays on screen after a connect.
@@ -1690,6 +1856,83 @@ async def connect_and_refresh_tools(
         # mark again.
         tool_registry.unmark_refreshing(upstream.id)
     return result
+
+
+def refresh_tools_in_background(
+    *,
+    org_id: str,
+    upstream: UpstreamDefinition,
+    effective_user: str,
+    connection_store: ConnectionStore | None,
+    client_manager: UpstreamClientManager,
+    tool_registry: ToolRegistry,
+    server_url: str,
+    on_success: Callable[[], Awaitable[None]] | None = None,
+    on_error: Callable[[str], Awaitable[None]] | None = None,
+) -> "asyncio.Task[None]":
+    """Run a tool-catalog refresh off the request path; return at once.
+
+    The dashboard refresh endpoint used to ``await`` the full
+    acquire+refresh synchronously. After an E2B auto-pause that path can
+    stall ~15s and recover by reconnecting on a fresh session, blowing the
+    request's budget — so the operator saw a ``TimeoutError`` for a
+    refresh that actually completed seconds later in the background (prod
+    incident 2026-06-18). This decouples the two:
+
+    - ``mark_refreshing`` flips synchronously (before this returns), so the
+      very next ``GET /api/admin/upstreams`` shows the "Fetching info" pill;
+    - the slow acquire+refresh+recovery runs in a task;
+    - completion is surfaced via the pill clearing + ``tools/list_changed``
+      + the per-upstream connection-error state — NOT via the HTTP
+      response, which returns immediately.
+
+    ``on_success`` / ``on_error`` (async) let the caller record the outcome
+    (clear/set connection error, audit log, policy broadcast); they run
+    AFTER the refreshing flag clears. Returns the spawned task so callers
+    (and tests) can await it; the endpoint ignores it. Mirrors
+    :func:`connect_and_refresh_tools`' mark-then-background structure.
+    """
+    tool_registry.mark_refreshing(upstream.id)
+
+    async def _bg() -> None:
+        started_at = tool_registry.refreshing_started_at(upstream.id)
+        error_msg: str | None = None
+        try:
+            await acquire_and_refresh_with_recovery(
+                org_id=org_id,
+                upstream=upstream,
+                effective_user=effective_user,
+                connection_store=connection_store,
+                client_manager=client_manager,
+                tool_registry=tool_registry,
+                server_url=server_url,
+            )
+        except SessionUnavailable as exc:
+            error_msg = f"could not reattach session: {exc.reason}"
+        except Exception as exc:  # noqa: BLE001
+            error_msg = str(exc) or exc.__class__.__name__
+        finally:
+            # Keep the pill on screen for the floor duration even if the
+            # refresh was fast or failed fast — same as the connect path.
+            if started_at is not None:
+                remaining = (
+                    _MIN_REFRESHING_DISPLAY_SECONDS
+                    - (time.monotonic() - started_at)
+                )
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+            tool_registry.unmark_refreshing(upstream.id)
+        if error_msg is not None:
+            logger.warning(
+                "upstream.refresh.background_failed",
+                upstream_id=upstream.id, org_id=org_id, error=error_msg,
+            )
+            if on_error is not None:
+                await on_error(error_msg)
+        elif on_success is not None:
+            await on_success()
+
+    return asyncio.create_task(_bg())
 
 
 async def reconnect_all_oauth_upstreams(

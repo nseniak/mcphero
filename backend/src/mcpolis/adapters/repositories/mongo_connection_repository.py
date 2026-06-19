@@ -242,6 +242,12 @@ class MongoConnectionRepository(ConnectionStore, ConnectionRepository):
             count += 1
         return count
 
+    async def delete_all_for_org(self, org_id: str) -> int:
+        # Org deletion is terminal — drop every row for this tenant.
+        # ``OrgScopedCollection`` forces ``org_id`` into the filter, so
+        # an empty filter can only ever match this org's documents.
+        return await self._coll.delete_many(org_id, {})
+
     async def get_all_stored_tokens(
         self, org_id: str
     ) -> list[tuple[str, str]]:

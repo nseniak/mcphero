@@ -10,6 +10,7 @@ that early return on ``shared_task.is_transport_alive()``.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 
 import pytest
@@ -97,4 +98,52 @@ async def test_ensure_shared_connected_reconnects_a_dead_session() -> None:
     assert calls == ["everything2"], (
         "a session whose transport has fatally died must be reconnected "
         "(connect_shared), not reused as a zombie"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_and_reconnect_fresh_race_to_one_connect() -> None:
+    """R1 cross-pool (review item 3): a heal holding the shared-connect lock
+    mid-connect, racing a concurrent lazy ``ensure_shared_connected``, must
+    yield exactly ONE ``connect_shared`` — the ensure blocks on the lock and
+    then reuses the heal's fresh session via the double-check, instead of
+    opening a second sandbox (two sandboxes, one orphaned, + a ref race)."""
+    upstream = make_upstream_definition(id="everything2")
+    mgr = UpstreamClientManager(upstreams=[upstream])
+
+    calls = 0
+    gate = asyncio.Event()
+
+    async def gated_connect(up: UpstreamDefinition, *_a: Any, **_k: Any) -> None:
+        nonlocal calls
+        calls += 1
+        await gate.wait()
+        # Install a live shared session, as the real connect_shared would.
+        mgr.transition_to_live_shared(
+            up.id,
+            session=cast(Any, object()),
+            task=cast(Any, _FakeTask(alive=True)),
+            server_info=ServerInfo(name="srv", version="1"),
+            self_description=UpstreamSelfDescription(name="srv", version="1"),
+        )
+
+    mgr.connect_shared = gated_connect  # type: ignore[method-assign]
+
+    # Heal: acquires the shared-connect lock, enters gated_connect, blocks on
+    # the gate (still holding the lock).
+    heal = asyncio.create_task(mgr.reconnect_shared_fresh(upstream))
+    await asyncio.sleep(0.05)
+    assert calls == 1
+
+    # Concurrent lazy acquire arrives while the heal holds the lock.
+    ensure = asyncio.create_task(mgr.ensure_shared_connected(upstream))
+    await asyncio.sleep(0.05)
+    assert calls == 1, "the ensure must block on the lock, not connect in parallel"
+
+    gate.set()  # heal finishes: installs the live session, releases the lock
+    await asyncio.gather(heal, ensure)
+
+    assert calls == 1, (
+        "ensure must reuse the heal's fresh session via the double-check, "
+        "not open a second sandbox"
     )

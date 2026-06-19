@@ -258,14 +258,34 @@ sleep 1
 
 # --- Start backend ----------------------------------------------------
 
+# Launch a long-lived dev daemon fully detached from this script: its
+# own session, std fds pinned to a log file, stdin from /dev/null.
+#
+# Why a NEW SESSION and not just ``nohup ... &``: otherwise the daemon
+# stays in this script's process group, so (a) capturing or piping this
+# script's output (``bash start.sh | tail``) hangs until the daemon dies
+# instead of EOF-ing when the script exits, and (b) a process-group kill
+# of the launcher (e.g. an agent harness stopping the task) takes the
+# daemon down with it. macOS ships no setsid(1); fall back to perl's
+# POSIX::setsid. Run from the cwd you want the daemon to inherit.
+start_detached() {
+    local log="$1"; shift
+    if command -v setsid > /dev/null 2>&1; then
+        setsid "$@" > "$log" 2>&1 < /dev/null &
+    else
+        perl -e 'use POSIX qw(setsid); open(STDIN, "<", "/dev/null"); open(STDOUT, ">", $ARGV[0]) or die "open: $!"; open(STDERR, ">&", STDOUT); setsid(); shift @ARGV; exec { $ARGV[0] } @ARGV or die "exec: $!"' "$log" "$@" &
+    fi
+    disown 2> /dev/null || true
+}
+
 echo "Starting backend in $MODE mode..."
-(cd backend && nohup python -m mcpolis > /tmp/mcpolis-backend.log 2>&1 &)
+(cd backend && start_detached /tmp/mcpolis-backend.log python -m mcpolis)
 echo "Backend started (log: /tmp/mcpolis-backend.log)"
 
 # --- Start frontend if not running ------------------------------------
 
 if ! curl -s http://localhost:5173 -o /dev/null -w '' 2>/dev/null; then
-    (cd frontend && nohup npm run dev > /tmp/mcpolis-frontend.log 2>&1 &)
+    (cd frontend && start_detached /tmp/mcpolis-frontend.log npm run dev)
     echo "Frontend started (log: /tmp/mcpolis-frontend.log)"
 else
     echo "Frontend already running"

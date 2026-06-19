@@ -50,6 +50,12 @@ class FileConfigStore:
         async with self._lock:
             self._write(config)
 
+    async def delete_for_org(self, org_id: str) -> None:
+        # Single-org file store (standalone): the config file holds only
+        # this org, so removing it IS the per-org purge. Idempotent.
+        async with self._lock:
+            self._path.unlink(missing_ok=True)
+
     def ensure_defaults_sync(self, org_id: str) -> SettingsConfig:
         """Synchronous version for use during app startup (no event loop)."""
         config = self._read()

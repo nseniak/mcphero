@@ -12,6 +12,9 @@ fully mocked and runs offline.
 from __future__ import annotations
 
 import asyncio
+import gc
+import time
+import tracemalloc
 from datetime import UTC, datetime
 from io import StringIO
 from typing import Any, cast
@@ -169,6 +172,19 @@ def test_capabilities_hide_disk_grid() -> None:
     # E2B enforces the picked CPU/RAM (template-backed), so the admin
     # UI keeps the resource picker live.
     assert caps.enforces_resources is True
+
+
+def test_sandbox_home_is_fixed_home_user() -> None:
+    """E2B containers run as the stock SDK user (``user``) with
+    ``HOME=/home/user``, fixed regardless of session — so ``${HOME}``
+    resolves there. Guarded against template drift by
+    ``test_e2b_template_home_consistency.py``."""
+    service, _ = make_e2b_service()
+    assert service.sandbox_home(session_id="anything") == "/home/user"
+    assert (
+        service.sandbox_home(session_id="other")
+        == service.sandbox_home(session_id="anything")
+    )
 
 
 def test_validate_resources_rejects_non_zero_disk() -> None:
@@ -2105,3 +2121,686 @@ async def test_start_docker_daemon_stops_engine_before_manual_launch() -> None:
     assert "launch" in handle.calls
     assert handle.calls.index("stop_engine") < handle.calls.index("launch")
     assert handle.calls[-1] == "chmod"
+
+
+# =====================================================================
+# SANDBOX guardrail tier (SBX-*) — reattach / docker-daemon / fail-fast
+# / map_exit / resolver robustness. Fully mocked, no real E2B.
+# =====================================================================
+
+
+async def _send_dummy_tool_call(write_stream: Any) -> None:
+    """Push a single JSON-RPC ``tools/call`` through the write stream
+    so the stdin pump runs one iteration (the reattach-or-send path)."""
+    from mcp import types as mcp_types
+    from mcp.shared.message import SessionMessage
+
+    await write_stream.send(SessionMessage(
+        message=mcp_types.JSONRPCMessage.model_validate({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "noop", "arguments": {}},
+        }),
+    ))
+
+
+async def _drive_reattach(
+    service: E2BSandboxService,
+    mock: MockE2BClient,
+    session_id: str,
+    write_stream: Any,
+) -> tuple[MockE2BProcessHandle, MockE2BProcessHandle]:
+    """Force the stdin_pump reattach branch: kill the streaming RPC via
+    ``simulate_exit``, send one tool call, and wait for ``connect_command``
+    to fire. Returns ``(original_process, new_process)``."""
+    live_handle = cast(
+        MockE2BSandboxHandle,
+        service._live_sandboxes[session_id],  # type: ignore[reportPrivateUsage]
+    )
+    original = live_handle.last_process
+    assert original is not None
+    original.simulate_exit(0)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await _send_dummy_tool_call(write_stream)
+    for _ in range(50):
+        if mock.connect_commands:
+            break
+        await asyncio.sleep(0.01)
+    # Let the pump finish the set_timeout + send after reattach.
+    for _ in range(20):
+        await asyncio.sleep(0)
+    new = live_handle.last_process
+    assert new is not None
+    return original, new
+
+
+# ---------- SBX-1: set_timeout re-applied after reattach ----------
+
+
+@pytest.mark.asyncio
+async def test_sbx1_set_timeout_reapplied_after_stdin_pump_reattach() -> None:
+    """SBX-1 (P0): the stdin_pump reattach path
+    (``connect_command(pid)`` after auto-pause severs the streaming RPC)
+    MUST re-apply ``set_timeout(on_timeout_seconds)`` — E2B's auto_resume
+    resets the idle timer to its 300s default, so without this the cost
+    knob silently drifts. Pins the defense at service.py:603-622."""
+    service, mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="sbx1-pump", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        await _drive_reattach(service, mock, "sbx1-pump", session.write_stream)
+    # on_timeout_seconds=60 from make_e2b_service — re-applied exactly once
+    # after reattach.
+    assert [t.timeout_seconds for t in mock.set_timeouts] == [60], (
+        f"reattach must re-apply set_timeout(60); got {mock.set_timeouts}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sbx1_set_timeout_reapplied_in_try_reconnect_path() -> None:
+    """SBX-1 sibling: the boot ``_try_reconnect`` path
+    (service.py:951) must also re-apply ``set_timeout`` after a
+    successful ``connect_sandbox`` — the reconnect implicitly sets the
+    SDK 300s default on auto_resume."""
+    persistence = InMemorySandboxPersistenceRepository()
+    upstream = make_upstream_definition(id="ups-reconnect", command="npx")
+    service, mock = make_e2b_service(persistence=persistence)
+    service._reuse_sandboxes_on_restart = True  # type: ignore[reportPrivateUsage]
+    # Warmup session writes a live ref; preserve so it survives for the
+    # reconnect attempt below.
+    async with service.session(
+        session_id="warmup", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ):
+        service.mark_session_preserve_on_close("warmup")
+    timeouts_before = len(mock.set_timeouts)
+    # Second session reconnects to the live ref → set_timeout re-applied.
+    async with service.session(
+        session_id="reconnect", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ):
+        service.mark_session_preserve_on_close("reconnect")
+    new_timeouts = mock.set_timeouts[timeouts_before:]
+    assert any(t.timeout_seconds == 60 for t in new_timeouts), (
+        f"_try_reconnect must re-apply set_timeout(60); "
+        f"new set_timeouts={new_timeouts}"
+    )
+
+
+# ---------- SBX-2: set_timeout failure after reattach swallowed ----------
+
+
+@pytest.mark.asyncio
+async def test_sbx2_set_timeout_failure_after_reattach_is_swallowed() -> None:
+    """SBX-2 (P1): a ``set_timeout`` that raises after reattach is
+    best-effort — it only costs extra running time, so the pump logs
+    ``reattach.set_timeout_failed`` and keeps the session usable
+    (stdin still delivered to the new handle). Pins service.py:612-622."""
+    from structlog.testing import capture_logs
+
+    service, mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="sbx2", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        live_handle = cast(
+            MockE2BSandboxHandle,
+            service._live_sandboxes["sbx2"],  # type: ignore[reportPrivateUsage]
+        )
+
+        async def _boom_set_timeout(timeout_seconds: int) -> None:
+            del timeout_seconds
+            raise E2BSDKError("E2BSDKError", "set_timeout boom")
+
+        live_handle.set_timeout = _boom_set_timeout  # type: ignore[method-assign,assignment]
+        with capture_logs() as logs:
+            original, new = await _drive_reattach(
+                service, mock, "sbx2", session.write_stream,
+            )
+        # Session is still usable: stdin reached the reattached handle,
+        # not the dead original.
+        for _ in range(50):
+            if new.stdin_buffer:
+                break
+            await asyncio.sleep(0.01)
+        assert new is not original
+        assert new.stdin_buffer, "stdin must reach the reattached handle"
+        # Transport NOT failed — set_timeout failure is non-fatal.
+        assert session.transport_failed is not None
+        assert not session.transport_failed.is_set()
+    events = [le.get("event") for le in logs]
+    assert "sandbox.e2b.reattach.set_timeout_failed" in events, (
+        f"set_timeout failure must log reattach.set_timeout_failed; "
+        f"got {events}"
+    )
+
+
+# ---------- SBX-3: reattach succeeds then send fails ----------
+
+
+@pytest.mark.asyncio
+async def test_sbx3_reattach_ok_then_send_fails_fails_transport() -> None:
+    """SBX-3 (P1): reattach via ``connect_command`` succeeds but the
+    very next ``send_stdin`` raises (sandbox died between reattach and
+    send). The pump must ``_fail_transport`` — close the read side and
+    set ``transport_failed`` — so the in-flight tool call fails fast
+    instead of hanging. Pins service.py:663-674 reached via the
+    post-reattach send."""
+    service, mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="sbx3", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        live_handle = cast(
+            MockE2BSandboxHandle,
+            service._live_sandboxes["sbx3"],  # type: ignore[reportPrivateUsage]
+        )
+        original = live_handle.last_process
+        assert original is not None
+        original_connect = live_handle.connect_command
+
+        async def _connect_then_doomed(
+            *, pid: int, on_stdout: Any, on_stderr: Any,
+        ) -> MockE2BProcessHandle:
+            handle = cast(MockE2BProcessHandle, await original_connect(
+                pid=pid, on_stdout=on_stdout, on_stderr=on_stderr,
+            ))
+            # The reattached handle's first send fails — sandbox gone.
+            handle.stdin_send_error = E2BSDKError(
+                "E2BNotFoundError", "sandbox sbx-0 not found",
+            )
+            return handle
+
+        live_handle.connect_command = _connect_then_doomed  # type: ignore[method-assign,assignment]
+
+        original.simulate_exit(0)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await _send_dummy_tool_call(session.write_stream)
+
+        with pytest.raises(anyio.EndOfStream):
+            await asyncio.wait_for(session.read_stream.receive(), timeout=2.0)
+        assert mock.connect_commands, "reattach must have succeeded first"
+        assert session.transport_failed is not None
+        assert session.transport_failed.is_set()
+
+
+# ---------- SBX-4: old_process.release() failure during reattach ----------
+
+
+@pytest.mark.asyncio
+async def test_sbx4_old_handle_release_failure_does_not_break_reattach() -> None:
+    """SBX-4 (P2): tearing down the OLD streaming handle via
+    ``release()`` after a successful reattach is best-effort. A raise
+    there must NOT break the reattach — stdin still reaches the new
+    handle and the transport stays alive. Pins service.py:644-654."""
+    service, mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="sbx4", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        live_handle = cast(
+            MockE2BSandboxHandle,
+            service._live_sandboxes["sbx4"],  # type: ignore[reportPrivateUsage]
+        )
+        original = live_handle.last_process
+        assert original is not None
+
+        async def _boom_release() -> None:
+            raise E2BSDKError("E2BSDKError", "release boom")
+
+        original.release = _boom_release  # type: ignore[method-assign,assignment]
+
+        original.simulate_exit(0)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await _send_dummy_tool_call(session.write_stream)
+        for _ in range(50):
+            if mock.connect_commands:
+                break
+            await asyncio.sleep(0.01)
+        new = live_handle.last_process
+        assert new is not None and new is not original
+        for _ in range(50):
+            if new.stdin_buffer:
+                break
+            await asyncio.sleep(0.01)
+        assert new.stdin_buffer, "stdin must reach the reattached handle"
+        assert session.transport_failed is not None
+        assert not session.transport_failed.is_set()
+
+
+# ---------- SBX-5: _start_docker_daemon TimeoutError + log capture -------
+
+
+class _NeverReadyDaemonHandle:
+    """Full ``_start_docker_daemon`` stand-in where the daemon never
+    stabilizes. ``docker info`` always fails, pending probe says "no
+    boot daemon" (manual launch path), and ``cat /tmp/dockerd.log``
+    streams a scripted error back through ``on_stdout`` so the test can
+    assert the raised ``TimeoutError`` carries that log text."""
+
+    def __init__(self, *, dockerd_log: str) -> None:
+        self._dockerd_log = dockerd_log
+        self.calls: list[str] = []
+
+    def _classify(self, argv: list[str]) -> str:
+        joined = " ".join(argv)
+        if argv[:2] == ["docker", "info"]:
+            return "info"
+        if "pgrep -x dockerd" in joined:
+            return "pending_probe"
+        if "systemctl stop" in joined:
+            return "stop_engine"
+        if "nohup sudo dockerd" in joined:
+            return "launch"
+        if argv[:2] == ["sudo", "chmod"]:
+            return "chmod"
+        if "[ -S /var/run/docker.sock ]" in joined:
+            return "chmod_early"
+        if argv[:1] == ["cat"]:
+            return "read_log"
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    async def run_command(
+        self,
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        on_stdout: Callable[[bytes], Awaitable[None] | None],
+        on_stderr: Callable[[bytes], Awaitable[None] | None],
+    ) -> _ScriptedDockerProc:
+        label = self._classify(argv)
+        self.calls.append(label)
+        if label == "read_log":
+            result = on_stdout(self._dockerd_log.encode("utf-8"))
+            if asyncio.iscoroutine(result):
+                await result
+            return _ScriptedDockerProc(0)
+        if label == "info":
+            return _ScriptedDockerProc(1)  # never ready
+        if label == "pending_probe":
+            return _ScriptedDockerProc(1)  # no boot daemon → manual launch
+        return _ScriptedDockerProc(0)
+
+
+@pytest.mark.asyncio
+async def test_sbx5_start_docker_daemon_raises_timeout_with_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SBX-5 (P1): when the daemon never stabilizes, the FULL
+    ``_start_docker_daemon`` flow (not just the isolated poll helper)
+    must read ``/tmp/dockerd.log`` and raise ``TimeoutError`` carrying
+    that log text so the operator can diagnose. Pins service.py:1231-1257.
+    The poll budget is shrunk so the test runs fast."""
+    service, _client = make_e2b_service()
+    # Shrink the poll budget so the never-ready path exits quickly.
+    monkeypatch.setattr(
+        E2BSandboxService._poll_docker_ready,  # type: ignore[reportPrivateUsage]
+        "__kwdefaults__",
+        {"max_polls": 2, "poll_interval": 0.0, "required_consecutive": 3},
+    )
+    handle = _NeverReadyDaemonHandle(
+        dockerd_log="failed to start daemon: flock timeout on metadata.db",
+    )
+    with pytest.raises(TimeoutError) as exc:
+        await service._start_docker_daemon(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, handle),
+        )
+    msg = str(exc.value)
+    assert "did not become ready" in msg
+    assert "flock timeout on metadata.db" in msg, (
+        f"TimeoutError must carry the /tmp/dockerd.log text; got {msg!r}"
+    )
+    assert "read_log" in handle.calls, "the dockerd log must be read"
+
+
+@pytest.mark.asyncio
+async def test_sbx5_start_docker_daemon_empty_log_renders_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SBX-5 sibling: an empty dockerd log still raises TimeoutError
+    with an ``(empty)`` placeholder rather than a blank tail."""
+    service, _client = make_e2b_service()
+    monkeypatch.setattr(
+        E2BSandboxService._poll_docker_ready,  # type: ignore[reportPrivateUsage]
+        "__kwdefaults__",
+        {"max_polls": 2, "poll_interval": 0.0, "required_consecutive": 3},
+    )
+    handle = _NeverReadyDaemonHandle(dockerd_log="")
+    with pytest.raises(TimeoutError) as exc:
+        await service._start_docker_daemon(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, handle),
+        )
+    assert "(empty)" in str(exc.value)
+
+
+# ---------- SBX-6: connect_command slow-fail → fresh-create fallback -----
+
+
+@pytest.mark.asyncio
+async def test_sbx6_try_reconnect_slow_fail_kills_and_fresh_creates() -> None:
+    """SBX-6 (P1): in ``_try_reconnect`` a ``connect_command`` that
+    raises the timeout-shaped ``E2BSDKError`` (envd port wedged after
+    auto_resume) must kill the stale sandbox and fall through to a
+    fresh create. Pins service.py:965-996."""
+    persistence = InMemorySandboxPersistenceRepository()
+    upstream = make_upstream_definition(id="ups-slow", command="npx")
+    service, mock = make_e2b_service(persistence=persistence)
+    service._reuse_sandboxes_on_restart = True  # type: ignore[reportPrivateUsage]
+    async with service.session(
+        session_id="warmup", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ):
+        service.mark_session_preserve_on_close("warmup")
+    ref = await persistence.get(org_id="acme", upstream_id="ups-slow")
+    assert ref is not None and ref.sandbox_id is not None
+    alive_sandbox_id = ref.sandbox_id
+
+    creates_before = len(mock.creates)
+    kills_before = len(mock.kills)
+    original_connect = mock.connect_sandbox
+
+    async def _connect_with_wedged_pid(snapshot_id: str):  # type: ignore[no-untyped-def]
+        handle = await original_connect(snapshot_id)
+
+        async def _timeout_connect_command(
+            *, pid: int, **_kwargs: Any,
+        ) -> None:
+            del pid
+            # Same shape real_client.connect_command raises when the
+            # 10s wait_for cap trips on a wedged envd port.
+            raise E2BSDKError(
+                "TimeoutException",
+                "commands.connect did not establish within 10s "
+                "(envd port not open after resume)",
+            )
+
+        handle.connect_command = _timeout_connect_command  # type: ignore[method-assign,assignment]
+        return handle
+
+    mock.connect_sandbox = _connect_with_wedged_pid  # type: ignore[method-assign,assignment]
+
+    async with service.session(
+        session_id="slow-recovery", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ):
+        service.mark_session_preserve_on_close("slow-recovery")
+
+    # _kill_stale_sandbox fired (the reconnect handle was killed) and a
+    # fresh sandbox was created.
+    assert len(mock.kills) > kills_before, (
+        f"the stale sandbox must be killed after the slow connect_command "
+        f"failure; kills={mock.kills}"
+    )
+    assert len(mock.creates) == creates_before + 1, (
+        f"expected one fresh-create after the slow-fail; creates={mock.creates}"
+    )
+    ref_after = await persistence.get(org_id="acme", upstream_id="ups-slow")
+    assert ref_after is not None and ref_after.sandbox_id is not None
+    assert ref_after.sandbox_id != alive_sandbox_id
+
+
+# ---------- SBX-7 [BUG?]: oversized / chatty non-JSON stdout (E2B) -------
+
+
+@pytest.mark.asyncio
+async def test_sbx7_e2b_no_newline_stream_buffer_is_bounded() -> None:
+    """[BUG?] SBX-7 (P1): a stdout stream that NEVER emits a newline must
+    not be retained in memory unbounded. ``on_stdout`` keeps the whole
+    accumulated stream in ``stdout_buffer[0]`` (``split('\\n')`` leaves it
+    as the leftover), so 16 MiB of newline-free output is held verbatim
+    while errlog stays empty.
+
+    Pinned via tracemalloc RETENTION, not errlog size: a trailing-newline
+    variant would assert on the flushed line, which an errlog-only cap
+    would satisfy while leaving the in-memory DoS in place (and falsely
+    flipping this guardrail green). This asserts the contract the bug
+    actually violates — bounded in-memory retention."""
+    service, mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    errlog = StringIO()
+    fed = 16 * 1024 * 1024
+    chunk = b"x" * (1024 * 1024)  # 1 MiB, NO newline ever
+    sane_retained = 4 * 1024 * 1024  # 4 MiB: 4x below the fed size
+    async with service.session(
+        session_id="sbx7", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(), errlog=errlog,
+    ) as session:
+        read_stream = session.read_stream
+
+        async def drain() -> None:
+            async with read_stream:
+                async for item in read_stream:
+                    del item
+
+        drain_task = asyncio.create_task(drain())
+        on_stdout = mock.last_on_stdout
+        assert on_stdout is not None
+        gc.collect()
+        tracemalloc.start()
+        base, _ = tracemalloc.get_traced_memory()
+        for _ in range(fed // len(chunk)):
+            result = on_stdout(chunk)
+            if asyncio.iscoroutine(result):
+                await result
+        gc.collect()
+        current, _ = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        drain_task.cancel()
+    retained = current - base
+    # No complete line ever arrived, so the flushed-line (errlog) path is
+    # not what's under test; assert it stayed bounded too, then pin the
+    # real contract: the in-memory leftover buffer must be bounded.
+    assert len(errlog.getvalue()) <= sane_retained
+    assert retained <= sane_retained, (
+        f"no-newline stdout retained {retained} bytes in memory "
+        f"(fed {fed}); the leftover buffer is unbounded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sbx7_e2b_chatty_npm_warn_lines_route_to_errlog() -> None:
+    """SBX-7 (P1) — chatty path: 10k newline-framed npm-warn lines are
+    each non-JSON and must all route to errlog (none silently dropped).
+    This branch is well-behaved (newline-framed → bounded per line), so
+    it passes; it documents the no-bug half of the spec."""
+    service, mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    errlog = StringIO()
+    async with service.session(
+        session_id="sbx7-chatty", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(), errlog=errlog,
+    ) as session:
+        read_stream = session.read_stream
+
+        async def drain() -> None:
+            async with read_stream:
+                async for item in read_stream:
+                    del item
+
+        drain_task = asyncio.create_task(drain())
+        on_stdout = mock.last_on_stdout
+        assert on_stdout is not None
+        n = 10_000
+        payload = "".join(
+            f"npm warn deprecated pkg-{i}@1.0.0\n" for i in range(n)
+        ).encode("utf-8")
+        result = on_stdout(payload)
+        if asyncio.iscoroutine(result):
+            await result
+        try:
+            await asyncio.wait_for(drain_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            drain_task.cancel()
+    captured = errlog.getvalue()
+    assert captured.count("npm warn deprecated") == n, (
+        f"all {n} chatty lines must route to errlog; "
+        f"got {captured.count('npm warn deprecated')}"
+    )
+
+
+# ---------- SBX-8: bogus-command fail-fast through _session_cm -----------
+
+
+@pytest.mark.asyncio
+async def test_sbx8_bogus_command_exit_during_init_fast_fails() -> None:
+    """SBX-8 (P1): when the MCP process exits during init (E2B mock
+    ``simulate_exit(127)``: command-not-found), the
+    ``init_with_exit_race`` against the session's ``exit_signal`` must
+    raise ``SubprocessExitedDuringInit`` with code 127 + the stderr
+    tail — within the fast budget, not the full 120s INIT_TIMEOUT.
+    Drives the E2B session's exit_signal end-to-end."""
+    from mcpolis.adapters.upstream_clients.stdio_adapter import (
+        SubprocessExitedDuringInit,
+        init_with_exit_race,
+    )
+
+    service, mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-bogus", command="npx")
+    async with service.session(
+        session_id="sbx8", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        live_handle = cast(
+            MockE2BSandboxHandle,
+            service._live_sandboxes["sbx8"],  # type: ignore[reportPrivateUsage]
+        )
+        process = live_handle.last_process
+        assert process is not None
+        # Emit a stderr tail, then exit 127 (bash command-not-found).
+        cb = mock.last_on_stderr
+        assert cb is not None
+        result = cb(b"npx: command not found: bogus-mcp\n")
+        if asyncio.iscoroutine(result):
+            await result
+        process.simulate_exit(127)
+
+        fake_session = _NeverInitSession()
+        started = time.monotonic()
+        with pytest.raises(SubprocessExitedDuringInit) as exc:
+            await init_with_exit_race(
+                cast(Any, fake_session), session.exit_signal, timeout=5.0,
+            )
+        elapsed = time.monotonic() - started
+    assert elapsed < 2.0, f"fail-fast must beat INIT_TIMEOUT; took {elapsed:.2f}s"
+    assert exc.value.exit_code == 127
+    assert "command not found" in exc.value.stderr_tail
+
+
+@pytest.mark.asyncio
+async def test_sbx8_init_with_exit_race_exit_wins_over_pending_init() -> None:
+    """SBX-8 (init_with_exit_race semantics): when exit fires while
+    init is still pending, the race raises ``SubprocessExitedDuringInit``
+    carrying the exit code/stderr — mirrors the ``init_with_exit_race``
+    contract used by the connection task on a bogus E2B command."""
+    from mcpolis.adapters.sandbox_services.exit_signal import ExitSignalImpl
+    from mcpolis.adapters.upstream_clients.stdio_adapter import (
+        SubprocessExitedDuringInit,
+        init_with_exit_race,
+    )
+
+    signal = ExitSignalImpl()
+    signal.append_stderr(b"bogus startup failure\n")
+
+    async def fire_exit() -> None:
+        await asyncio.sleep(0.02)
+        signal.mark_exited(127)
+
+    asyncio.create_task(fire_exit())
+    with pytest.raises(SubprocessExitedDuringInit) as exc:
+        await init_with_exit_race(
+            cast(Any, _NeverInitSession()), signal, timeout=5.0,
+        )
+    assert exc.value.exit_code == 127
+    assert "bogus startup failure" in exc.value.stderr_tail
+
+
+class _NeverInitSession:
+    """``ClientSession`` stub whose ``initialize()`` never resolves —
+    forces the exit-signal arm of ``init_with_exit_race`` to win."""
+
+    async def initialize(self) -> object:
+        await asyncio.Event().wait()
+        return None
+
+
+# ---------- SBX-12: off-grid resources reach session() ----------
+
+
+@pytest.mark.asyncio
+async def test_sbx12_off_grid_resources_raise_at_template_name() -> None:
+    """SBX-12 (P2): if validate_resources is bypassed and an off-grid
+    (cpu, ram) reaches ``session()``, the template lookup must raise
+    (KeyError / ResourcesUnsupported) rather than silently resolving to
+    a surprising template. ``_open_sandbox`` → ``grid.template_name``
+    raises KeyError for an unpublished pairing (service.py:1418)."""
+    service, mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    # 1 vCPU + 8192 MiB is NOT in the published grid.
+    off_grid = SandboxResources(cpu_vcpus=1.0, memory_mb=8192, disk_gb=0)
+    with pytest.raises((KeyError, ResourcesUnsupported)):
+        async with service.session(
+            session_id="sbx12", org_id="acme", upstream=upstream,
+            resources=off_grid, denylist=(),
+        ):
+            pass
+    # No sandbox was created with a mis-resolved template.
+    assert mock.creates == []
+
+
+# ---------- SBX-13: map_exit exit_code=0 with error_class set ----------
+
+
+def test_sbx13_map_exit_zero_code_with_error_class_pins_branch() -> None:
+    """SBX-13 (P2): ``map_exit`` with ``exit_code=0`` AND an
+    uncategorized ``error_class`` must NOT fall into the SUBPROCESS_EXITED
+    branch (that's gated on a non-zero code) — it pins the
+    ``PROVIDER_ERROR`` fallback. service.py:1830 requires
+    ``exit_code != 0``."""
+    service, _ = make_e2b_service()
+    info = ProviderExitInfo(
+        exit_code=0, error_class="SomeUncategorizedSDKError",
+        raw_message="boom at zero",
+    )
+    reason, detail = service.map_exit(info)
+    assert reason is ExitReason.PROVIDER_ERROR, (
+        f"exit_code=0 + uncategorized error_class must map to "
+        f"PROVIDER_ERROR, not SUBPROCESS_EXITED; got {reason}"
+    )
+    assert detail == "boom at zero"
+
+
+def test_sbx13_map_exit_zero_code_with_auth_error_class_still_auth() -> None:
+    """SBX-13 sibling: a categorized error_class (AuthError) wins even
+    with exit_code=0 — the error-class branches are checked before the
+    exit-code branch."""
+    service, _ = make_e2b_service()
+    info = ProviderExitInfo(
+        exit_code=0, error_class="E2BAuthError", raw_message="bad key",
+    )
+    reason, _ = service.map_exit(info)
+    assert reason is ExitReason.AUTH_FAILED
+
+
+# ---------- SBX-14: SandboxResolver returns the global provider ----------
+# NOTE: SandboxResolver lives in domain/services/sandbox_resolver.py, which
+# the config/plumbing agent may also touch — possible test overlap. Keeping
+# only this one-line guard here per the brief.
+
+
+@pytest.mark.asyncio
+async def test_sbx14_resolver_returns_global_provider() -> None:
+    """SBX-14 (P2): day-one ``SandboxResolver.resolve`` ignores org_id
+    and returns the configured global provider verbatim."""
+    from mcpolis.domain.services.sandbox_resolver import SandboxResolver
+
+    resolver = SandboxResolver(global_provider="e2b")
+    assert await resolver.resolve(org_id="any-org") == "e2b"
+    assert await resolver.resolve(org_id="other") == "e2b"

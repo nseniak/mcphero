@@ -183,6 +183,17 @@ class FileConnectionStore(ConnectionStore):
                 self._write(data)
             return len(keys)
 
+    async def delete_all_for_org(self, org_id: str) -> int:
+        # The file store is single-org (standalone mode), so every key
+        # belongs to this org: clearing the whole store IS the per-org
+        # purge. No org prefix exists in the key space to filter on.
+        async with self._lock:
+            data = self._read()
+            count = len(data)
+            if count:
+                self._write({})
+            return count
+
     async def get_all_stored_tokens(self, org_id: str) -> list[tuple[str, str]]:
         async with self._lock:
             data = self._read()

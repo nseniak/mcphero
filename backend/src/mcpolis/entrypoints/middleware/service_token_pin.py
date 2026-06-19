@@ -24,7 +24,10 @@ from mcp.server.auth.middleware.auth_context import auth_context_var
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from mcpolis.domain.model.service_token import pinned_org_from_auth_scopes
+from mcpolis.domain.model.service_token import (
+    is_service_token_auth,
+    pinned_org_from_auth_scopes,
+)
 from mcpolis.domain.ports import MULTI_ORG_SENTINEL
 from mcpolis.entrypoints.controllers.gateway_controller import (
     current_org_id,
@@ -48,12 +51,30 @@ class ServiceTokenOrgPinMiddleware:
         if auth_user is None:
             await self._app(scope, receive, send)
             return
-        pinned_org = pinned_org_from_auth_scopes(
-            auth_user.access_token.scopes,
-        )
-        if pinned_org is None:
-            # Human auth — untouched.
+        scopes = auth_user.access_token.scopes
+        if not is_service_token_auth(scopes):
+            # Human auth — untouched. Discriminate on SCOPE_SVC presence,
+            # NOT on a resolvable pinned org: an org-less service identity
+            # must fail closed below, not be mistaken for a human and
+            # forwarded with the multi-org sentinel intact (AUTH-1).
             await self._app(scope, receive, send)
+            return
+        pinned_org = pinned_org_from_auth_scopes(scopes)
+        if pinned_org is None:
+            # Service identity with no resolvable org. The verifier always
+            # emits the org scope, so this can only come from a future
+            # minting path / scope refactor — fail closed rather than
+            # bypass org isolation. Same anti-enumeration body as a slug
+            # mismatch.
+            logger.info(
+                "service_token.org_pin.no_org_scope",
+                user_id=auth_user.display_name,
+            )
+            response = JSONResponse(
+                {"error": "Not authorized for this org"},
+                status_code=401,
+            )
+            await response(scope, receive, send)
             return
 
         try:

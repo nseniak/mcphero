@@ -170,6 +170,13 @@ def create_sandbox_files_router(deps: DashboardDeps) -> APIRouter:
         # changes without flicker.
         if transport != TransportType.stdio:
             return []
+        # Display is the canonical home (E2B's /home/user, the default).
+        # Runtime ``${HOME}`` resolution is provider-aware (the
+        # local-subprocess backend uses a per-session temp dir), but
+        # this route has no per-session context and a per-session temp
+        # path would be meaningless to show. Operators reference
+        # ``${HOME}`` symbolically; it round-trips at runtime on both
+        # backends. So the wizard shows the canonical value.
         return [
             SystemVariableView(name=name, value=value)
             for name, value in sorted(

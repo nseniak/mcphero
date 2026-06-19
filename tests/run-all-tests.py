@@ -106,9 +106,16 @@ def compute_budget() -> Budget:
 
     unit_jobs = _env_int("UNIT_JOBS", None)
     if unit_jobs is None:
-        # e2e shards weigh ~2 CPUs each; leave ~2 cores of headroom for the
-        # OS and integration's light load.
-        unit_jobs = _clamp(cores - e2e_shards * 2 - 2, 2, cores)
+        # e2e shards weigh ~2 CPUs each. Reserve 4 cores (not 2) for the
+        # OS, integration's light load, AND the substantial non-test load
+        # this gate actually runs against: Docker Desktop's VM (hosting
+        # the test Mongo/Redis) plus desktop apps routinely consume 4-6
+        # cores, so an "assume all N cores are free" budget oversubscribes
+        # the box and starves both legs into transient connection blips.
+        # Capping unit (per this file's own strategy of bounding unit
+        # rather than shaving e2e shards) frees that CPU for the e2e
+        # shards without disturbing their tuned partition.
+        unit_jobs = _clamp(cores - e2e_shards * 2 - 4, 2, cores)
 
     integration_jobs = _env_int("INTEGRATION_JOBS", None) or 4
 
@@ -144,7 +151,25 @@ def build_suites(budget: Budget) -> list[Suite]:
                 "-j", str(budget.unit_jobs),
             ],
             log_path=Path("/tmp/mcpolis-all-unit.log"),
-            env=base_env,
+            # Give the unit leg the same transient-blip resilience the
+            # e2e leg gets from Playwright retries. Under this
+            # oversubscribed cross-suite run a CPU-/Docker-VM-starved box
+            # intermittently refuses or times out the connect to Redis or
+            # an in-process loopback server — the exact analogue of the
+            # e2e socket blips. ``run-unit-tests.sh`` reruns ONLY failures
+            # whose signature is a connection-establishment error, so a
+            # real failure still fails on the first attempt.
+            env={
+                **base_env,
+                # 3 (not the e2e leg's historical 2): this box runs the
+                # cross-suite load noisier than when retries=2 was tuned
+                # (e2e flaky counts climbed from ~6 to ~12-15), so a
+                # connection blip occasionally survives 2 attempts. Only
+                # connection-signature failures are eligible to rerun
+                # (see run-unit-tests.sh), so a real failure still fails
+                # on the first attempt regardless of this count.
+                "UNIT_RERUNS": os.environ.get("UNIT_RERUNS", "3"),
+            },
         ),
         Suite(
             name="e2e",
@@ -155,10 +180,14 @@ def build_suites(budget: Budget) -> list[Suite]:
             log_path=Path("/tmp/mcpolis-all-e2e.log"),
             env={
                 **base_env,
-                # Loosen Playwright under cross-suite load: a double blip
-                # (both attempts starved at once) still recovers, and a
-                # genuinely slow nav doesn't trip the 30s default.
-                "E2E_RETRIES": os.environ.get("E2E_RETRIES", "2"),
+                # Loosen Playwright under cross-suite load: a triple blip
+                # (all attempts starved at once) still recovers, and a
+                # genuinely slow nav doesn't trip the 30s default. Raised
+                # 2->3 because this box's saturation pushed e2e flaky
+                # counts to ~12-15/run, enough that a spec occasionally
+                # blipped on 3 consecutive attempts and hard-failed the
+                # gate. A real regression still fails all 4 attempts.
+                "E2E_RETRIES": os.environ.get("E2E_RETRIES", "3"),
                 "E2E_TIMEOUT_MS": os.environ.get("E2E_TIMEOUT_MS", "45000"),
             },
         ),

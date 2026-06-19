@@ -70,6 +70,22 @@ pytest-xdist = "^3.8.0"
 # Python e2e orchestrator to surface pass/fail without parsing the
 # console stream.
 pytest-json-report = "^1.5.0"
+# Rerun safety net for the unit leg under ``make test-all`` load — the
+# unit-side analogue of the e2e suite's Playwright ``retries``. Scoped
+# via ``--only-rerun`` to *transient connection signatures* only
+# (ConnectError/ConnectTimeout/ConnectionError/…), so a real assertion
+# failure still fails on the first try and is never masked. Off by
+# default (``UNIT_RERUNS=0`` in run-unit-tests.sh); run-all-tests.py
+# turns it on under the oversubscribed cross-suite run.
+pytest-rerunfailures = "^16.3"
+# Per-test timeout backstop. A unit test that boots loopback servers /
+# talks to Redis/Mongo can, under make test-all saturation, block on a
+# socket read with no timeout (e.g. a synchronous Mongo monitor recv) and
+# hang the WHOLE gate indefinitely — worse than a flake. A generous
+# 120s ceiling (the slowest unit test is ~10s) turns any such hang into a
+# normal failure the rerun net can retry, so no single test can wedge the
+# suite.
+pytest-timeout = "^2.3.1"
 
 [tool.ruff]
 target-version = "py312"
@@ -116,6 +132,13 @@ reportAttributeAccessIssue = "none"
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
 asyncio_mode = "auto"
+# Per-test wall-clock ceiling (pytest-timeout). No legit unit test runs
+# anywhere near this — it exists only so a socket read with no timeout
+# (a starved Mongo monitor, a wedged loopback teardown) can't hang the
+# whole suite forever under make test-all load; the ``signal`` method
+# interrupts a blocking C-level recv, which the ``thread`` method cannot.
+timeout = 120
+timeout_method = "signal"
 
 [build-system]
 requires = ["poetry-core"]

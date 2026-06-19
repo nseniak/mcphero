@@ -19,11 +19,15 @@ from mcpolis.adapters.repositories.file_organization_repository import (
 from mcpolis.adapters.repositories.file_upstream_config_store import (
     FileUpstreamConfigStore,
 )
+from mcpolis.adapters.repositories.file_service_token_repository import (
+    FileServiceTokenRepository,
+)
 from mcpolis.adapters.repositories.mcp_json_store import McpJsonStore
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
 from mcpolis.domain.model.subscription import PlanName, Subscription
 from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.domain.services.policy_engine import PolicyEngine
+from mcpolis.domain.services.service_token_service import ServiceTokenService
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.services.upstream_config_service import UpstreamConfigService
 from mcpolis.entrypoints.app import create_app
@@ -169,6 +173,7 @@ async def _build_admin_server(
     config: dict[str, Any],
     mcp_servers: dict[str, Any] | None = None,
     plan: PlanName = PlanName.free,
+    service_token_service: ServiceTokenService | None = None,
 ) -> tuple[Any, AuditRepository]:
     """Spin up a real admin-MCP server backed by file repos.
 
@@ -177,6 +182,10 @@ async def _build_admin_server(
     returns the seeded MCPs, real ``FileOrganizationRepository`` so
     ``resolve_plan`` reads the configured subscription. ``allow_stdio_mcp``
     is left True so the stdio cap test isn't masked by the feature flag.
+
+    Pass *service_token_service* to wire the ``delete_role`` /
+    ``list_roles`` service-token guard (AUTH-8); left ``None`` for the
+    plan-gate tests that don't exercise it.
     """
     mcp_json = tmp_path / "mcp.json"
     mcp_json.write_text(json.dumps({"mcpServers": mcp_servers or {}}))
@@ -215,6 +224,7 @@ async def _build_admin_server(
         policy_store=config_store,
         connection_store=connection_store,
         org_repo=org_repo,
+        service_token_service=service_token_service,
     )
     return server, audit_repo
 
@@ -395,3 +405,190 @@ async def test_admin_mcp_set_role_argument_constraint_team_passes_gate(
     except ToolError as exc:
         text = str(exc)
     assert "Argument checks aren't available" not in text
+
+
+# ---------- refresh_upstream_tools (R6 recovery wiring) ----------
+
+
+def _config_with_refreshable_upstreams() -> tuple[dict[str, Any], dict[str, Any]]:
+    config = {
+        "upstreams": {
+            "github": {
+                "display_name": "GitHub", "auth_mode": "service_account",
+            },
+            "notion": {
+                "display_name": "Notion", "auth_mode": "per_user_oauth",
+            },
+        },
+        "roles": {
+            "admin": {"is_admin": True},
+            "user": {"is_default": True},
+        },
+        "users": {ADMIN_EMAIL: {"role": "admin"}},
+    }
+    mcp_servers = {
+        "github": {"url": "http://localhost:9000/mcp"},
+        "notion": {"url": "http://localhost:9001/mcp"},
+    }
+    return config, mcp_servers
+
+
+@pytest.mark.asyncio
+async def test_refresh_upstream_tools_unknown_mcp_returns_not_found(
+    tmp_path: Path,
+) -> None:
+    """Review item 8: the new early-return for an unknown ``mcp_id``."""
+    config, mcp_servers = _config_with_refreshable_upstreams()
+    server, _ = await _build_admin_server(
+        tmp_path, config=config, mcp_servers=mcp_servers, plan=PlanName.team,
+    )
+    text = await _call(server, "refresh_upstream_tools", {"mcp_id": "ghost"})
+    assert "not found" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_refresh_upstream_tools_session_unavailable_maps_to_message(
+    tmp_path: Path,
+) -> None:
+    """Review item 8: a ``SessionUnavailable`` from the recovery path (an
+    OAuth upstream with no stored tokens / no session) maps to the
+    'could not reattach session' message, not a raw exception."""
+    config, mcp_servers = _config_with_refreshable_upstreams()
+    server, _ = await _build_admin_server(
+        tmp_path, config=config, mcp_servers=mcp_servers, plan=PlanName.team,
+    )
+    text = await _call(server, "refresh_upstream_tools", {"mcp_id": "notion"})
+    assert "could not reattach session" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_refresh_upstream_tools_single_routes_through_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review item 8: the ``mcp_id`` branch routes through
+    ``acquire_and_refresh_with_recovery`` under the service_account identity
+    (``effective_user=""``)."""
+    config, mcp_servers = _config_with_refreshable_upstreams()
+    server, _ = await _build_admin_server(
+        tmp_path, config=config, mcp_servers=mcp_servers, plan=PlanName.team,
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    async def fake_recovery(**kwargs: Any) -> list[Any]:
+        calls.append((kwargs["upstream"].id, kwargs["effective_user"]))
+        return [object()]
+
+    monkeypatch.setattr(
+        "mcpolis.entrypoints.controllers.admin_mcp_controller"
+        ".acquire_and_refresh_with_recovery",
+        fake_recovery,
+    )
+    text = await _call(server, "refresh_upstream_tools", {"mcp_id": "github"})
+    assert "Refreshed 1 tools" in text
+    assert calls == [("github", "")], (
+        "service_account refresh must route through the recovery helper "
+        "under the shared identity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_upstream_tools_all_routes_through_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review item 8: the no-arg branch routes through
+    ``refresh_all_with_recovery``."""
+    config, mcp_servers = _config_with_refreshable_upstreams()
+    server, _ = await _build_admin_server(
+        tmp_path, config=config, mcp_servers=mcp_servers, plan=PlanName.team,
+    )
+
+    called = {"n": 0}
+
+    async def fake_refresh_all(**_kwargs: Any) -> None:
+        called["n"] += 1
+
+    monkeypatch.setattr(
+        "mcpolis.entrypoints.controllers.admin_mcp_controller"
+        ".refresh_all_with_recovery",
+        fake_refresh_all,
+    )
+    text = await _call(server, "refresh_upstream_tools", {})
+    assert "Refreshed all upstream MCPs" in text
+    assert called["n"] == 1, "the no-arg branch must call refresh_all_with_recovery"
+
+
+# ---------- delete_role service-token guard (AUTH-8) ----------
+#
+# Sibling of the gateway-side AUTH-7 rejection: the admin-MCP
+# ``delete_role`` tool refuses to drop a role that any service token is
+# pinned to, because the token would silently fail closed (correct, but
+# confusing when done by accident). The guard lives in
+# ``admin_mcp_controller.py:980-987`` and reads ``count_by_role`` off the
+# injected ``ServiceTokenService``. Revoking the token clears the guard.
+
+
+def _config_with_custom_role(role_name: str) -> dict[str, Any]:
+    """Admin + a deletable custom role (Team plan supports custom roles)."""
+    return {
+        "upstreams": {},
+        "roles": {
+            "admin": {"is_admin": True},
+            "user": {"is_default": True},
+            role_name: {"settings": {"mcp_access": {"mcps": {}}}},
+        },
+        "users": {ADMIN_EMAIL: {"role": "admin"}},
+    }
+
+
+def _make_service_token_service(tmp_path: Path) -> ServiceTokenService:
+    return ServiceTokenService(
+        repo=FileServiceTokenRepository(tmp_path / "data"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_delete_role_blocked_while_service_token_assigned(
+    tmp_path: Path,
+) -> None:
+    """``delete_role`` fails with a 'service token' error while a token is
+    pinned to the role; after revoke, the same call succeeds."""
+    role_name = "reader"
+    svc = _make_service_token_service(tmp_path)
+    await svc.mint(
+        org_id=DEFAULT_ORG_ID, label="ci-bot", role_name=role_name,
+        created_by=ADMIN_EMAIL,
+    )
+    server, _ = await _build_admin_server(
+        tmp_path,
+        config=_config_with_custom_role(role_name),
+        plan=PlanName.team,
+        service_token_service=svc,
+    )
+
+    blocked = await _call(server, "delete_role", {"role_name": role_name})
+    assert "service token" in blocked.lower()
+    assert role_name.lower() in blocked.lower()
+
+    # Revoke the token — the guard clears and deletion goes through.
+    assert await svc.revoke(DEFAULT_ORG_ID, "ci-bot") is True
+    deleted = await _call(server, "delete_role", {"role_name": role_name})
+    assert "deleted" in deleted.lower()
+    assert "service token" not in deleted.lower()
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_delete_role_unblocked_without_token_service(
+    tmp_path: Path,
+) -> None:
+    """Control: with no service-token service wired, the guard is a no-op
+    and an unused custom role deletes cleanly — proving the AUTH-8 block
+    comes from the token guard, not some unrelated delete failure."""
+    role_name = "reader"
+    server, _ = await _build_admin_server(
+        tmp_path,
+        config=_config_with_custom_role(role_name),
+        plan=PlanName.team,
+    )
+    deleted = await _call(server, "delete_role", {"role_name": role_name})
+    assert "deleted" in deleted.lower()

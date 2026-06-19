@@ -19,3 +19,9 @@ class UpstreamConfigRepository(Protocol):
     ) -> None: ...
 
     async def remove(self, org_id: str, upstream_id: str) -> None: ...
+
+    async def delete_all_for_org(self, org_id: str) -> None:
+        """Remove every upstream definition for this org. Part of the
+        org-deletion cascade. Idempotent.
+        """
+        ...

@@ -303,13 +303,13 @@ def create_org_router(
             raise HTTPException(
                 status_code=403, detail="Only admins can delete an organization"
             )
+        # ``delete_organization`` runs the full teardown internally,
+        # including slug-cache invalidation via the service's
+        # runtime-teardown hook (wired in ``create_app``). No separate
+        # ``on_org_created`` call here — that closure also does
+        # create-only work (policy listener, display-name registration)
+        # that's spurious on delete.
         await org_service.delete_organization(org.id)
-        if on_org_created is not None:
-            # Reuse the hook for slug-cache invalidation on delete.
-            # Passing the deleted org keeps the callback signature
-            # uniform; the slug-cache clears wholesale so the specific
-            # id doesn't matter here.
-            on_org_created(org)
         get_analytics().track_async(email, "org_deleted", {"org_slug": slug})
         return Response(status_code=204)
 

@@ -296,6 +296,27 @@ class SandboxService(Protocol):
         will accept the same value without another check."""
         ...
 
+    def sandbox_home(self, *, session_id: str) -> str:
+        """Absolute ``$HOME`` the MCP process spawned for ``session_id``
+        will actually get.
+
+        This is the value ``${HOME}`` must substitute to so a
+        ``${HOME}``-templated ``target_path`` (and any ``${HOME}`` in
+        env / headers) lands where the process looks. The contract is
+        an EQUALITY: ``session()`` MUST spawn the process with exactly
+        this ``$HOME``, and the caller substitutes ``${HOME}`` with it
+        before materializing files — so substitution, materialization,
+        and the live process all agree.
+
+        E2B returns the container's fixed ``/home/user`` (``session_id``
+        ignored). ``local-subprocess`` returns a per-session isolated
+        temp dir on the host (keyed on ``session_id``) so the spawned
+        process never inherits — or pollutes — the operator's real home.
+        Deterministic in ``session_id`` so the manager can derive it for
+        substitution and the session can recompute the identical value.
+        """
+        ...
+
     def session(
         self,
         *,

@@ -56,6 +56,12 @@ class MongoConfigRepository(ConfigRepository):
         async with self._lock:
             await self._write(org_id, config)
 
+    async def delete_for_org(self, org_id: str) -> None:
+        # Org-deletion cascade. One config doc per org; ``delete_many``
+        # with an empty filter is org-scoped by ``OrgScopedCollection``.
+        async with self._lock:
+            await self._coll.delete_many(org_id, {})
+
     def ensure_defaults_sync(self, org_id: str) -> SettingsConfig:
         """Sync variant: used at startup before the event loop runs.
 

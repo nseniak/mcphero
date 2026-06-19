@@ -11,19 +11,25 @@ for another coroutine to observe a torn state.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from time import monotonic
 
 from mcpolis.domain.ports.rate_limiter import RateLimitResult
 
 
 class InProcessRateLimiter:
-    def __init__(self) -> None:
+    def __init__(self, *, now: Callable[[], float] = monotonic) -> None:
         self._hits: dict[str, deque[float]] = {}
+        # Injectable clock. Tests pass a controllable clock so the
+        # sliding-window assertions don't depend on wall-clock elapsed
+        # time between calls (which flakes under CPU starvation). Prod
+        # uses ``monotonic``.
+        self._now = now
 
     async def check(
         self, key: str, *, limit: int, window_seconds: float,
     ) -> RateLimitResult:
-        now = monotonic()
+        now = self._now()
         window_start = now - window_seconds
         hits = self._hits.get(key)
         if hits is None:

@@ -41,6 +41,14 @@ class InMemorySandboxPersistenceRepository(SandboxPersistenceRepository):
         async with self._lock:
             self._refs.pop((org_id, upstream_id), None)
 
+    async def delete_all_for_org(self, *, org_id: str) -> int:
+        # Org-deletion cascade. Drop every ref whose key's org matches.
+        async with self._lock:
+            keys = [k for k in self._refs if k[0] == org_id]
+            for k in keys:
+                del self._refs[k]
+            return len(keys)
+
     async def list_for_org(
         self, *, org_id: str,
     ) -> list[SandboxPersistedRef]:

@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import structlog
+from pymongo.errors import DuplicateKeyError
 
 from mcpolis.adapters.repositories.file_service_token_repository import (
     FileServiceTokenRepository,
@@ -107,6 +109,86 @@ async def test_file_repo_touch_last_used_persists(tmp_path: Path) -> None:
     assert reloaded.last_used_at == when
     # Unknown hash is a no-op, not an error.
     await fresh.touch_last_used(hash_service_token("svct_ghost"), when)
+
+
+@pytest.mark.asyncio
+async def test_file_repo_corrupt_json_get_by_hash_returns_none_and_logs(
+    tmp_path: Path,
+) -> None:
+    """AUTH-5: a garbled registry file must not crash the verify path.
+
+    ``_read`` is on the auth hot path; an operator-corrupted (or
+    half-written) JSON file must degrade to "no tokens" — return None,
+    no exception — and emit ``service_tokens.file.read_failed`` so the
+    corruption is observable. Failing closed (None) is the safe
+    direction: a presented token can't be verified, so it's rejected,
+    never accidentally granted."""
+    repo = make_file_repo(tmp_path)
+    repo.path.write_text("{ this is not valid json ]]")
+
+    with structlog.testing.capture_logs() as logs:
+        result = await repo.get_by_hash(hash_service_token("svct_anything"))
+
+    assert result is None
+    events = [entry["event"] for entry in logs]
+    assert "service_tokens.file.read_failed" in events
+    # The warning carries the path for the operator to find the file.
+    read_failed = next(
+        e for e in logs if e["event"] == "service_tokens.file.read_failed"
+    )
+    assert read_failed["log_level"] == "warning"
+    assert str(repo.path) == read_failed["path"]
+
+
+@pytest.mark.asyncio
+async def test_file_repo_corrupt_json_list_for_org_returns_empty(
+    tmp_path: Path,
+) -> None:
+    """AUTH-5 sibling: ``list_for_org`` over a corrupt file degrades to
+    an empty list (same ``_read`` tolerance), never an exception — so
+    the admin listing page renders empty rather than 500ing."""
+    repo = make_file_repo(tmp_path)
+    repo.path.write_text("not json at all")
+    assert await repo.list_for_org("org-a") == []
+
+
+@pytest.mark.skipif(not mongo_available(), reason="Mongo not reachable")
+@pytest.mark.asyncio
+async def test_mongo_repo_token_hash_unique_index_rejects_duplicate_hash() -> (
+    None
+):
+    """AUTH-6: ``token_hash`` is the global verify-path lookup key and
+    must be globally unique. Two records with the same hash — even in
+    different orgs — must be rejected by the ``uniq_token_hash`` index,
+    or a collision would make ``get_by_hash`` ambiguous on the auth
+    path. Inserted via the raw driver (bypassing the repo's
+    label-uniqueness mapping) so only the hash index is under test."""
+    async with temp_mongo_database() as db:
+        coll = db[COLL_SERVICE_TOKENS]
+        shared_hash = hash_service_token("svct_shared")
+        await coll.insert_one(
+            {
+                "token_hash": shared_hash,
+                "org_id": "org-a",
+                "label": "bot-a",
+                "role_name": "user",
+                "created_by": "admin@example.com",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                "last_used_at": None,
+            },
+        )
+        with pytest.raises(DuplicateKeyError):
+            await coll.insert_one(
+                {
+                    "token_hash": shared_hash,
+                    "org_id": "org-b",
+                    "label": "bot-b",
+                    "role_name": "user",
+                    "created_by": "admin@example.com",
+                    "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                    "last_used_at": None,
+                },
+            )
 
 
 @pytest.mark.skipif(not mongo_available(), reason="Mongo not reachable")

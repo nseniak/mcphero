@@ -15,15 +15,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import cast
 
-import httpx
 import pytest
 import uvicorn
+from fastapi import FastAPI
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamable_http_client
 
+from mcpolis.adapters.auth.mcp_gateway_oauth_provider import ACCESS_TOKEN_TTL
 from mcpolis.adapters.repositories.file_service_token_repository import (
     FileServiceTokenRepository,
 )
@@ -31,8 +32,9 @@ from mcpolis.domain.services.service_token_service import ServiceTokenService
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
 from tests.unit._loopback_mcp import (
-    MCP_CLIENT_TIMEOUT,
+    await_tools_ready,
     free_ports,
+    mcp_session_call,
     wait_for_health,
 )
 
@@ -90,7 +92,7 @@ def _create_fake_upstream():  # noqa: ANN202 — FastMCP type lives in test dep
 
 async def _start_stack(
     tmp_path: Path,
-) -> tuple[uvicorn.Server, uvicorn.Server, asyncio.Task[None]]:
+) -> tuple[uvicorn.Server, uvicorn.Server, asyncio.Task[None], FastAPI]:
     global _gateway_port, _upstream_port
     _upstream_port, _gateway_port = free_ports(2)
     fake_mcp = _create_fake_upstream()
@@ -115,8 +117,11 @@ async def _start_stack(
         session_secret="svc-token-test-secret",
         server_url=f"http://127.0.0.1:{_gateway_port}",
     )
+    # Hold the app object so tests can mint a human OAuth bearer
+    # (``mint_test_token``) and reach the live provider for AUTH-9/10/11.
+    gateway_app = create_app(settings)
     gateway_server = uvicorn.Server(uvicorn.Config(
-        create_app(settings), host="127.0.0.1", port=_gateway_port,
+        gateway_app, host="127.0.0.1", port=_gateway_port,
         log_level="warning", ws="none",
     ))
 
@@ -131,7 +136,7 @@ async def _start_stack(
         f"http://127.0.0.1:{_gateway_port}/health",
         label="service-token gateway stack",
     )
-    return upstream_server, gateway_server, server_task
+    return upstream_server, gateway_server, server_task, gateway_app
 
 
 async def _stop_stack(
@@ -162,40 +167,34 @@ def make_registry_service(tmp_path: Path) -> ServiceTokenService:
 
 
 async def _list_tools_with(token: str) -> list[str]:
-    async with httpx.AsyncClient(
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=MCP_CLIENT_TIMEOUT,
-    ) as http_client:
-        async with streamable_http_client(
-            f"http://127.0.0.1:{_gateway_port}/mcp/", http_client=http_client,
-        ) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.list_tools()
-                return [t.name for t in result.tools]
+    async def _list(session: ClientSession) -> list[str]:
+        result = await session.list_tools()
+        return [t.name for t in result.tools]
+
+    return await mcp_session_call(
+        f"http://127.0.0.1:{_gateway_port}/mcp/", token, _list,
+    )
 
 
 async def _call_tool_with(
     token: str, tool_name: str, arguments: dict[str, str],
 ) -> tuple[bool, str]:
-    async with httpx.AsyncClient(
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=MCP_CLIENT_TIMEOUT,
-    ) as http_client:
-        async with streamable_http_client(
-            f"http://127.0.0.1:{_gateway_port}/mcp/", http_client=http_client,
-        ) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
-                text = cast(str, result.content[0].text)  # type: ignore[union-attr]
-                return result.isError or False, text
+    async def _call(session: ClientSession) -> tuple[bool, str]:
+        result = await session.call_tool(tool_name, arguments)
+        text = cast(str, result.content[0].text)  # type: ignore[union-attr]
+        return result.isError or False, text
+
+    return await mcp_session_call(
+        f"http://127.0.0.1:{_gateway_port}/mcp/", token, _call,
+    )
 
 
 @pytest.mark.asyncio
 async def test_service_token_gateway_end_to_end(tmp_path: Path) -> None:
     """One stack boot, every gateway-side service-token behavior."""
-    upstream_server, gateway_server, server_task = await _start_stack(tmp_path)
+    upstream_server, gateway_server, server_task, _app = await _start_stack(
+        tmp_path,
+    )
     registry = make_registry_service(tmp_path)
     try:
         full = await registry.mint(
@@ -211,6 +210,13 @@ async def test_service_token_gateway_end_to_end(tmp_path: Path) -> None:
             created_by="admin@example.com",
         )
 
+        # Wait for the gateway->upstream connect to settle before the
+        # first tools read — otherwise tools/list returns [] under load
+        # and the assertion races it ("assert [] == ['fake__greet']").
+        await await_tools_ready(
+            f"http://127.0.0.1:{_gateway_port}/mcp/",
+            full.raw_token, "fake__greet",
+        )
         # Role-driven discovery: svc identity is not in config.users.
         assert await _list_tools_with(full.raw_token) == ["fake__greet"]
 
@@ -255,5 +261,244 @@ async def test_service_token_gateway_end_to_end(tmp_path: Path) -> None:
         )
         connects = [e for e in entries if e.get("action") == "client_connect"]
         assert any(e["user_id"] == "svc:full-bot" for e in connects)
+    finally:
+        await _stop_stack(upstream_server, gateway_server, server_task)
+
+
+# ─────────────── AUTH-9 / AUTH-10 / AUTH-11 (live gateway) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_oauth_and_service_token_auth_coexist(tmp_path: Path) -> None:
+    """AUTH-9 — both auth modes live in one app.
+
+    A human OAuth bearer (minted via the provider's test-token path) and
+    a ``svct_`` bearer hit the same gateway. The OAuth bearer resolves
+    via the OAuth store to the human's ``config.users`` role; the svct_
+    resolves via the registry to ``svc:<label>`` with its minted role.
+    Neither path leaks into the other.
+    """
+    upstream_server, gateway_server, server_task, gateway_app = (
+        await _start_stack(tmp_path)
+    )
+    registry = make_registry_service(tmp_path)
+    try:
+        provider = gateway_app.state.mcp_gateway_oauth_provider
+        oauth_token = await provider.mint_test_token("admin@example.com")
+        svc = await registry.mint(
+            org_id="default", label="full-bot", role_name="full",
+            created_by="admin@example.com",
+        )
+        await await_tools_ready(
+            f"http://127.0.0.1:{_gateway_port}/mcp/",
+            svc.raw_token, "fake__greet",
+        )
+
+        # Human OAuth bearer: admin role → sees the tool, audited as email.
+        assert await _list_tools_with(oauth_token) == ["fake__greet"]
+        _is_err, oauth_text = await _call_tool_with(
+            oauth_token, "fake__greet", {"name": "Human"},
+        )
+        assert "Hello, Human" in oauth_text
+
+        # svct_ bearer: registry role → sees the tool, audited as svc.
+        assert await _list_tools_with(svc.raw_token) == ["fake__greet"]
+        _is_err, svc_text = await _call_tool_with(
+            svc.raw_token, "fake__greet", {"name": "Bot"},
+        )
+        assert "Hello, Bot" in svc_text
+
+        # Audit rows pin the distinct identities to the distinct paths.
+        audit_path = tmp_path / "data" / "audit.jsonl"
+        entries = [
+            json.loads(line)
+            for line in audit_path.read_text().strip().splitlines()
+        ]
+        tool_calls = [e for e in entries if e.get("tool") == "fake__greet"]
+        identities = {e["user_id"] for e in tool_calls}
+        assert "admin@example.com" in identities  # OAuth path
+        assert "svc:full-bot" in identities       # registry path
+    finally:
+        await _stop_stack(upstream_server, gateway_server, server_task)
+
+
+@pytest.mark.asyncio
+async def test_service_token_revoked_mid_session_fails_next_request(
+    tmp_path: Path,
+) -> None:
+    """AUTH-10 — revocation bites on the next request.
+
+    A live svct_ lists tools fine; after ``revoke`` the token no longer
+    authenticates (per-request verification), so the next connect fails —
+    not a silent success on a cached session.
+    """
+    upstream_server, gateway_server, server_task, _app = await _start_stack(
+        tmp_path,
+    )
+    registry = make_registry_service(tmp_path)
+    try:
+        svc = await registry.mint(
+            org_id="default", label="full-bot", role_name="full",
+            created_by="admin@example.com",
+        )
+        await await_tools_ready(
+            f"http://127.0.0.1:{_gateway_port}/mcp/",
+            svc.raw_token, "fake__greet",
+        )
+        assert await _list_tools_with(svc.raw_token) == ["fake__greet"]
+
+        # Revoke, then a fresh request must fail auth (no cached pass).
+        assert await registry.revoke("default", "full-bot") is True
+        with pytest.raises(BaseException):
+            await _list_tools_with(svc.raw_token)
+    finally:
+        await _stop_stack(upstream_server, gateway_server, server_task)
+
+
+@pytest.mark.asyncio
+async def test_expired_oauth_bearer_is_rejected(tmp_path: Path) -> None:
+    """AUTH-11 — an expired OAuth bearer on /mcp fails to authenticate.
+
+    Mint a gateway token, then advance time past ``ACCESS_TOKEN_TTL`` by
+    rewriting the stored token's ``expires_at`` into the past (the
+    provider reads ``int(time.time())`` on every ``load_access_token``).
+    The next connect must fail — ``load_access_token`` pops the expired
+    entry and returns ``None``, so ``BearerAuthBackend`` rejects it.
+    """
+    upstream_server, gateway_server, server_task, gateway_app = (
+        await _start_stack(tmp_path)
+    )
+    try:
+        provider = gateway_app.state.mcp_gateway_oauth_provider
+        token = await provider.mint_test_token("admin@example.com")
+        # Sanity: valid before expiry.
+        assert await _list_tools_with(token) == ["fake__greet"]
+
+        # Simulate the clock advancing past ACCESS_TOKEN_TTL: the stored
+        # token's expiry moves into the past.
+        await provider._ensure_loaded()
+        stored = provider._access_tokens[token]
+        stored.expires_at = int(time.time()) - (ACCESS_TOKEN_TTL + 1)
+
+        with pytest.raises(BaseException):
+            await _list_tools_with(token)
+    finally:
+        await _stop_stack(upstream_server, gateway_server, server_task)
+
+
+# ─────────────── AUTH-13 / AUTH-14 (behavioral auth backend) ────────────
+
+
+@pytest.mark.asyncio
+async def test_bearer_auth_backend_accepts_minted_service_token(
+    tmp_path: Path,
+) -> None:
+    """AUTH-13 — behavioral ``BearerAuthBackend`` contract.
+
+    Replaces the brittle source-grep in
+    ``test_service_token_verifier.py`` (which asserts on the SDK's source
+    text) with a behavioral check: construct a real
+    ``BearerAuthBackend`` over the composite verifier and drive its
+    ``authenticate`` with a minted ``svct_`` bearer (``expires_at=None``,
+    i.e. non-expiring). It must return an ``AuthenticatedUser`` carrying
+    the ``svc:<label>`` identity and the service-token scopes — proving
+    the SDK's truthiness expiry check treats ``None`` as non-expiring.
+    """
+    from mcp.server.auth.middleware.bearer_auth import (
+        AuthenticatedUser,
+        BearerAuthBackend,
+    )
+    from starlette.requests import HTTPConnection
+
+    from mcpolis.adapters.auth.service_token_verifier import (
+        CompositeGatewayTokenVerifier,
+        ServiceTokenVerifier,
+    )
+
+    service = make_registry_service(tmp_path)
+    minted = await service.mint(
+        org_id="default", label="ci-bot", role_name="reader",
+        created_by="admin@example.com",
+    )
+
+    class _RejectingOAuth:
+        async def verify_token(self, token: str) -> None:
+            raise AssertionError("svct_ must not reach the OAuth path")
+
+    backend = BearerAuthBackend(
+        CompositeGatewayTokenVerifier(
+            ServiceTokenVerifier(service), _RejectingOAuth(),  # type: ignore[arg-type]
+        ),
+    )
+    conn = HTTPConnection({
+        "type": "http",
+        "headers": [(b"authorization", f"Bearer {minted.raw_token}".encode())],
+    })
+    result = await backend.authenticate(conn)
+    assert result is not None
+    _creds, user = result
+    assert isinstance(user, AuthenticatedUser)
+    assert user.display_name == "svc:ci-bot"
+    assert "mcpolis:svc" in user.access_token.scopes
+
+
+async def _initialize_status_with_auth(
+    auth_value: str | None,
+) -> int:
+    """POST an MCP ``initialize`` to ``/mcp/`` with a raw Authorization
+    header value (or none) and return the HTTP status code.
+
+    Uses the streamable-HTTP transport's own initialize shape so the
+    request reaches the auth middleware exactly as a real client's would.
+    """
+    import httpx as _httpx
+
+    headers: dict[str, str] = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if auth_value is not None:
+        headers["Authorization"] = auth_value
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"http://127.0.0.1:{_gateway_port}/mcp/",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "probe", "version": "0"},
+                },
+            },
+        )
+    return resp.status_code
+
+
+@pytest.mark.asyncio
+async def test_malformed_authorization_headers_rejected(tmp_path: Path) -> None:
+    """AUTH-14 — malformed Authorization credentials 401 without crashing.
+
+    A no-scheme token, a wrong scheme, an empty bearer value, and a bare
+    garbage bearer are each presented to the live gateway. Each must
+    return 401 (failed to authenticate) — never a 5xx, never a hang —
+    proving the auth boundary handles junk credentials, not just absent
+    ones.
+    """
+    upstream_server, gateway_server, server_task, _app = await _start_stack(
+        tmp_path,
+    )
+    try:
+        cases: list[str | None] = [
+            None,                 # no header at all (baseline)
+            "svct_x",             # no scheme
+            "Basic Zm9vOmJhcg==",  # wrong scheme
+            "Bearer",             # scheme, no token
+            "Bearer not-a-real-token",  # garbage bearer
+        ]
+        for auth_value in cases:
+            status = await _initialize_status_with_auth(auth_value)
+            # Failed to authenticate (4xx), never a server crash (5xx).
+            assert status == 401, (auth_value, status)
     finally:
         await _stop_stack(upstream_server, gateway_server, server_task)

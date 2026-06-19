@@ -10,6 +10,9 @@ from pathlib import Path
 
 import pytest
 
+from mcpolis.adapters.repositories.file_sandbox_file_repository import (
+    FileSandboxFileRepository,
+)
 from mcpolis.adapters.repositories.file_template_var_repository import (
     FileTemplateVarRepository,
 )
@@ -71,6 +74,55 @@ async def test_resolve_substitutes_stdio_env(tmp_path: Path) -> None:
     # Original is untouched.
     assert upstream.stdio is not None
     assert upstream.stdio.env == {"GITHUB_TOKEN": "${GH_TOKEN}"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_substitutes_home_with_provider_home(
+    tmp_path: Path,
+) -> None:
+    """``${HOME}`` resolves to the provider's home passed by the caller,
+    not a hardcoded constant. The manager passes the active provider's
+    ``sandbox_home`` (a local-subprocess per-session temp dir here) so
+    the substituted value matches the spawned process's real ``$HOME``.
+    """
+    secret_repo = FileTemplateVarRepository(tmp_path)
+    upstream = _make_stdio_upstream(
+        env={"CRED_PATH": "${HOME}/.config/cred.json"},
+    )
+    manager = UpstreamClientManager(
+        upstreams=[upstream], template_var_repo=secret_repo,
+    )
+    home = "/tmp/mcpolis-local-home-sess123"
+    resolved = await manager._resolve_upstream_template_vars(  # type: ignore[reportPrivateUsage]
+        upstream, sandbox_home=home,
+    )
+    assert resolved.stdio is not None
+    assert resolved.stdio.env == {"CRED_PATH": f"{home}/.config/cred.json"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_sandbox_file_target_path_uses_provider_home(
+    tmp_path: Path,
+) -> None:
+    """A ``${HOME}``-templated sandbox-file ``target_path`` materializes
+    under the provider's home, so the file lands where the spawned
+    process (whose ``$HOME`` is that same dir) looks for it."""
+    file_repo = FileSandboxFileRepository(tmp_path / "files")
+    await file_repo.set(
+        "default", "github", "cred",
+        contents="secret", target_path="${HOME}/.config/cred.json",
+    )
+    upstream = _make_stdio_upstream()
+    manager = UpstreamClientManager(
+        upstreams=[upstream], sandbox_file_repo=file_repo,
+    )
+    home = "/tmp/mcpolis-local-home-sess456"
+    materialized = await manager._resolve_sandbox_files(  # type: ignore[reportPrivateUsage]
+        upstream, sandbox_home=home,
+    )
+    assert len(materialized) == 1
+    assert materialized[0].target_path == f"{home}/.config/cred.json"
+    assert materialized[0].contents == "secret"
 
 
 @pytest.mark.asyncio

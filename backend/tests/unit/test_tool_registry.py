@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import mcp.types as mcp_types
 import pytest
+from mcp.shared.exceptions import McpError
 
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
 from mcpolis.domain.model.upstream import DiscoveredTool, ToolAnnotations
 from mcpolis.domain.services.tool_registry import (
     SEPARATOR,
     ToolRegistry,
+    is_transport_stall,
     prefix_display_title,
 )
 from tests.unit.factories import make_discovered_tool, make_upstream_definition
@@ -232,3 +236,118 @@ async def test_discover_upstream_raises_when_neither_session_exists() -> None:
     registry = ToolRegistry([upstream], client_manager)
     with pytest.raises(KeyError):
         await registry._discover_upstream("slack")  # pyright: ignore[reportPrivateUsage]
+
+
+# ── ROUTE-9: tool/prompt names that themselves contain the separator ──
+#
+# ``SEPARATOR`` is ``__`` and a tool's own name may legitimately contain
+# ``__`` (e.g. an upstream exposing ``get__user``). The prefixed wire
+# name is ``<upstream>__<original>`` and ``resolve_tool`` / ``resolve_prompt``
+# split on the FIRST ``__`` only, so the original name is reassembled
+# intact. A naive ``split("__")`` (no maxsplit) would mis-route
+# ``gh__get__user`` to a non-existent ``get`` tool on ``gh``.
+
+
+def test_resolve_tool_splits_on_first_separator_only() -> None:
+    """ROUTE-9: an upstream tool whose own name contains ``__`` round-trips:
+    ``gh__get__user`` resolves to ``("gh", "get__user")``, not ``("gh", "get")``
+    or a None. Split-on-first-``__`` is the contract."""
+    upstream = make_upstream_definition(id="gh")
+    registry = ToolRegistry([upstream], None)  # type: ignore[arg-type]
+    registry._tools = [
+        make_discovered_tool(upstream_id="gh", original_name="get__user"),
+    ]
+    assert registry.resolve_tool("gh__get__user") == ("gh", "get__user")
+
+
+def test_resolve_prompt_splits_on_first_separator_only() -> None:
+    """ROUTE-9 counterpart for prompts: ``gh__make__greeting`` →
+    ``("gh", "make__greeting")``."""
+    upstream = make_upstream_definition(id="gh")
+    registry = ToolRegistry([upstream], None)  # type: ignore[arg-type]
+    assert registry.resolve_prompt("gh__make__greeting") == (
+        "gh", "make__greeting",
+    )
+
+
+def test_discover_upstream_prefixes_name_containing_separator() -> None:
+    """ROUTE-9 (discovery side): a ``__``-bearing original name produces a
+    prefixed wire name that ``resolve_tool`` can split back to the SAME
+    original name — discovery and dispatch agree on the round-trip."""
+    upstream = make_upstream_definition(id="gh")
+    session = _make_discovery_session("get__user")
+    from tests.unit._state_seed import seed_shared_session
+    cm = UpstreamClientManager([upstream])
+    seed_shared_session(cm, "gh", session=session)
+
+    async def _run() -> None:
+        registry = ToolRegistry([upstream], cm)
+        tools = await registry._discover_upstream("gh")  # pyright: ignore[reportPrivateUsage]
+        assert tools[0].prefixed_name == "gh__get__user"
+        registry._tools = tools
+        assert registry.resolve_tool(tools[0].prefixed_name) == (
+            "gh", "get__user",
+        )
+
+    asyncio.run(_run())
+
+
+# ── ROUTE-11: is_transport_stall SDK-constant drift guard ────────────
+#
+# ``is_transport_stall`` compares the upstream error against two SDK
+# constants: ``mcp_types.CONNECTION_CLOSED`` and the hardcoded
+# streamable-HTTP "Session terminated" (code 32600). These are baked into
+# the classifier as literals; a future SDK upgrade that renumbers either
+# would silently turn a real stall into a non-stall (no heal, no retry —
+# the prod incident class re-opens) with every existing stall test still
+# green because they construct the error from the same drifted constant.
+# This canary asserts the SDK's published values still equal what the
+# classifier keys off, so the drift is caught at upgrade time.
+
+
+def test_is_transport_stall_connection_closed_constant_unchanged() -> None:
+    """ROUTE-11: pin ``CONNECTION_CLOSED`` to the value baked into the
+    classifier. If the SDK renumbers it, this fails — the signal to
+    re-check ``is_transport_stall``."""
+    assert mcp_types.CONNECTION_CLOSED == -32000
+    assert is_transport_stall(
+        McpError(mcp_types.ErrorData(
+            code=mcp_types.CONNECTION_CLOSED, message="connection closed",
+        )),
+    )
+
+
+def test_is_transport_stall_session_terminated_code_message_unchanged() -> None:
+    """ROUTE-11: the streamable-HTTP transport raises
+    ``McpError(code=32600, message="Session terminated")`` when the server
+    no longer honors the session id. ``is_transport_stall`` keys off BOTH
+    the code AND the exact message (so a server's own INVALID_REQUEST,
+    same code, isn't misread as a stall). Pin both halves.
+
+    HONEST SCOPE: ``"Session terminated"`` and the ``32600`` it pairs with
+    are a transport convention, not a published SDK constant — there is
+    nothing to compare them against, so this is a REGRESSION GUARD on the
+    classifier's own behaviour (catches an accidental edit to
+    ``is_transport_stall``), NOT a drift guard against the SDK/transport
+    renumbering that pair (which it cannot catch). The ``CONNECTION_CLOSED``
+    and ``INVALID_REQUEST`` assertions in the sibling tests ARE real
+    drift guards, because those values come from ``mcp.types``."""
+    # The literal pair the classifier matches against.
+    assert is_transport_stall(
+        McpError(mcp_types.ErrorData(code=32600, message="Session terminated")),
+    )
+    # Code matches but message differs → NOT a stall (a normal server answer).
+    assert not is_transport_stall(
+        McpError(mcp_types.ErrorData(code=32600, message="Invalid request")),
+    )
+    # Sanity: the SDK constant the message-distinct path guards against.
+    assert mcp_types.INVALID_REQUEST == -32600
+
+
+def test_is_transport_stall_broken_and_closed_stream_unchanged() -> None:
+    """ROUTE-11: the anyio stream-failure types the classifier treats as
+    stalls. A future anyio rename would silently drop these from the stall
+    set; pin them behaviorally."""
+    assert is_transport_stall(anyio.BrokenResourceError())
+    assert is_transport_stall(anyio.ClosedResourceError())
+    assert is_transport_stall(asyncio.TimeoutError())

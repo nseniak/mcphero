@@ -83,7 +83,18 @@ async def temp_mongo_database() -> AsyncIterator[MotorDatabase]:
     user's real ``mcpolis`` database are both safe.
     """
     uri = require_mongo()
-    client: AsyncIOMotorClient[dict[str, object]] = AsyncIOMotorClient(uri)
+    # Bounded timeouts so a CPU-/Docker-VM-starved Mongo (under make
+    # test-all) fails fast and cleanly instead of blocking a socket read
+    # forever — without these the driver's monitor recv has no socket
+    # timeout and could hang the whole unit suite. A failure here is
+    # rerun by the unit rerun net; the pytest-timeout ceiling is only the
+    # last-resort backstop.
+    client: AsyncIOMotorClient[dict[str, object]] = AsyncIOMotorClient(
+        uri,
+        serverSelectionTimeoutMS=15_000,
+        connectTimeoutMS=15_000,
+        socketTimeoutMS=15_000,
+    )
     db_name = f"mcpolis_test_{uuid.uuid4().hex[:12]}"
     try:
         db: MotorDatabase = client[db_name]

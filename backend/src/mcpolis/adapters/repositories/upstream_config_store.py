@@ -26,3 +26,6 @@ class UpstreamConfigStore(ABC):
 
     @abstractmethod
     async def remove(self, org_id: str, upstream_id: str) -> None: ...
+
+    @abstractmethod
+    async def delete_all_for_org(self, org_id: str) -> None: ...

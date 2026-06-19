@@ -191,3 +191,8 @@ class MongoUpstreamConfigRepository(UpstreamConfigStore, UpstreamConfigRepositor
         await self._upstreams.delete_one(
             org_id, {"upstream_id": upstream_id}
         )
+
+    async def delete_all_for_org(self, org_id: str) -> None:
+        # Org-deletion cascade. ``OrgScopedCollection`` scopes the empty
+        # filter to this org, so no other tenant's upstreams are touched.
+        await self._upstreams.delete_many(org_id, {})

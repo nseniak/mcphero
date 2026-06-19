@@ -80,6 +80,11 @@ class MongoSandboxPersistenceRepository(SandboxPersistenceRepository):
             org_id, {"upstream_id": upstream_id},
         )
 
+    async def delete_all_for_org(self, *, org_id: str) -> int:
+        # Org-deletion cascade. ``OrgScopedCollection`` scopes the empty
+        # filter to this org, so no other tenant's refs are touched.
+        return await self._coll.delete_many(org_id, {})
+
     async def list_for_org(
         self, *, org_id: str,
     ) -> list[SandboxPersistedRef]:

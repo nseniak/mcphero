@@ -98,6 +98,22 @@ class E2BSandboxReconciler:
             if ref.paused_snapshot_id is not None
             and ref.provider == "e2b"
         }
+        # (org, upstream) pairs with an in-flight fresh create — the
+        # service writes a "creating" marker (a ref with BOTH sandbox_id
+        # and paused_snapshot_id None, a state the normal lifecycle never
+        # produces) before ``create_sandbox`` makes the sandbox
+        # provider-visible. A running sandbox whose ``mcpolis_org`` /
+        # ``mcpolis_upstream`` metadata maps to one of these is a session
+        # mid-create on a LIVE process, not an orphan from a dead one —
+        # leave it alone (SBX-CONC-4).
+        creating_pairs: set[tuple[str, str]] = {
+            (ref.org_id, ref.upstream_id)
+            for ref in persisted_refs
+            if ref.provider == "e2b"
+            and ref.mcpolis_instance == self._mcpolis_instance
+            and ref.sandbox_id is None
+            and ref.paused_snapshot_id is None
+        }
 
         report_kw: dict[str, int] = {
             "killed_orphan_sandboxes": 0,
@@ -112,6 +128,22 @@ class E2BSandboxReconciler:
                 report_kw["skipped_other_instance"] += 1
                 continue
             if info.state == "running":
+                org = info.metadata.get("mcpolis_org")
+                ups = info.metadata.get("mcpolis_upstream")
+                if org is not None and ups is not None and (
+                    org, ups,
+                ) in creating_pairs:
+                    # A live session on this process is mid-create for
+                    # this sandbox — not an orphan. Leave it; the session
+                    # will overwrite the creating marker with a live ref.
+                    logger.info(
+                        "sandbox.reconcile.skipped_in_flight_create",
+                        provider="e2b",
+                        sandbox_id=info.sandbox_id,
+                        org_id=org,
+                        upstream_id=ups,
+                    )
+                    continue
                 await self._kill_orphan(info, report_kw)
             elif info.state == "paused":
                 if info.sandbox_id in recognized_paused:

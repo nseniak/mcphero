@@ -10,6 +10,7 @@ from mcpolis.adapters.repositories.file_service_token_repository import (
 )
 from mcpolis.domain.model.service_token import (
     SERVICE_TOKEN_PREFIX,
+    ServiceTokenRecord,
     hash_service_token,
 )
 from mcpolis.domain.services.service_token_service import (
@@ -22,6 +23,24 @@ class _RefusingRepo:
 
     def __getattr__(self, name: str) -> object:
         raise AssertionError(f"repo.{name} must not be called")
+
+
+class _CountingRepo:
+    """Repo double that records ``get_by_hash`` lookups and never finds
+    a record. Used to prove the prefix gate lets a hash lookup through
+    (so the miss is a real registry miss, not a prefix short-circuit)
+    while keeping the result None."""
+
+    def __init__(self) -> None:
+        self.hashes_looked_up: list[str] = []
+        self.touch_calls: int = 0
+
+    async def get_by_hash(self, token_hash: str) -> ServiceTokenRecord | None:
+        self.hashes_looked_up.append(token_hash)
+        return None
+
+    async def touch_last_used(self, token_hash: str, when: datetime) -> None:
+        self.touch_calls += 1
 
 
 class _Clock:
@@ -94,6 +113,23 @@ async def test_verify_unknown_token_returns_none(tmp_path: Path) -> None:
 async def test_verify_non_svct_prefix_returns_none_without_repo_lookup() -> None:
     service = ServiceTokenService(repo=_RefusingRepo())  # type: ignore[arg-type]
     assert await service.verify("some-oauth-access-token") is None
+
+
+@pytest.mark.asyncio
+async def test_verify_prefix_only_empty_secret_token_returns_none() -> None:
+    """AUTH-2: ``svct_`` with no secret body passes the prefix gate
+    (it *does* start with the prefix), so the registry is consulted —
+    and the lookup misses, yielding None. The prefix gate is a router,
+    not an authenticator: an empty-secret token is not special-cased,
+    it just hashes to a value no record carries."""
+    repo = _CountingRepo()
+    service = ServiceTokenService(repo=repo)  # type: ignore[arg-type]
+    assert await service.verify(SERVICE_TOKEN_PREFIX) is None
+    # The prefix matched, so exactly one hash lookup happened — proving
+    # the None is a real registry miss, not a prefix short-circuit.
+    assert repo.hashes_looked_up == [hash_service_token(SERVICE_TOKEN_PREFIX)]
+    # A missed lookup never touches last_used.
+    assert repo.touch_calls == 0
 
 
 @pytest.mark.asyncio

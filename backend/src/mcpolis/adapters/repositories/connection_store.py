@@ -83,6 +83,20 @@ class ConnectionStore:
         """
         raise NotImplementedError
 
+    async def delete_all_for_org(self, org_id: str) -> int:
+        """Delete EVERY stored row for this org, regardless of prefix,
+        upstream, or user: tokens, ``client_info``, ``oauth_metadata``,
+        pending codes, failure counters, notified flags, enabled markers,
+        connection-error rows, and started-config hashes. Returns the
+        number of rows removed.
+
+        This is the org-removal cascade. Org deletion is terminal, so
+        the scope is deliberately the whole tenant — the Mongo backend
+        scopes by ``org_id`` so it can never touch another org's rows;
+        the file backend is single-org and clears the store.
+        """
+        raise NotImplementedError
+
     async def get_all_stored_tokens(self, org_id: str) -> list[tuple[str, str]]:
         raise NotImplementedError
 
