@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import mcp.types as mcp_types
 import pytest
 from pydantic import AnyUrl
@@ -502,13 +503,14 @@ def make_stall_router(
 
 
 @pytest.mark.asyncio
-async def test_read_resource_heals_and_retries_on_transport_stall(
+async def test_read_resource_heals_and_retries_on_pre_delivery_stall(
     tmp_path: Path,
 ) -> None:
-    """R3 gap closed: a stalled resources/read heals the shared session
-    (fresh reconnect) and retries on a clean transport — the recovery the
-    tool path had but read_resource lacked. ``retry_safe=True`` for
-    resources (risk-b: no readOnlyHint exists for them)."""
+    """A PRE-delivery stall (a dead/closed transport — the request never
+    reached the upstream) heals the shared session (fresh reconnect) and
+    retries on a clean transport. This is the recovery resources/read must
+    keep — only the post-delivery silent stall is excluded (see the
+    sibling test)."""
     router, session, cm, _ = make_stall_router(tmp_path)
     ok = mcp_types.ReadResourceResult(
         contents=[
@@ -517,7 +519,9 @@ async def test_read_resource_heals_and_retries_on_transport_stall(
             ),
         ],
     )
-    session.read_resource = AsyncMock(side_effect=[asyncio.TimeoutError(), ok])
+    session.read_resource = AsyncMock(
+        side_effect=[anyio.ClosedResourceError(), ok],
+    )
 
     result = await router.read_resource(
         org_id=DEFAULT_ORG_ID, upstream_id="notion",
@@ -530,10 +534,35 @@ async def test_read_resource_heals_and_retries_on_transport_stall(
 
 
 @pytest.mark.asyncio
-async def test_get_prompt_heals_and_retries_on_transport_stall(
+async def test_read_resource_heals_but_does_not_retry_post_delivery_stall(
     tmp_path: Path,
 ) -> None:
-    """Counterpart for prompts/get."""
+    """A POST-delivery silent stall (``asyncio.TimeoutError`` — the request
+    reached the upstream and its response was lost) must NOT re-run the
+    read: a side-effecting resource could double-execute, and no
+    readOnlyHint exists to clear it. The session still heals (so the NEXT
+    call is clean), but this call surfaces an error and the upstream read
+    runs exactly ONCE."""
+    router, session, cm, _ = make_stall_router(tmp_path)
+    session.read_resource = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    with pytest.raises(UpstreamRouterError):
+        await router.read_resource(
+            org_id=DEFAULT_ORG_ID, upstream_id="notion",
+            original_uri="test://hello", user_id="alice", session_id=None,
+        )
+
+    assert cm.fresh_calls == 1, "the stall must still heal the shared session"
+    assert session.read_resource.await_count == 1, (
+        "a post-delivery stall must NOT re-run the read (double-execute guard)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_heals_and_retries_on_pre_delivery_stall(
+    tmp_path: Path,
+) -> None:
+    """prompts/get counterpart: a pre-delivery stall recovers via retry."""
     router, session, cm, _ = make_stall_router(tmp_path)
     ok = mcp_types.GetPromptResult(
         description="x",
@@ -544,7 +573,9 @@ async def test_get_prompt_heals_and_retries_on_transport_stall(
             ),
         ],
     )
-    session.get_prompt = AsyncMock(side_effect=[asyncio.TimeoutError(), ok])
+    session.get_prompt = AsyncMock(
+        side_effect=[anyio.ClosedResourceError(), ok],
+    )
 
     result = await router.get_prompt(
         org_id=DEFAULT_ORG_ID, upstream_id="notion",
@@ -554,6 +585,28 @@ async def test_get_prompt_heals_and_retries_on_transport_stall(
     assert isinstance(result, mcp_types.GetPromptResult)
     assert cm.fresh_calls == 1, "the stall must heal the shared session"
     assert session.get_prompt.await_count == 2, "prompt must be retried"
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_heals_but_does_not_retry_post_delivery_stall(
+    tmp_path: Path,
+) -> None:
+    """prompts/get counterpart: a post-delivery silent stall heals but is
+    NOT re-run (a prompt render can fetch live data / meter usage)."""
+    router, session, cm, _ = make_stall_router(tmp_path)
+    session.get_prompt = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    with pytest.raises(UpstreamRouterError):
+        await router.get_prompt(
+            org_id=DEFAULT_ORG_ID, upstream_id="notion",
+            original_name="greet", arguments=None,
+            user_id="alice", session_id=None,
+        )
+
+    assert cm.fresh_calls == 1, "the stall must still heal the shared session"
+    assert session.get_prompt.await_count == 1, (
+        "a post-delivery stall must NOT re-run the prompt (double-execute guard)"
+    )
 
 
 @pytest.mark.asyncio

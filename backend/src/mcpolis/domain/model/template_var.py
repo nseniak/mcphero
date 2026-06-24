@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 
 # Standard env-var convention: uppercase letter or underscore start,
 # uppercase letters / digits / underscore body. Same regex used by the
@@ -61,34 +61,6 @@ class MissingTemplateVarError(Exception):
             f"Environment variable {name!r} is referenced by upstream "
             f"{upstream_id!r} but not defined"
         )
-
-
-class TemplateVar(BaseModel):
-    """A per-MCP environment variable with the plaintext value attached.
-
-    Constructed in flight only — by the admin tools at write time, by
-    the repositories during ``get_value``. Never serialised back to the
-    UI; only :class:`TemplateVarSummary` crosses that boundary.
-
-    ``is_secret`` is set at create time and is immutable thereafter
-    (the repository ignores changes to this flag on replace).
-    """
-
-    name: str
-    value: str
-    is_secret: bool = True
-    last_four: str | None = None
-    created_at: datetime
-    updated_at: datetime
-
-    @field_validator("name")
-    @classmethod
-    def _validate_name(cls, v: str) -> str:
-        if not _NAME_RE.match(v):
-            raise ValueError(
-                f"Env var name {v!r} must match {_NAME_RE.pattern}"
-            )
-        return v
 
 
 class TemplateVarSummary(BaseModel):

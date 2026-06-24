@@ -148,6 +148,32 @@ async def dispatch_with_liveness(
                 pass
 
 
+def _is_post_delivery_stall(exc: BaseException) -> bool:
+    """True when *exc* is a stall that may have occurred AFTER the request
+    reached the upstream — so a blind re-run could DOUBLE-EXECUTE a
+    side-effecting op.
+
+    The liveness path (``dispatch_with_liveness``) raises
+    ``asyncio.TimeoutError`` only once the op has been in flight past the
+    probe interval AND the upstream stopped answering pings: the request
+    was already delivered and its response was lost (the E2B #1128 silent
+    post-reattach stall). That is the one stall the gateway *synthesizes*
+    for "in flight, went silent", so it is the precise post-delivery
+    signal.
+
+    Every other ``is_transport_stall`` shape — ``ClosedResourceError`` /
+    ``BrokenResourceError`` / ``CONNECTION_CLOSED`` / "Session terminated"
+    — means the cached transport was already dead (the dead-idle-session
+    case, Sentry MCPOLIS-BACKEND-R/-S), so the request never left the
+    gateway: pre-delivery, safe to re-run. HEURISTIC LIMIT: a stream that
+    breaks mid-flight *after* delivery also surfaces as
+    ``ClosedResourceError`` and is treated as pre-delivery here — so this
+    narrows the double-execute window rather than closing it. A read known
+    to side-effect needs a per-upstream opt-out, not this classifier.
+    """
+    return isinstance(exc, asyncio.TimeoutError)
+
+
 @dataclass
 class _DispatchVerb(Generic[_T]):
     """Per-verb knobs for ``ToolRouter._dispatch_with_recovery`` (R3/R4).
@@ -168,11 +194,20 @@ class _DispatchVerb(Generic[_T]):
     """The actual dispatch, given the resolved session."""
 
     retry_safe: bool
-    """Whether a transport stall may transparently re-run the op. tools:
-    only ``readOnly``/``idempotent``. resources/prompts: True — no
-    ``readOnlyHint`` exists for them, so this is a documented assumption
-    that increases shared-sandbox churn under synchronized heal
-    (risk-b); accepted as reads being safe to repeat."""
+    """Whether a transport stall may EVER transparently re-run the op
+    (drives ``max_attempts`` and the dead-token settle fallback). tools:
+    only ``readOnly``/``idempotent``. resources/prompts: True — they DO
+    retry, but only a pre-delivery stall (see ``retry_post_delivery``)."""
+
+    retry_post_delivery: bool
+    """Whether a retry-safe verb may retry even a POST-delivery silent
+    stall (``asyncio.TimeoutError`` — request in flight, response lost).
+    tools: True — an ``idempotent``/``readOnly`` tool DECLARED itself safe
+    to repeat, so a re-run is sound regardless of delivery phase.
+    resources/prompts: False — no ``readOnlyHint`` exists for them, so a
+    post-delivery re-run could double-execute a side-effecting read; only
+    a pre-delivery (dead-transport) stall is retried. See ``may_retry`` and
+    ``_is_post_delivery_stall``."""
 
     is_tool_call: bool
     """Tool-only-observability gate (R3): the
@@ -202,6 +237,20 @@ class _DispatchVerb(Generic[_T]):
     """Whether a *successful* dispatch nonetheless reports an error
     outcome — call_tool: ``result.isError``; resources/prompts: always
     False (those result types carry no error bit)."""
+
+    def may_retry(self, exc: BaseException) -> bool:
+        """Whether transport stall *exc* may transparently re-run the op.
+
+        A non-retry-safe verb never retries. A retry-safe verb that
+        DECLARED itself safe (``retry_post_delivery``) retries any stall;
+        a read/prompt (which can't declare safety) retries only a
+        pre-delivery stall, never a post-delivery silent one — that is the
+        guard against double-executing a side-effecting read."""
+        if not self.retry_safe:
+            return False
+        if not self.retry_post_delivery and _is_post_delivery_stall(exc):
+            return False
+        return True
 
 
 class ToolRouter:
@@ -364,6 +413,9 @@ class ToolRouter:
             audit_tool=prefixed_name,
             op=lambda s: s.call_tool(original_name, merged_arguments),
             retry_safe=retry_safe,
+            # An annotation-declared safe tool may retry any stall,
+            # including a post-delivery one — it vouched for repeatability.
+            retry_post_delivery=True,
             is_tool_call=True,
             failure_log_event="tool.call.failed",
             failure_log_fields={"tool": prefixed_name},
@@ -377,6 +429,31 @@ class ToolRouter:
             user_id=user_id,
             session_id=session_id,
             verb=verb,
+        )
+
+    async def _settle_after_unrecovered_stall(
+        self,
+        *,
+        org_id: str,
+        upstream: UpstreamDefinition,
+        effective_user: str,
+    ) -> None:
+        """Run the dead-token reconnect probe for a stall we healed but
+        will NOT retry (a non-retry-safe tool, or a read/prompt declining a
+        post-delivery silent stall).
+
+        Thin wrapper over ``settle_oauth_state_after_stall`` — pulls the
+        connection store / client manager / server url off ``self`` — so the
+        loop's settle DECISION is unit-testable via override without
+        standing up real OAuth. No-op for service_account / no connection
+        store (the wrapped function early-returns)."""
+        await settle_oauth_state_after_stall(
+            org_id=org_id,
+            upstream=upstream,
+            effective_user=effective_user,
+            connection_store=self._connection_store,
+            client_manager=self._client_manager,
+            server_url=self._server_url,
         )
 
     async def _dispatch_with_recovery(
@@ -483,7 +560,25 @@ class ToolRouter:
                                 op=verb.audit_tool,
                             )
                         else:
-                            if not is_last:
+                            if not is_last and verb.may_retry(exc):
+                                if not verb.retry_post_delivery:
+                                    # A read/prompt (no readOnly annotation)
+                                    # is being RE-RUN — only ever on a
+                                    # pre-delivery stall (may_retry gates out
+                                    # the post-delivery case), but the
+                                    # heuristic can't fully prove pre-
+                                    # delivery, so surface the re-execution
+                                    # so a possible double-effect is
+                                    # auditable. A side-effecting read should
+                                    # use a per-upstream opt-out, not lean on
+                                    # the heuristic.
+                                    logger.warning(
+                                        "upstream.dispatch.read_reexecuted",
+                                        org_id=org_id,
+                                        upstream_id=upstream.id,
+                                        op=verb.audit_tool,
+                                        stall=type(exc).__name__,
+                                    )
                                 logger.warning(
                                     "upstream.dispatch.transport_stall_retry",
                                     org_id=org_id,
@@ -492,24 +587,25 @@ class ToolRouter:
                                     attempt=attempt,
                                 )
                                 continue
-                            if not verb.retry_safe:
-                                # Last (only) attempt of a NON-retry-safe
-                                # verb: the heal evicted but nothing will
-                                # reconnect, so a stall caused by REVOKED
-                                # OAuth tokens would leave the token row —
-                                # and the dashboard "Ready" — intact. Run
-                                # the reconnect probe a retry-safe verb gets
-                                # for free (its retry's _resolve_session
-                                # reconnects + classifies), so §5.1 deletes
-                                # dead tokens and the dashboard reflects the
-                                # disconnect. No-op for service_account.
-                                await settle_oauth_state_after_stall(
+                            if attempt == 0:
+                                # Healed on the FIRST attempt but not
+                                # retrying this call — a NON-retry-safe tool,
+                                # or a read/prompt declining a POST-delivery
+                                # silent stall to avoid a double-execute. The
+                                # heal evicted but nothing will reconnect, so
+                                # a stall caused by REVOKED OAuth tokens would
+                                # leave the token row — and the dashboard
+                                # "Ready" — intact. Run the reconnect probe a
+                                # retry gets for free (its retry's
+                                # _resolve_session reconnects + classifies),
+                                # so §5.1 deletes dead tokens and the
+                                # dashboard reflects the disconnect. A later
+                                # attempt already reconnected. No-op for
+                                # service_account.
+                                await self._settle_after_unrecovered_stall(
                                     org_id=org_id,
                                     upstream=upstream,
                                     effective_user=session_result.effective_user,
-                                    connection_store=self._connection_store,
-                                    client_manager=self._client_manager,
-                                    server_url=self._server_url,
                                 )
                     response_status = "error"
                     correlation_id = uuid.uuid4().hex[:12]
@@ -661,9 +757,12 @@ class ToolRouter:
         adapters raise ``UpstreamRouterError`` with the user-facing
         message — the gateway controller maps that to a clean text
         ``ReadResourceResult`` (these result types carry no
-        ``isError`` bit). ``retry_safe=True`` is a documented assumption
-        (risk-b): no ``readOnlyHint`` exists for resources, so a read is
-        taken to be safe to repeat.
+        ``isError`` bit). Stall recovery is delivery-phase aware
+        (``retry_post_delivery=False``): a pre-delivery (dead-transport)
+        stall is retried to recover, but a post-delivery silent stall is
+        NOT — there is no ``readOnlyHint`` for resources, so a re-run could
+        double-execute a side-effecting read (the residual heuristic limit
+        is in ``_is_post_delivery_stall``).
         """
         upstream = self._upstreams.get(upstream_id)
         if upstream is None:
@@ -688,6 +787,11 @@ class ToolRouter:
             audit_tool=f"resource:{upstream_id}:{original_uri}",
             op=lambda s: s.read_resource(AnyUrl(original_uri)),
             retry_safe=True,
+            # No readOnlyHint exists for resources, so a read can't declare
+            # itself repeatable: retry a pre-delivery (dead-transport) stall
+            # to recover, but NOT a post-delivery silent stall, which could
+            # double-execute a side-effecting read (risk-b).
+            retry_post_delivery=False,
             is_tool_call=False,
             failure_log_event="resource.read.failed",
             failure_log_fields={"resource_uri": original_uri},
@@ -716,8 +820,9 @@ class ToolRouter:
 
         Counterpart to ``read_resource``; same auth-mode handling, same
         ping-gated stall recovery, same audit semantics, same
-        ``retry_safe=True`` assumption (risk-b). ``arguments`` is
-        forwarded unchanged to the upstream, mirroring ``call_tool``'s
+        delivery-phase-aware retry (``retry_post_delivery=False``: retry a
+        pre-delivery stall, never a post-delivery silent one). ``arguments``
+        is forwarded unchanged to the upstream, mirroring ``call_tool``'s
         arguments passthrough.
         """
         upstream = self._upstreams.get(upstream_id)
@@ -740,6 +845,10 @@ class ToolRouter:
             audit_tool=f"prompt:{upstream_id}:{original_name}",
             op=lambda s: s.get_prompt(original_name, arguments),
             retry_safe=True,
+            # Same as read_resource: prompts can't declare repeatability, so
+            # retry only a pre-delivery stall, never a post-delivery silent
+            # one (a prompt render can fetch live data / meter usage).
+            retry_post_delivery=False,
             is_tool_call=False,
             failure_log_event="prompt.get.failed",
             failure_log_fields={"prompt": original_name},
