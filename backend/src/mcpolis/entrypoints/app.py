@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import shutil
+from pathlib import Path
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -2127,11 +2128,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # is just a download endpoint. No auth (same threat model as
     # ``/dev/mcp-demo``); don't enable in untrusted environments.
     if settings.stdio_test_mcp:
-        from pathlib import Path as _Path  # noqa: PLC0415
         from starlette.responses import PlainTextResponse  # noqa: PLC0415
 
         _stdio_test_mcp_path = (
-            _Path(__file__).parent.parent / "dev" / "stdio_test_mcp_server.py"
+            Path(__file__).parent.parent / "dev" / "stdio_test_mcp_server.py"
         )
 
         @app.get("/dev/stdio-test-mcp.py")
@@ -2155,7 +2155,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from starlette.staticfiles import StaticFiles
 
         # Serve static assets (JS, CSS, fonts) from /assets/
-        app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")))
+        # Resolved once: ``_resolve_under`` compares against it on every
+        # request, and a relative or symlinked dist would never match.
+        dist_root = frontend_dist.resolve()
+        app.mount("/assets", StaticFiles(directory=str(dist_root / "assets")))
 
         # SPA fallback: serve index.html for any unmatched route.
         # index.html must never be cached — it references hashed asset filenames
@@ -2165,8 +2168,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         @app.get("/{path:path}")
         async def spa_fallback(path: str) -> Response:
-            # Serve actual files if they exist (favicon, etc.)
-            file_path = frontend_dist / path
+            # Serve actual files if they exist (favicon, etc.) — but
+            # only files that really live inside the built frontend.
+            file_path = _resolve_under(dist_root, path)
+            if file_path is None:
+                return Response(status_code=404)
             if file_path.is_file():
                 return FileResponse(str(file_path))
             # Refuse to SPA-fallback on paths that clearly aren't app
@@ -2181,18 +2187,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # frontend prerender plugin emits these for marketing routes
             # so non-JS crawlers and social scrapers see real content.
             if path:
-                prerendered = frontend_dist / path / "index.html"
-                if prerendered.is_file():
+                prerendered = _resolve_under(dist_root, path, "index.html")
+                if prerendered is not None and prerendered.is_file():
                     return FileResponse(
                         str(prerendered),
                         headers=no_cache_headers,
                     )
             return FileResponse(
-                str(frontend_dist / "index.html"),
+                str(dist_root / "index.html"),
                 headers=no_cache_headers,
             )
 
     return app
+
+
+def _resolve_under(root: Path, *parts: str) -> Path | None:
+    """Resolve ``parts`` beneath ``root``, or None when the result escapes it.
+
+    The path segment comes straight off the URL, so it can be absolute
+    or contain ``..``. Starlette strips exactly one leading slash when
+    it binds ``{path:path}``, so a request for ``//proc/self/environ``
+    arrives here as the absolute ``/proc/self/environ`` — and
+    ``root / <absolute>`` silently DISCARDS ``root`` (pathlib
+    semantics), handing back a path anywhere on disk. Resolve first,
+    then require the result to stay inside ``root``.
+    """
+    candidate = (root / Path(*parts)).resolve()
+    return candidate if candidate.is_relative_to(root) else None
 
 
 # Paths the SPA fallback must not paper over. Specific backend routes

@@ -22,9 +22,12 @@ Pinning three properties:
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from mcpolis.entrypoints.app import (  # pyright: ignore[reportPrivateUsage]
+    _resolve_under,
     _should_reject_spa_fallback,
 )
 
@@ -128,3 +131,74 @@ def test_empty_path_is_not_rejected() -> None:
     """The root (``"/"``) arrives here as the empty string. That's
     the SPA entry point — the most load-bearing route of all."""
     assert _should_reject_spa_fallback("") is False
+
+
+# --- path-escape guard (_resolve_under) ---
+#
+# The catch-all joins the URL path onto the built frontend directory.
+# Starlette strips exactly one leading slash when it binds
+# ``{path:path}``, so ``//proc/self/environ`` arrives as the absolute
+# ``/proc/self/environ`` — and ``dist / "/proc/self/environ"`` is just
+# ``/proc/self/environ`` under pathlib rules. Meerbot (sister project,
+# same code) was probed for exactly that on 2026-08-30. mcphero.io is
+# shielded by nginx, which merges duplicate slashes and forwards only
+# fixed prefixes; the ``standalone`` compose profile has no such proxy.
+
+
+def make_dist(tmp_path: Path) -> Path:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html>shell</html>")
+    (dist / "favicon.svg").write_text("<svg></svg>")
+    (dist / "contact").mkdir()
+    (dist / "contact" / "index.html").write_text("<html>contact</html>")
+    return dist
+
+
+def test_resolve_under_allows_real_file(tmp_path: Path) -> None:
+    dist = make_dist(tmp_path)
+    assert _resolve_under(dist, "favicon.svg") == dist / "favicon.svg"
+
+
+def test_resolve_under_allows_nested_prerendered_route(tmp_path: Path) -> None:
+    dist = make_dist(tmp_path)
+    resolved = _resolve_under(dist, "contact", "index.html")
+    assert resolved == dist / "contact" / "index.html"
+
+
+def test_resolve_under_allows_the_root_itself(tmp_path: Path) -> None:
+    dist = make_dist(tmp_path)
+    assert _resolve_under(dist, "") == dist
+
+
+def test_resolve_under_rejects_absolute_path(tmp_path: Path) -> None:
+    dist = make_dist(tmp_path)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("MCPOLIS_SESSION_SECRET=hunter2")
+    assert _resolve_under(dist, str(secret)) is None
+
+
+def test_resolve_under_rejects_proc_self_environ(tmp_path: Path) -> None:
+    dist = make_dist(tmp_path)
+    assert _resolve_under(dist, "/proc/self/environ") is None
+
+
+def test_resolve_under_rejects_dotdot_escape(tmp_path: Path) -> None:
+    dist = make_dist(tmp_path)
+    (tmp_path / "outside.txt").write_text("not public")
+    assert _resolve_under(dist, "../outside.txt") is None
+
+
+def test_resolve_under_rejects_dotdot_buried_mid_path(tmp_path: Path) -> None:
+    dist = make_dist(tmp_path)
+    (tmp_path / "outside.txt").write_text("not public")
+    assert _resolve_under(dist, "contact/../../outside.txt") is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/etc/passwd", "/proc/self/cmdline", "//etc/hostname", "../../../etc/passwd"],
+)
+def test_resolve_under_rejects_known_scanner_probes(tmp_path: Path, path: str) -> None:
+    dist = make_dist(tmp_path)
+    assert _resolve_under(dist, path) is None
