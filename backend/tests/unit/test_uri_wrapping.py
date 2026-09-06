@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import pytest
 
-from mcpolis.domain.services.uri_wrapping import (
+from mcpolis.domain.services.uri_wrapping import (  # pyright: ignore[reportPrivateUsage]
     WrappedUriError,
+    _b64_decode,
     is_wrapped_widget_uri,
     unwrap_resource_uri,
     wrap_resource_uri,
@@ -143,3 +144,14 @@ def test_is_wrapped_widget_uri_rejects_unwrapped_ui() -> None:
     handler might try to unwrap them and crash."""
     assert is_wrapped_widget_uri("ui://widget/query-results.html") is False
     assert is_wrapped_widget_uri("mcphero://orgs/a/upstreams/b/resources/x") is False
+
+
+def test_non_ascii_segment_raises_wrapped_uri_error() -> None:
+    """`segment` comes off the request URI, so it can be non-ASCII.
+
+    Already correct today: UnicodeEncodeError subclasses ValueError, so
+    the existing `except (ValueError, ...)` catches it. Pinned here
+    because that is a subtle reason to rely on, and narrowing the except
+    clause later would silently turn this into a 500."""
+    with pytest.raises(WrappedUriError):
+        _b64_decode("平仮名")
