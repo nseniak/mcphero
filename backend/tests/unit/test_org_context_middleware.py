@@ -199,7 +199,9 @@ async def drive(
     scope: Scope = {
         "type": "http",
         "path": path,
-        "raw_path": path.encode("latin-1"),
+        # utf-8, not latin-1: a real server percent-encodes, and a
+        # test path may hold non-Latin characters.
+        "raw_path": path.encode("utf-8"),
         "headers": headers,
         "query_string": query_string.encode("latin-1"),
         "method": "GET",
@@ -963,3 +965,18 @@ async def test_resolved_org_id_is_bound_to_structlog_contextvars() -> None:
         f"middleware must not wipe pre-existing structlog context; "
         f"saw: {bound}"
     )
+
+
+@pytest.mark.asyncio
+async def test_non_latin_mcp_path_does_not_crash() -> None:
+    """Sibling of the snoopier host-rewrite crash in argus
+    (ARGUS-BACKEND-6): the slug rewrite rebuilt ``raw_path`` by
+    encoding the percent-DECODED path as latin-1, which raises
+    UnicodeEncodeError for any non-Latin path a scanner probes and
+    turns a clean 4xx into a 500."""
+    settings = make_settings(mode="standalone")
+
+    result = await run_middleware(settings, "/mcp/\u5e73\u4eee\u540d")
+
+    assert result.status == 200
+    assert result.downstream_path == "/mcp/\u5e73\u4eee\u540d"

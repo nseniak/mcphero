@@ -380,7 +380,14 @@ class OrgContextMiddleware:
                 # mount routes the request to the non-slugged prefix.
                 new_scope: dict[str, Any] = dict(scope)
                 new_scope["path"] = rewritten_path
-                new_scope["raw_path"] = rewritten_path.encode("latin-1")
+                # ``path`` is percent-DECODED and can hold any
+                # character (scanners probe ``/mcp/<slug>/平仮名``);
+                # latin-1 cannot represent most of them, so encoding it
+                # raised UnicodeEncodeError and turned a clean 4xx into
+                # a 500. utf-8 encodes every string. Sibling of the
+                # snoopier host-rewrite crash in argus
+                # (ARGUS-BACKEND-6).
+                new_scope["raw_path"] = rewritten_path.encode("utf-8")
                 await self._app(new_scope, receive, send)
             else:
                 await self._app(scope, receive, send)
