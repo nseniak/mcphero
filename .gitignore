@@ -1,7 +1,7 @@
 .DS_Store
 
-# coyodex-eval — method-quality regression output (regenerable)
-.coyodex-eval/
+# coyomap-eval — method-quality regression output (regenerable)
+.coyomap-eval/
 
 # Python
 __pycache__/
@@ -81,5 +81,5 @@ tests/e2e/test-results/
 # Mondrian interactive-diagram tool state (served locally; not part of the repo)
 .mondrian/
 
-# coyodex project map (local only, not tracked)
-.coyodex/
+# coyomap project map (local only, not tracked)
+.coyomap/

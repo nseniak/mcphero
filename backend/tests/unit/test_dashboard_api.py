@@ -2284,3 +2284,115 @@ def test_admin_rename_role_400_on_unknown(tmp_path: Path) -> None:
     )
     assert resp.status_code == 400
 
+
+
+# --- Last-admin lockout guard ----------------------------------------
+# The seeded CONFIG_JSON has exactly one admin (admin@example.com) and
+# one developer (dev@example.com), which is the shape that can lock an
+# org out. Frontend-only enforcement is not enough: the admin MCP tools
+# reach the same mutations with no screen involved.
+
+
+def test_removing_the_only_admin_is_refused(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+
+    resp = client.delete("/api/admin/users/admin@example.com")
+    assert resp.status_code == 409
+    assert "only admin" in resp.json()["detail"]
+
+    # Still a member, still an admin — the refusal changed nothing.
+    resp = client.get("/api/admin/users")
+    admins = {u["email"] for u in resp.json() if u["is_admin"]}
+    assert "admin@example.com" in admins
+
+
+def test_demoting_the_only_admin_is_refused(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+
+    resp = client.put(
+        "/api/admin/users/admin@example.com/role",
+        json={"role": "developer"})
+    assert resp.status_code == 409
+    assert "only admin" in resp.json()["detail"]
+
+    resp = client.get("/api/admin/users")
+    roles = {u["email"]: u["role"] for u in resp.json()}
+    assert roles["admin@example.com"] == "admin"
+
+
+def test_the_only_admin_may_leave_once_a_second_admin_exists(
+    tmp_path: Path,
+) -> None:
+    """The guard protects the org, not the incumbent. Handing over and
+    stepping down must stay possible — otherwise the first admin can
+    never leave the team they created.
+
+    The successor has to sign in once first: only a signed-in member
+    counts as an admin, so that the handover lands on somebody who
+    demonstrably exists."""
+    client = make_test_client(tmp_path)
+
+    # The successor signs in once, which creates their membership row.
+    login_as(client, "dev@example.com")
+    login_as(client, "admin@example.com")
+
+    resp = client.put(
+        "/api/admin/users/dev@example.com/role", json={"role": "admin"})
+    assert resp.status_code == 200
+
+    resp = client.delete("/api/admin/users/admin@example.com")
+    assert resp.status_code == 200
+
+    # The caller just removed themselves, so their own session is no
+    # longer an admin of this org. Check the result as the new admin.
+    login_as(client, "dev@example.com")
+    resp = client.get("/api/admin/users")
+    assert resp.status_code == 200
+    emails = {u["email"] for u in resp.json()}
+    assert "admin@example.com" not in emails
+    assert "dev@example.com" in emails
+
+
+def test_removing_a_non_admin_still_works(tmp_path: Path) -> None:
+    """Regression guard on the guard: it must not block ordinary
+    member removal."""
+    client = make_test_client(tmp_path)
+
+    resp = client.delete("/api/admin/users/dev@example.com")
+    assert resp.status_code == 200
+
+
+def test_a_pending_admin_does_not_license_the_real_admin_to_leave(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's bricking sequence, end to end.
+
+    Invite a second admin at an address that never signs in (a typo),
+    then try to remove the only admin who actually exists. Before the
+    ``eligible`` narrowing this returned 200 and the org was left with
+    nobody who could administer it.
+    """
+    client = make_test_client(tmp_path)
+
+    resp = client.post(
+        "/api/admin/users", json={"email": "tpyo@example.com", "role": "admin"})
+    assert resp.status_code == 201
+
+    # The Team page itself calls this one pending, not active.
+    resp = client.get("/api/admin/users")
+    statuses = {u["email"]: u.get("status") for u in resp.json()}
+    assert statuses["tpyo@example.com"] == "pending"
+
+    resp = client.delete("/api/admin/users/admin@example.com")
+    assert resp.status_code == 409
+    assert "only admin" in resp.json()["detail"]
+
+
+def test_the_mistyped_invite_can_still_be_cleaned_up(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+    resp = client.post(
+        "/api/admin/users", json={"email": "tpyo@example.com", "role": "admin"})
+    assert resp.status_code == 201
+
+    resp = client.delete("/api/admin/users/tpyo@example.com")
+    assert resp.status_code == 200

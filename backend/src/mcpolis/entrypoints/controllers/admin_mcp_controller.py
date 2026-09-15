@@ -18,7 +18,11 @@ from mcpolis.adapters.auth.pending_auth import PendingAuthCoordinator
 from mcpolis.adapters.repositories.connection_store import ConnectionStore
 from mcpolis.domain.model.events import Event
 from mcpolis.domain.model.policy import AuthMode, UpstreamAuthConfig
-from mcpolis.domain.model.settings import ArgumentConstraint, UserDefinition
+from mcpolis.domain.model.settings import (
+    ArgumentConstraint,
+    SettingsConfig,
+    UserDefinition,
+)
 from mcpolis.domain.model.upstream import (
     HttpTransportConfig,
     StdioTransportConfig,
@@ -51,7 +55,12 @@ from mcpolis.domain.services.sandbox_service import (
     ResourcesUnsupported,
     SandboxResources,
 )
-from mcpolis.domain.services.settings_resolver import resolve_settings
+from mcpolis.domain.services.settings_resolver import (
+    LAST_ADMIN_DEMOTE_ERROR,
+    LAST_ADMIN_REMOVE_ERROR,
+    resolve_settings,
+    would_remove_last_admin,
+)
 from mcpolis.domain.services.upstream_connection_service import (
     SessionUnavailable,
     acquire_and_refresh_with_recovery,
@@ -842,6 +851,18 @@ def create_admin_mcp_server(
             "is_admin": resolved.is_admin,
         }, indent=2)
 
+    async def _active_member_emails(
+        org_id: str, config: SettingsConfig,
+    ) -> set[str]:
+        """Mirror of the dashboard's active-vs-pending split, so both
+        doors apply the last-admin rule to the same population. An
+        invited address with no membership row has never signed in and
+        cannot administer anything."""
+        if org_repo is None:
+            return set(config.users.keys())
+        memberships = await org_repo.list_memberships(org_id)
+        return {m.email for m in memberships}
+
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="remove_user",
         description=(
@@ -854,6 +875,12 @@ def create_admin_mcp_server(
     async def remove_user(email: str) -> str:
         org_id = current_org_id.get()
         runtime = await runtime_manager.get(org_id)
+        config = runtime.policy_engine.config
+        if would_remove_last_admin(
+            config, email,
+            eligible=await _active_member_emails(org_id, config),
+        ):
+            return f"Error: {LAST_ADMIN_REMOVE_ERROR}"
         try:
             new_config = await policy_store.remove_user(org_id, email)
         except ValueError as e:
@@ -882,6 +909,12 @@ def create_admin_mcp_server(
     async def set_user_role(email: str, role: str) -> str:
         org_id = current_org_id.get()
         runtime = await runtime_manager.get(org_id)
+        config = runtime.policy_engine.config
+        if role in config.roles and would_remove_last_admin(
+            config, email, new_role=role,
+            eligible=await _active_member_emails(org_id, config),
+        ):
+            return f"Error: {LAST_ADMIN_DEMOTE_ERROR}"
         try:
             new_config = await policy_store.set_user_role(org_id, email, role)
         except ValueError as e:

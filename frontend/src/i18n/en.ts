@@ -227,6 +227,8 @@ export const en = {
   "users.addUser": "Add Member",
   "users.confirmRemove": "Remove user \"{{email}}\"?",
   "users.failedToAdd": "Failed to add user",
+  "users.failedToRemove": "Failed to remove user",
+  "users.failedToUpdateRole": "Failed to change role",
   "users.noUsers":
     "No users yet. The first Google login will be auto-assigned admin.",
   "users.formEmail": "Email (Google only)",

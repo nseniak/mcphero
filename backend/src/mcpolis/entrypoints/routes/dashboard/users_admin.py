@@ -20,10 +20,17 @@ from mcpolis.domain.services.plan_gates import (
     assert_seat_capacity,
     resolve_plan,
 )
-from mcpolis.domain.services.settings_resolver import resolve_settings
+from mcpolis.domain.services.settings_resolver import (
+    LAST_ADMIN_DEMOTE_ERROR,
+    LAST_ADMIN_REMOVE_ERROR,
+    LastAdminError,
+    resolve_settings,
+    would_remove_last_admin,
+)
 from mcpolis.entrypoints.controllers.gateway_controller import current_org_id
 from mcpolis.entrypoints.routes.dashboard._deps import (
     DashboardDeps,
+    active_member_emails,
     notify_policy_change,
 )
 from mcpolis.entrypoints.routes.dashboard._models import (
@@ -44,17 +51,7 @@ def create_users_admin_router(deps: DashboardDeps) -> APIRouter:
         org_id = current_org_id.get()
         runtime = await deps.runtime_manager.get(org_id)
         config = runtime.policy_engine.config
-        # Determine which users have actually signed in by checking
-        # for a membership row. Users in config.users without a
-        # membership are "pending" (pre-approved but never signed in).
-        active_emails: set[str] = set()
-        if deps.org_repo is not None:
-            memberships = await deps.org_repo.list_memberships(org_id)
-            active_emails = {m.email for m in memberships}
-        else:
-            # Standalone mode: everyone is active (no membership
-            # tracking, single-org, direct config.users management).
-            active_emails = set(config.users.keys())
+        active_emails = await active_member_emails(deps, org_id, config)
         results: list[UserInfo] = []
         for email, user_def in config.users.items():
             resolved = resolve_settings(config, email)
@@ -127,10 +124,20 @@ def create_users_admin_router(deps: DashboardDeps) -> APIRouter:
         runtime = await deps.runtime_manager.get(org_id)
         removed_role = runtime.policy_engine.config.users.get(email)
         removed_role_name = removed_role.role if removed_role else "unknown"
+        config = runtime.policy_engine.config
+        if would_remove_last_admin(
+            config, email,
+            eligible=await active_member_emails(deps, org_id, config),
+        ):
+            raise HTTPException(409, LAST_ADMIN_REMOVE_ERROR)
         try:
             new_config = await deps.policy_store.remove_user(org_id, email)
             runtime.policy_engine.reload(new_config)
             notify_policy_change(deps, user=email)
+        except LastAdminError as e:
+            # The store re-checks under its write lock; a racing request
+            # can land here even though the pre-check above passed.
+            raise HTTPException(409, str(e)) from None
         except ValueError as e:
             raise HTTPException(404, str(e)) from None
         # Remove membership row so list_user_orgs stays in sync.
@@ -170,12 +177,24 @@ def create_users_admin_router(deps: DashboardDeps) -> APIRouter:
         runtime = await deps.runtime_manager.get(org_id)
         previous = runtime.policy_engine.config.users.get(email)
         previous_role = previous.role if previous else "unknown"
+        # Only pre-check once the target role is known to exist —
+        # otherwise a bogus role name on the sole admin reports "only
+        # admin" when the real problem is the role name. The store
+        # still enforces the invariant either way.
+        config = runtime.policy_engine.config
+        if body.role in config.roles and would_remove_last_admin(
+            config, email, new_role=body.role,
+            eligible=await active_member_emails(deps, org_id, config),
+        ):
+            raise HTTPException(409, LAST_ADMIN_DEMOTE_ERROR)
         try:
             new_config = await deps.policy_store.set_user_role(
                 org_id, email, body.role,
             )
             runtime.policy_engine.reload(new_config)
             notify_policy_change(deps, user=email)
+        except LastAdminError as e:
+            raise HTTPException(409, str(e)) from None
         except ValueError as e:
             raise HTTPException(400, str(e)) from None
         # Update membership row to keep roles in sync.

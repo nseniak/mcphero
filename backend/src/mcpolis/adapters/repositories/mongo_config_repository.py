@@ -10,6 +10,9 @@ import asyncio
 from typing import Any
 
 from mcpolis.adapters.repositories.mongo_client import OrgScopedCollection
+from mcpolis.domain.services.settings_resolver import (
+    assert_keeps_an_admin,
+)
 from mcpolis.domain.model.settings import (
     ArgumentConstraint,
     DEFAULT_SETTINGS_CONFIG,
@@ -142,6 +145,9 @@ class MongoConfigRepository(ConfigRepository):
             config = await self._read(org_id)
             if email not in config.users:
                 raise ValueError(f"User '{email}' not found")
+            # Inside the lock: check + write are one step, so two
+            # parallel removals can't each see a surviving admin.
+            assert_keeps_an_admin(config, email)
             del config.users[email]
             await self._write(org_id, config)
             return config
@@ -155,6 +161,7 @@ class MongoConfigRepository(ConfigRepository):
                 raise ValueError(f"User '{email}' not found")
             if role not in config.roles:
                 raise ValueError(f"Role '{role}' not found")
+            assert_keeps_an_admin(config, email, new_role=role)
             config.users[email].role = role
             await self._write(org_id, config)
             return config

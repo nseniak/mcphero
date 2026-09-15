@@ -48,7 +48,13 @@ mixpanel = "^4.10.0"
 # real-SDK adapter at ``adapters/sandbox_e2b/real_client.py`` imports
 # this lazily so deployments running on ``own-runner`` /
 # ``local-subprocess`` don't pay an import cost.
-e2b = "^2.20.0"
+# Pinned exactly: pause/resume + reattach behavior is version-sensitive.
+# 2.29.0 is the newest release BEFORE the 2.29.1 reattach-stdout-stall
+# regression (changeset cb061d2): 2.29.0 stalls ~1/6 on reattach, 2.29.1+
+# stalls ~6/6, forcing a fresh-create recovery on nearly every resume.
+# Bisect-verified 2026-07-23. Do NOT bump to 2.29.1+ until E2B fixes it;
+# re-run the paid integration gate on any bump. Don't float.
+e2b = "2.29.0"
 # Async SMTP client for the transactional-email adapter
 # (``adapters/email/smtp_email_sender.py``). Used only when
 # ``MCPOLIS_SMTP_HOST`` is set; the stub sender needs no SMTP lib.

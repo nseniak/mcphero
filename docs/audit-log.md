@@ -4,8 +4,10 @@ Every tool call and every gateway connection event in your organization is logge
 
 ## What gets logged
 
-- **Tool call** — every tool call: who called what, with which arguments, what came back, how long it took, and whether the call was allowed or denied by your role policies.
+- **Tool call** — every tool call: who called what, how long it took, whether it succeeded, and whether the call was allowed or denied by your role policies.
 - **Connection** — when a team member's AI client connects or disconnects from the gateway.
+
+Arguments and responses are deliberately **not** recorded. Tool arguments routinely carry API keys, tokens and customer data, so the log keeps the fact of the call and its outcome, never the values passed in or returned.
 
 Denied tool calls are logged too — the policy check happens before the call is forwarded, and the deny reason is recorded.
 

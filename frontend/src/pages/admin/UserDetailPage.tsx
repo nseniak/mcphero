@@ -30,6 +30,10 @@ export function UserDetailPage() {
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
   const [editRole, setEditRole] = useState("");
+  // Server-side refusals the screens cannot predict — today the
+  // last-admin guard, which returns 409 from both the role change and
+  // the removal. Without this the click looked like it worked.
+  const [actionError, setActionError] = useState("");
 
   const decodedEmail = email ? decodeURIComponent(email) : "";
   const isSelf = decodedEmail === currentUser?.email;
@@ -66,9 +70,17 @@ export function UserDetailPage() {
 
   const handleSave = async () => {
     if (!decodedEmail || !user) return;
+    setActionError("");
     if (editRole !== user.role) {
-      const updated = await setUserRole(decodedEmail, editRole);
-      setUser(updated);
+      try {
+        const updated = await setUserRole(decodedEmail, editRole);
+        setUser(updated);
+      } catch (e) {
+        // Stay in edit mode: closing the editor would read as saved.
+        setActionError(
+          e instanceof Error ? e.message : t("users.failedToUpdateRole"));
+        return;
+      }
     }
     setEditing(false);
     reload();
@@ -84,7 +96,15 @@ export function UserDetailPage() {
       destructive: true,
     });
     if (!ok) return;
-    await removeUser(decodedEmail);
+    setActionError("");
+    try {
+      await removeUser(decodedEmail);
+    } catch (e) {
+      // Do NOT navigate away — the person is still a member.
+      setActionError(
+        e instanceof Error ? e.message : t("users.failedToRemove"));
+      return;
+    }
     navigate(`/orgs/${orgSlug}/admin/team`);
   };
 
@@ -115,6 +135,10 @@ export function UserDetailPage() {
           )}
         </div>
       </div>
+
+      {actionError && (
+        <p className="mb-4 text-sm text-red-600">{actionError}</p>
+      )}
 
       {/* Settings section */}
       <SettingsCard

@@ -592,3 +592,76 @@ async def test_admin_mcp_delete_role_unblocked_without_token_service(
     )
     deleted = await _call(server, "delete_role", {"role_name": role_name})
     assert "deleted" in deleted.lower()
+
+
+# ---------- last-admin lockout guard ----------
+# The admin MCP tools reach remove_user / set_user_role with no screen
+# in the way, so the dashboard's frontend-only "you can't edit your own
+# membership" rule never applied here at all. An assistant holding an
+# admin token could empty the org of admins in one call.
+
+
+def make_config_two_admins() -> dict[str, Any]:
+    return {
+        "upstreams": {},
+        "roles": {
+            "admin": {"is_admin": True},
+            "user": {"is_default": True},
+        },
+        "users": {
+            ADMIN_EMAIL: {"role": "admin"},
+            "deputy@example.com": {"role": "admin"},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_remove_user_refuses_the_only_admin(
+    tmp_path: Path,
+) -> None:
+    server, _ = await _build_admin_server(
+        tmp_path, config=_config_users_only_admin(),
+    )
+    text = await _call(server, "remove_user", {"email": ADMIN_EMAIL})
+    assert text.startswith("Error:")
+    assert "only admin" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_set_user_role_refuses_demoting_the_only_admin(
+    tmp_path: Path,
+) -> None:
+    server, _ = await _build_admin_server(
+        tmp_path, config=_config_users_only_admin(),
+    )
+    text = await _call(
+        server, "set_user_role", {"email": ADMIN_EMAIL, "role": "user"},
+    )
+    assert text.startswith("Error:")
+    assert "only admin" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_remove_user_allows_one_of_two_admins(
+    tmp_path: Path,
+) -> None:
+    server, _ = await _build_admin_server(
+        tmp_path, config=make_config_two_admins(),
+    )
+    text = await _call(server, "remove_user", {"email": "deputy@example.com"})
+    assert not text.startswith("Error:")
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_set_user_role_allows_demoting_one_of_two_admins(
+    tmp_path: Path,
+) -> None:
+    server, _ = await _build_admin_server(
+        tmp_path, config=make_config_two_admins(),
+    )
+    text = await _call(
+        server,
+        "set_user_role",
+        {"email": "deputy@example.com", "role": "user"},
+    )
+    assert not text.startswith("Error:")

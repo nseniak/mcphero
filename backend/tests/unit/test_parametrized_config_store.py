@@ -1,6 +1,7 @@
 """Parameterized ``ConfigRepository`` tests."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,9 +16,10 @@ from mcpolis.adapters.repositories.mongo_client import (
 from mcpolis.adapters.repositories.mongo_config_repository import (
     MongoConfigRepository,
 )
-from mcpolis.domain.model.settings import UserDefinition
+from mcpolis.domain.model.settings import SettingsConfig, UserDefinition
 from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.domain.ports.config_repository import ConfigRepository
+from mcpolis.domain.services.settings_resolver import LastAdminError
 from tests.unit.mongo_fixture import mongo_available, temp_mongo_database
 
 
@@ -56,6 +58,12 @@ async def test_set_and_remove_user(backend: str, tmp_path: Path) -> None:
         )
         assert "alice@test.com" in config.users
         assert config.users["alice@test.com"].role == "admin"
+        # A second admin, because the store now refuses to remove the
+        # last one. This test is about the set/remove round trip, not
+        # about that invariant (which has its own tests below).
+        await store.set_user(
+            DEFAULT_ORG_ID, "root@test.com", UserDefinition(role="admin")
+        )
         config = await store.remove_user(DEFAULT_ORG_ID, "alice@test.com")
         assert "alice@test.com" not in config.users
 
@@ -104,3 +112,111 @@ async def test_cross_org_isolation(backend: str, tmp_path: Path) -> None:
         )
         other = await store.load(other_org)
         assert "alice@test.com" not in other.users
+
+
+# --- Last-admin invariant, enforced in the store ----------------------
+# The route-level pre-check cannot hold this on its own: it reads the
+# config, awaits, then writes, so two parallel calls each see a
+# surviving admin and both proceed. The store does the check inside the
+# same lock as the write, which is what actually makes it safe.
+
+
+async def _seed_two_admins(store: ConfigRepository) -> None:
+    for email in ("alice@test.com", "bob@test.com"):
+        await store.set_user(DEFAULT_ORG_ID, email, UserDefinition(role="admin"))
+
+
+def _admins(config: SettingsConfig) -> set[str]:
+    return {
+        e for e, u in config.users.items()
+        if (r := config.roles.get(u.role)) is not None and r.is_admin
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_store_refuses_to_remove_the_only_admin(
+    backend: str, tmp_path: Path,
+) -> None:
+    async with _make_store(backend, tmp_path) as store:
+        await store.set_user(
+            DEFAULT_ORG_ID, "alice@test.com", UserDefinition(role="admin"))
+        with pytest.raises(LastAdminError):
+            await store.remove_user(DEFAULT_ORG_ID, "alice@test.com")
+        config = await store.load(DEFAULT_ORG_ID)
+        assert _admins(config) == {"alice@test.com"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_store_refuses_to_demote_the_only_admin(
+    backend: str, tmp_path: Path,
+) -> None:
+    async with _make_store(backend, tmp_path) as store:
+        await store.set_user(
+            DEFAULT_ORG_ID, "alice@test.com", UserDefinition(role="admin"))
+        with pytest.raises(LastAdminError):
+            await store.set_user_role(
+                DEFAULT_ORG_ID, "alice@test.com", "user")
+        config = await store.load(DEFAULT_ORG_ID)
+        assert _admins(config) == {"alice@test.com"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_parallel_removals_cannot_empty_the_admins(
+    backend: str, tmp_path: Path,
+) -> None:
+    """Two admins, two concurrent removals, one for each.
+
+    Both callers see two admins when they start. Exactly one may
+    succeed. Before the store-level check this left zero admins on
+    Mongo, which is production.
+    """
+    async with _make_store(backend, tmp_path) as store:
+        await _seed_two_admins(store)
+
+        results = await asyncio.gather(
+            store.remove_user(DEFAULT_ORG_ID, "alice@test.com"),
+            store.remove_user(DEFAULT_ORG_ID, "bob@test.com"),
+            return_exceptions=True,
+        )
+        refused = [r for r in results if isinstance(r, LastAdminError)]
+        assert len(refused) == 1, f"expected exactly one refusal, got {results}"
+
+        config = await store.load(DEFAULT_ORG_ID)
+        assert len(_admins(config)) == 1, (
+            f"org ended with {_admins(config)} admins; the invariant is that "
+            f"at least one always survives"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_parallel_demotions_cannot_empty_the_admins(
+    backend: str, tmp_path: Path,
+) -> None:
+    async with _make_store(backend, tmp_path) as store:
+        await _seed_two_admins(store)
+
+        results = await asyncio.gather(
+            store.set_user_role(DEFAULT_ORG_ID, "alice@test.com", "user"),
+            store.set_user_role(DEFAULT_ORG_ID, "bob@test.com", "user"),
+            return_exceptions=True,
+        )
+        refused = [r for r in results if isinstance(r, LastAdminError)]
+        assert len(refused) == 1, f"expected exactly one refusal, got {results}"
+
+        config = await store.load(DEFAULT_ORG_ID)
+        assert len(_admins(config)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_removing_one_of_two_admins_still_works(
+    backend: str, tmp_path: Path,
+) -> None:
+    async with _make_store(backend, tmp_path) as store:
+        await _seed_two_admins(store)
+        config = await store.remove_user(DEFAULT_ORG_ID, "alice@test.com")
+        assert _admins(config) == {"bob@test.com"}

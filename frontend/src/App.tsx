@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router";
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { AuthContext, useAuth, useAuthProvider } from "./hooks/useAuth";
 import { useFeatures } from "./hooks/useFeatures";
@@ -53,14 +53,23 @@ const queryClient = new QueryClient({
   },
 });
 
-function DefaultRedirect() {
+/** Shared gate for the chrome-less transit routes (``/app``,
+ *  ``/my-tools``). Resolves auth + features, hands a logged-out
+ *  visitor to the server login route, and yields the org slug the
+ *  destination path needs.
+ *
+ *  Returns ``"pending"`` while still resolving (render nothing),
+ *  ``"signup"`` when a signed-in cloud user has no org yet, or the
+ *  slug to build a destination from. Keeping this in one place means
+ *  a new transit route can't drift from ``/app``'s behaviour. */
+type TransitTarget =
+  | { status: "pending" }
+  | { status: "signup" }
+  | { status: "ready"; slug: string };
+
+function useTransitTarget(): TransitTarget {
   const { user, loading } = useAuth();
   const { mode, isLoading: featuresLoading } = useFeatures();
-  const { data: gateway, isLoading: gatewayLoading } = useQuery({
-    queryKey: ["gateway-config"],
-    queryFn: fetchGatewayConfig,
-    enabled: !!user && !user.is_admin,
-  });
 
   // Once auth + features have resolved and there's still no user, the
   // visitor is logged out. Hand off to the server login route — the
@@ -77,14 +86,57 @@ function DefaultRedirect() {
   }, [loggedOut]);
 
   if (loading || featuresLoading || !user) {
-    return null;
+    return { status: "pending" };
   }
   // Cloud mode: user signed in but has no org → must create one.
   if (mode === "cloud" && !user.current_org) {
+    return { status: "signup" };
+  }
+  return { status: "ready", slug: user.current_org?.slug ?? "default" };
+}
+
+/** Bare ``/my-tools``: resolves to the signed-in person's own org.
+ *
+ *  The gateway emits this path when a per-user OAuth connection needs
+ *  re-authenticating (``tool_router``), and so does the upstream
+ *  health-check email — neither knows the viewer's org slug, only the
+ *  org id. Without this route the path fell through to ``path="*"``
+ *  and the user landed on the marketing homepage.
+ *
+ *  The query string is preserved: the health-check link carries a
+ *  ``?reauth=`` token that its (still to be built) consumer needs. */
+function MyToolsRedirect() {
+  const target = useTransitTarget();
+  const { search } = useLocation();
+
+  if (target.status === "pending") {
+    return null;
+  }
+  if (target.status === "signup") {
+    return <Navigate to="/signup" replace />;
+  }
+  return (
+    <Navigate to={`/orgs/${target.slug}/my-tools${search}`} replace />
+  );
+}
+
+function DefaultRedirect() {
+  const { user } = useAuth();
+  const target = useTransitTarget();
+  const { data: gateway, isLoading: gatewayLoading } = useQuery({
+    queryKey: ["gateway-config"],
+    queryFn: fetchGatewayConfig,
+    enabled: !!user && !user.is_admin,
+  });
+
+  if (target.status === "pending" || !user) {
+    return null;
+  }
+  if (target.status === "signup") {
     return <Navigate to="/signup" replace />;
   }
 
-  const slug = user.current_org?.slug ?? "default";
+  const slug = target.slug;
 
   if (user.is_admin) {
     return <Navigate to={`/orgs/${slug}/admin/upstream`} replace />;
@@ -155,6 +207,11 @@ function App() {
                 during that resolve, giving every "Go to app" click a
                 visible flash of sidebar before the real page lands. */}
             <Route path="/app" element={<DefaultRedirect />} />
+            {/* Bare /my-tools: same chrome-less transit treatment as
+                /app. The gateway and the health-check email both emit
+                this path without a slug, so it must resolve to the
+                viewer's own org instead of falling to path="*". */}
+            <Route path="/my-tools" element={<MyToolsRedirect />} />
             <Route element={<DashboardLayout />}>
               <Route path="/orgs/manage" element={<OrganizationsPage />} />
               <Route path="/orgs/:slug">

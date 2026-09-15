@@ -42,7 +42,14 @@ import {
   mintMcpToken,
 } from "./helpers";
 
-// ``uvx --from mcp python -c "<INLINE>"`` runs the inline script
+// Pinned to the 1.x line, matching the backend's own ``mcp = "^1.27.0"``.
+// Unpinned, uvx resolves the latest release: mcp 2.x renamed
+// ``FastMCP`` to ``MCPServer``, so the inline script below died with
+// ModuleNotFoundError the day 2.0 shipped — a green suite broken by an
+// upstream release, not by a change here.
+const MCP_PKG = "mcp<2";
+
+// ``uvx --from mcp<2 python -c "<INLINE>"`` runs the inline script
 // in an ephemeral environment with the ``mcp`` Python package
 // installed. The script exposes two tools the e2e specs rely on:
 // ``read_env(name)`` and ``read_file(path)``.
@@ -110,7 +117,7 @@ test.describe("Stdio template-var substitution + Sandbox files — runtime", () 
           id: upstreamId,
           display_name: "subst-env-stdio",
           command: "uvx",
-          args: ["--from", "mcp", "python", "-c", INLINE_MCP_SCRIPT],
+          args: ["--from", MCP_PKG, "python", "-c", INLINE_MCP_SCRIPT],
           env: { E2E_TEST_TOKEN: "${E2E_TEST_TOKEN}" },
           auth_mode: "service_account",
         },
@@ -174,7 +181,7 @@ test.describe("Stdio template-var substitution + Sandbox files — runtime", () 
           id: upstreamId,
           display_name: "subst-file-stdio",
           command: "uvx",
-          args: ["--from", "mcp", "python", "-c", INLINE_MCP_SCRIPT],
+          args: ["--from", MCP_PKG, "python", "-c", INLINE_MCP_SCRIPT],
           auth_mode: "service_account",
         },
       },
@@ -231,7 +238,7 @@ test.describe("Stdio template-var substitution + Sandbox files — runtime", () 
           id: upstreamId,
           display_name: "subst-missing-stdio",
           command: "uvx",
-          args: ["--from", "mcp", "python", "-c", INLINE_MCP_SCRIPT],
+          args: ["--from", MCP_PKG, "python", "-c", INLINE_MCP_SCRIPT],
           env: { LEAK: "${UNDEFINED_E2E_VAR}" },
           auth_mode: "service_account",
         },

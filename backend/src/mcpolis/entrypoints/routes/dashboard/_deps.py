@@ -17,6 +17,8 @@ the old factory becomes an explicit parameter.
 """
 from __future__ import annotations
 
+from mcpolis.domain.model.settings import SettingsConfig
+
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -261,3 +263,22 @@ def notify_policy_change(
         current_org_id.get(),
         Event(type="policy_changed", payload=payload),
     )
+
+
+async def active_member_emails(
+    deps: DashboardDeps, org_id: str, config: SettingsConfig,
+) -> set[str]:
+    """Addresses that have actually signed in at least once.
+
+    A membership row is created on first sign-in, so an address in
+    ``config.users`` with no row is still only an invitation. The Team
+    page calls these "pending", and the last-admin guard must not count
+    them: an invitation sent to a typo can never administer anything.
+
+    Standalone has no membership tracking (single org, config.users is
+    managed directly), so everyone there counts as active.
+    """
+    if deps.org_repo is None:
+        return set(config.users.keys())
+    memberships = await deps.org_repo.list_memberships(org_id)
+    return {m.email for m in memberships}

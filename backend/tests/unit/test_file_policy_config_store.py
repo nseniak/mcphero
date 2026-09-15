@@ -39,6 +39,8 @@ async def test_set_and_remove_user(tmp_path: Path) -> None:
     assert "alice@test.com" in config.users
     assert config.users["alice@test.com"].role == "admin"
 
+    # A second admin: the store refuses to remove the last one.
+    await store.set_user(DEFAULT_ORG_ID,"root@test.com", UserDefinition(role="admin"))
     config = await store.remove_user(DEFAULT_ORG_ID,"alice@test.com")
     assert "alice@test.com" not in config.users
 
@@ -57,6 +59,8 @@ async def test_set_user_role(tmp_path: Path) -> None:
     store = FileConfigStore(tmp_path / "config.json")
     await store.ensure_defaults(DEFAULT_ORG_ID)
     await store.set_user(DEFAULT_ORG_ID,"alice@test.com", UserDefinition(role="admin"))
+    # A second admin: the store refuses to demote the last one.
+    await store.set_user(DEFAULT_ORG_ID,"root@test.com", UserDefinition(role="admin"))
 
     config = await store.set_user_role(DEFAULT_ORG_ID,"alice@test.com", "user")
     assert config.users["alice@test.com"].role == "user"

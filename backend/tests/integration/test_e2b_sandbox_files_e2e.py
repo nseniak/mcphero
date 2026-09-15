@@ -66,6 +66,11 @@ pytestmark = pytest.mark.skipif(
 # in the python E2B template via the ``mcp-server-time`` /
 # ``mcp-server-fetch`` pre-warm chain that pulls the ``mcp`` SDK as
 # a transitive dep.
+# Pinned to the 1.x line, matching the backend's own ``mcp = "^1.27.0"``.
+# Unpinned, uvx resolves the latest release: mcp 2.x renamed ``FastMCP``
+# to ``MCPServer``, which breaks the inline script below.
+MCP_PKG = "mcp<2"
+
 _INLINE_MCP_SCRIPT = (
     "import os\n"
     "from mcp.server.fastmcp import FastMCP\n"
@@ -115,7 +120,7 @@ async def test_sandbox_file_materializes_at_resolved_target_path(
     # inline server. ``--from`` makes uvx install the ``mcp`` package
     # before exec'ing python.
     upstream.stdio.args = [  # type: ignore[union-attr]
-        "--from", "mcp",
+        "--from", MCP_PKG,
         "python", "-c", _INLINE_MCP_SCRIPT,
     ]
     upstream.stdio.env = {}  # type: ignore[union-attr]
@@ -204,7 +209,7 @@ async def test_sandbox_file_target_path_with_spaces_materializes(
         id=f"e2e-spc-{TEST_RUN_ID}", command="uvx",
     )
     upstream.stdio.args = [  # type: ignore[union-attr]
-        "--from", "mcp",
+        "--from", MCP_PKG,
         "python", "-c", _INLINE_MCP_SCRIPT,
     ]
     upstream.stdio.env = {}  # type: ignore[union-attr]
@@ -294,7 +299,7 @@ async def test_gcp_recipe_round_trips_path_and_body(
         id=f"e2e-gcp-{TEST_RUN_ID}", command="uvx",
     )
     upstream.stdio.args = [  # type: ignore[union-attr]
-        "--from", "mcp",
+        "--from", MCP_PKG,
         "python", "-c", _INLINE_MCP_SCRIPT,
     ]
     cred_path_template = "${HOME}/.config/gcloud/credentials.json"

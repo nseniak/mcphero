@@ -103,6 +103,10 @@ export function UsersPage() {
   const [formEmail, setFormEmail] = useState("");
   const [formRole, setFormRole] = useState("");
   const [formError, setFormError] = useState("");
+  // Refusals from the server that no screen can predict — today the
+  // last-admin guard (409). Rendered above the table, because the
+  // click that triggers it is on a table row, not in the add form.
+  const [actionError, setActionError] = useState("");
 
   const isEmailValid = (email: string): boolean =>
     /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
@@ -153,7 +157,14 @@ export function UsersPage() {
       destructive: true,
     });
     if (!ok) return;
-    await removeUser(email);
+    setActionError("");
+    try {
+      await removeUser(email);
+    } catch (e) {
+      setActionError(
+        e instanceof Error ? e.message : t("users.failedToRemove"));
+      return;
+    }
     reload();
   };
 
@@ -260,6 +271,10 @@ export function UsersPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {actionError && (
+        <p className="mb-3 text-sm text-red-600">{actionError}</p>
       )}
 
       {!showForm && (users.length === 0 ? (
