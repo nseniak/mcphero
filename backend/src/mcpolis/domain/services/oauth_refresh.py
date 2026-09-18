@@ -11,11 +11,11 @@ handler into the authorization_code grant.
 Split out of ``upstream_connection_service.py`` during the
 post-§5.2 cleanup. The provider primitives (``RefreshFailureSignature``,
 ``_extract_refresh_failure``, ``_build_oauth_provider``, the
-noop redirect/callback helpers, ``_inject_accept_json``) still live
-in the service module — this file depends on them. Tests that
-monkeypatch refresh-path internals now target this module's
-``httpx`` / ``asyncio`` rebinding — see
-``test_refresh_token_retry.py``.
+noop redirect/callback helpers, ``probe_upstream_for_auth``) still
+live in the service module — this file depends on them. Tests that
+monkeypatch refresh-path internals target ``httpx.AsyncClient``
+itself, because the probe issues its request from the service module
+rather than from here — see ``test_refresh_token_retry.py``.
 """
 from __future__ import annotations
 
@@ -31,9 +31,6 @@ from mcpolis.adapters.repositories.connection_store import (
     ConnectionStore,
     OAuthToken,
 )
-from mcpolis.adapters.upstream_clients.safe_http_transport import (
-    SafeAsyncHTTPTransport,
-)
 from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.domain.ports.distributed_lock import DistributedLock
 from mcpolis.domain.ports.email_sender import EmailSender
@@ -46,11 +43,11 @@ from mcpolis.domain.services.upstream_connection_service import (
     _build_oauth_provider,  # pyright: ignore[reportPrivateUsage]
     _exception_chain_contains,  # pyright: ignore[reportPrivateUsage]
     _extract_refresh_failure,  # pyright: ignore[reportPrivateUsage]
-    _inject_accept_json,  # pyright: ignore[reportPrivateUsage]
     _noop_callback,  # pyright: ignore[reportPrivateUsage]
     _noop_redirect,  # pyright: ignore[reportPrivateUsage]
     _synthesize_silent_reconnect_signature,  # pyright: ignore[reportPrivateUsage]
     _TERMINAL_AUTH_ERROR_CODES,  # pyright: ignore[reportPrivateUsage]
+    probe_upstream_for_auth,
     purge_user_oauth_state,
 )
 
@@ -250,15 +247,9 @@ async def refresh_token_for_user(
     auth_flow_exc: Exception | None = None
     for attempt in range(1, TOKEN_REFRESH_MAX_RETRIES + 1):
         try:
-            async with httpx.AsyncClient(
-                auth=oauth_auth,
-                event_hooks={"request": [_inject_accept_json]},
-                transport=SafeAsyncHTTPTransport(),
-            ) as client:
-                await asyncio.wait_for(
-                    client.get(upstream.http.url),
-                    timeout=10,
-                )
+            await probe_upstream_for_auth(
+                upstream.http.url, oauth_auth, timeout=10,
+            )
             # Request succeeded (unusual for MCP servers, but fine)
             break
         except (

@@ -258,7 +258,7 @@ def _install_failing_reconnect(
         def __init__(self, **_kw: Any) -> None: ...
         async def __aenter__(self) -> "_DummyClient": return self
         async def __aexit__(self, *_a: Any) -> None: ...
-        async def get(self, _url: str) -> Any:
+        async def post(self, _url: str, **_kw: Any) -> Any:
             # Benign — the Step-1 try/except already discards.
             raise RuntimeError("step1 simulated")
 
@@ -477,7 +477,7 @@ async def test_reconnect_success_resets_failure_counter(
         def __init__(self, **_kw: Any) -> None: ...
         async def __aenter__(self) -> "_NoopClient": return self
         async def __aexit__(self, *_a: Any) -> None: ...
-        async def get(self, _url: str) -> Any:
+        async def post(self, _url: str, **_kw: Any) -> Any:
             return None
 
     monkeypatch.setattr(
@@ -569,7 +569,7 @@ async def test_silent_reconnect_auth_required_synthesizes_invalid_grant_and_dele
         def __init__(self, **_kw: Any) -> None: ...
         async def __aenter__(self) -> "_DummyClient": return self
         async def __aexit__(self, *_a: Any) -> None: ...
-        async def get(self, _url: str) -> Any:
+        async def post(self, _url: str, **_kw: Any) -> Any:
             return None
 
     monkeypatch.setattr(
@@ -783,7 +783,7 @@ async def test_reconnect_timeout_returns_connection_timeout(
         def __init__(self, **_kw: Any) -> None: ...
         async def __aenter__(self) -> "_NoopClient": return self
         async def __aexit__(self, *_a: Any) -> None: ...
-        async def get(self, _url: str) -> Any: return None
+        async def post(self, _url: str, **_kw: Any) -> Any: return None
 
     monkeypatch.setattr(
         "mcpolis.domain.services.upstream_connection_service.httpx.AsyncClient",
@@ -830,13 +830,13 @@ async def test_reconnect_no_tokens_after_silent_refresh_returns_token_refresh_fa
     store = FileConnectionStore(tmp_path)
     await _seed(store, expired=True)
 
-    # Step 1's "lightweight HTTP" client deletes the stored token row
+    # Step 1's auth-probe client deletes the stored token row
     # to mimic the SDK reacting to a 4xx-on-refresh.
     class _ClearingClient:
         def __init__(self, **_kw: Any) -> None: ...
         async def __aenter__(self) -> "_ClearingClient": return self
         async def __aexit__(self, *_a: Any) -> None: ...
-        async def get(self, _url: str) -> Any:
+        async def post(self, _url: str, **_kw: Any) -> Any:
             await store.delete_user_token(
                 DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
             )
@@ -875,7 +875,7 @@ async def test_reconnect_no_tokens_after_silent_refresh_with_live_access_returns
         def __init__(self, **_kw: Any) -> None: ...
         async def __aenter__(self) -> "_ClearingClient": return self
         async def __aexit__(self, *_a: Any) -> None: ...
-        async def get(self, _url: str) -> Any:
+        async def post(self, _url: str, **_kw: Any) -> Any:
             await store.delete_user_token(
                 DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
             )

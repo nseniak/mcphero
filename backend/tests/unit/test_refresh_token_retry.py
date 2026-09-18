@@ -101,10 +101,14 @@ class _FakeAsyncClient:
     All instances created for a given test share one ``behaviors``
     queue, so a behavior list like
     ``[ConnectError, ConnectError, None]`` drives three successive
-    ``get()`` calls across however many ``AsyncClient(...)``
+    ``post()`` calls across however many ``AsyncClient(...)``
     instantiations the retry loop makes (one per attempt). Each
     behavior may be an exception instance (raised), a callable (called
-    per get), or None (treated as a successful no-op response)."""
+    per probe), or None (treated as a successful no-op response).
+
+    The verb is ``post`` because the auth probe sends an MCP
+    ``initialize`` body; a bare ``get`` never provokes the 401 that
+    drives the SDK's OAuth flow. See ``probe_upstream_for_auth``."""
 
     def __init__(
         self,
@@ -112,7 +116,7 @@ class _FakeAsyncClient:
         **_kwargs: Any,
     ) -> None:
         self._behaviors = behaviors  # shared list, consumed across instances
-        self.get_calls = 0
+        self.probe_calls = 0
 
     async def __aenter__(self) -> _FakeAsyncClient:
         return self
@@ -120,8 +124,8 @@ class _FakeAsyncClient:
     async def __aexit__(self, *_args: Any) -> None:
         pass
 
-    async def get(self, _url: str) -> Any:
-        self.get_calls += 1
+    async def post(self, _url: str, **_kwargs: Any) -> Any:
+        self.probe_calls += 1
         if not self._behaviors:
             return MagicMock(status_code=200)
         behavior = self._behaviors.pop(0)
@@ -139,17 +143,25 @@ class _FakeAsyncClient:
 
 def _install_fake_client(
     monkeypatch: pytest.MonkeyPatch,
-    get_behaviors: list[Any],
+    probe_behaviors: list[Any],
 ) -> list[_FakeAsyncClient]:
-    """Patch ``httpx.AsyncClient`` used by the service module.
+    """Patch ``httpx.AsyncClient`` for the whole process.
 
     The behavior list is shared across every instance created during
-    the test: entry N drives the N-th ``get()`` call overall, no
+    the test: entry N drives the N-th ``post()`` call overall, no
     matter which ``AsyncClient(...)`` instance it lands on. Returns
     the list of instantiated clients so tests can also assert on
     instantiation counts if needed.
+
+    Patched on ``httpx`` itself. The old target
+    (``oauth_refresh.httpx.AsyncClient``) resolves to the very same
+    attribute — ``oauth_refresh.httpx is httpx`` — so both spellings
+    work. Naming ``httpx`` directly just stops the target from implying
+    the request is issued by ``oauth_refresh``; the retry loop
+    delegates to ``probe_upstream_for_auth``, which builds its client
+    inside ``upstream_connection_service``.
     """
-    shared_behaviors = list(get_behaviors)
+    shared_behaviors = list(probe_behaviors)
     clients: list[_FakeAsyncClient] = []
 
     def _factory(**kwargs: Any) -> _FakeAsyncClient:
@@ -158,7 +170,7 @@ def _install_fake_client(
         return client
 
     monkeypatch.setattr(
-        "mcpolis.domain.services.oauth_refresh.httpx.AsyncClient",
+        "httpx.AsyncClient",
         _factory,
     )
     return clients
@@ -209,8 +221,8 @@ async def test_network_error_retries_max_times_with_backoff(
         server_url=SERVER_URL,
     )
 
-    total_gets = sum(c.get_calls for c in clients)
-    assert total_gets == TOKEN_REFRESH_MAX_RETRIES
+    total_probes = sum(c.probe_calls for c in clients)
+    assert total_probes == TOKEN_REFRESH_MAX_RETRIES
     assert slept == [TOKEN_REFRESH_RETRY_DELAY] * (
         TOKEN_REFRESH_MAX_RETRIES - 1
     )
@@ -240,8 +252,8 @@ async def test_network_error_recovers_if_later_attempt_succeeds(
         server_url=SERVER_URL,
     )
 
-    total_gets = sum(c.get_calls for c in clients)
-    assert total_gets == 3
+    total_probes = sum(c.probe_calls for c in clients)
+    assert total_probes == 3
     # Two failures → two sleeps before the success exits the loop.
     assert slept == [TOKEN_REFRESH_RETRY_DELAY] * 2
 
@@ -278,8 +290,8 @@ async def test_each_network_error_type_triggers_retry(
         server_url=SERVER_URL,
     )
 
-    total_gets = sum(c.get_calls for c in clients)
-    assert total_gets == 2
+    total_probes = sum(c.probe_calls for c in clients)
+    assert total_probes == 2
     assert slept == [TOKEN_REFRESH_RETRY_DELAY]
 
 
@@ -311,8 +323,8 @@ async def test_non_network_error_breaks_immediately(
         server_url=SERVER_URL,
     )
 
-    total_gets = sum(c.get_calls for c in clients)
-    assert total_gets == 1
+    total_probes = sum(c.probe_calls for c in clients)
+    assert total_probes == 1
     assert slept == []
 
 
@@ -886,7 +898,7 @@ async def test_max_age_triggers_refresh_in_periodic_loop(
         return real_async_client(**kwargs)
 
     monkeypatch.setattr(
-        "mcpolis.domain.services.oauth_refresh.httpx.AsyncClient",
+        "httpx.AsyncClient",
         _factory,
     )
     _install_fake_sleep(monkeypatch)

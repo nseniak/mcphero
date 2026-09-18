@@ -28,16 +28,25 @@ STATE_TOKEN_MAX_AGE = 600
 
 class UpstreamUnreachableError(RuntimeError):
     """Raised by ``wait_for_redirect_or_refresh`` when the background
-    token-acquisition task hit a hard failure (e.g. upstream returned
-    5xx) before either a redirect URL or a silent refresh could happen.
+    token-acquisition task hit a hard failure before either a redirect
+    URL or a silent refresh could happen.
+
+    Despite the name this covers every terminal background failure, not
+    only unreachable upstreams: a 5xx, a connect error, *and* an
+    auth-flow that ended with no tokens and no redirect. ``reason``
+    distinguishes them — it is the ``OAuthFailureReason`` value as a
+    plain string, kept stringly-typed so this adapter does not import
+    the domain enum (``upstream_connection_service`` already imports
+    this module, so the dependency would be a cycle).
 
     Carries a user-facing message so the connect endpoint can surface
     the actual problem instead of the generic discovery-timeout text.
     """
 
-    def __init__(self, user_message: str) -> None:
+    def __init__(self, user_message: str, reason: str | None = None) -> None:
         super().__init__(user_message)
         self.user_message = user_message
+        self.reason = reason
 
 
 @dataclass
@@ -53,6 +62,7 @@ class PendingAuth:
     auth_state: str | None = None
     tokens_refreshed: bool = False
     failure_message: str | None = None
+    failure_reason: str | None = None
     _event: asyncio.Event = field(default_factory=asyncio.Event)
     _redirect_event: asyncio.Event = field(
         default_factory=asyncio.Event
@@ -124,12 +134,18 @@ class PendingAuth:
         self.tokens_refreshed = True
         self._tokens_refreshed_event.set()
 
-    def mark_failed(self, user_message: str) -> None:
+    def mark_failed(
+        self, user_message: str, reason: str | None = None
+    ) -> None:
         """Signal that the background token-acquisition task hit a hard
         failure — short-circuits the 30s wait so the connect endpoint
         can surface the real error instead of timing out generically.
+
+        ``reason`` is the ``OAuthFailureReason`` value as a string; see
+        ``UpstreamUnreachableError`` for why it is not the enum.
         """
         self.failure_message = user_message
+        self.failure_reason = reason
         self._failed_event.set()
 
     async def wait_for_redirect_or_refresh(self) -> str | None:
@@ -159,7 +175,9 @@ class PendingAuth:
             raise TimeoutError("Timed out waiting for OAuth flow")
 
         if self.failure_message is not None:
-            raise UpstreamUnreachableError(self.failure_message)
+            raise UpstreamUnreachableError(
+                self.failure_message, self.failure_reason,
+            )
         if self.tokens_refreshed:
             return None
         assert self.redirect_url is not None

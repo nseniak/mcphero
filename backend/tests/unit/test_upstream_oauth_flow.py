@@ -1177,3 +1177,242 @@ async def test_initiate_unreachable_returns_upstream_unavailable(
     assert coordinator.get_pending(
         DEFAULT_ORG_ID, "mixpanel", "__admin__",
     ) is None
+
+
+# ── Auth probe: verb, body, and terminal-failure signalling ──────────
+#
+# Regression cluster for the 2026-09-18 Mixpanel report. Two defects
+# compounded: the probe could not provoke a 401, and the resulting
+# terminal failure never woke the foreground waiter. Symptom was a 30s
+# hang followed by "Could not reach this MCP server" against a server
+# that was healthy the whole time.
+
+
+@pytest.mark.asyncio
+async def test_auth_probe_posts_mcp_initialize_never_get() -> None:
+    """Every OAuth side-effect rides on this probe, so it must POST an
+    MCP ``initialize`` — never a bare GET.
+
+    ``mcp.mixpanel.com`` answers ``405 Allow: POST, DELETE`` on its MCP
+    path. The SDK's ``OAuthClientProvider`` only enters its
+    authorization flow on a ``401``, so a GET meant no discovery, no
+    dynamic client registration and no redirect URL. Pin the verb, the
+    JSON-RPC body and the dual Accept header that streamable-HTTP
+    servers require.
+    """
+    from mcpolis.domain.services.upstream_connection_service import (
+        probe_upstream_for_auth,
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    class _RecordingClient:
+        def __init__(self, **_kwargs: Any) -> None: ...
+
+        async def __aenter__(self) -> _RecordingClient:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None: ...
+
+        async def get(self, *_a: Any, **_k: Any) -> Any:
+            raise AssertionError(
+                "auth probe used GET: a server that only routes POST on "
+                "its MCP path never returns the 401 the SDK needs"
+            )
+
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            calls.append({"url": url, **kwargs})
+            return MagicMock(status_code=401)
+
+    with patch("httpx.AsyncClient", _RecordingClient):
+        await probe_upstream_for_auth(
+            "http://localhost:9999/mcp", MagicMock(),
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "http://localhost:9999/mcp"
+    body = calls[0]["json"]
+    assert body["jsonrpc"] == "2.0"
+    assert body["method"] == "initialize"
+    assert "protocolVersion" in body["params"]
+    accept = calls[0]["headers"]["Accept"]
+    assert "application/json" in accept
+    assert "text/event-stream" in accept
+
+
+@pytest.mark.asyncio
+async def test_background_terminal_failure_marks_pending_failed(
+    tmp_path: Path,
+) -> None:
+    """A flow that ends with no redirect and no tokens must call
+    ``mark_failed`` so the foreground waiter returns immediately.
+
+    Without it the connect endpoint rides its full 30s discovery
+    deadline and then reports the upstream as unreachable — blaming the
+    network for an auth failure. In the Mixpanel case the background
+    task knew it had failed after 155ms.
+    """
+    from mcpolis.domain.services.upstream_connection_service import (
+        OAuthFailureReason,
+        _start_background_token_acquisition,
+    )
+
+    coordinator = PendingAuthCoordinator(make_signing_key())
+    pending = coordinator.create_pending(
+        DEFAULT_ORG_ID, "mixpanel", "__admin__",
+    )
+    storage = MagicMock()
+    storage.get_tokens = AsyncMock(return_value=None)
+    errors: list[tuple[str, OAuthFailureReason]] = []
+
+    async def _probe(*_a: Any, **_k: Any) -> None: ...
+
+    with patch(
+        "mcpolis.domain.services.upstream_connection_service"
+        ".probe_upstream_for_auth",
+        _probe,
+    ):
+        task = _start_background_token_acquisition(
+            make_http_upstream(), MagicMock(), storage, pending,
+            on_error=lambda m, r: errors.append((m, r)),
+        )
+        await task
+
+    assert pending.failure_message == "Authentication failed — please try again."
+    assert pending.failure_reason == OAuthFailureReason.token_exchange.value
+    assert errors == [(
+        "Authentication failed — please try again.",
+        OAuthFailureReason.token_exchange,
+    )]
+
+
+@pytest.mark.asyncio
+async def test_initiate_surfaces_background_failure_reason(
+    tmp_path: Path,
+) -> None:
+    """The reason the background task classified must survive the hop
+    to the connect endpoint.
+
+    Previously every short-circuited failure was reported as
+    ``upstream_unavailable`` regardless of cause, which is what made the
+    Mixpanel incident unreadable from the analytics event alone.
+    """
+    from mcpolis.adapters.auth.pending_auth import UpstreamUnreachableError
+    from mcpolis.domain.services.upstream_connection_service import (
+        OAuthFailureReason,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    cm = make_client_manager()
+    coordinator = PendingAuthCoordinator(make_signing_key())
+
+    with patch(
+        "mcpolis.domain.services.upstream_connection_service"
+        "._start_background_token_acquisition",
+    ) as mock_bg:
+        def fake_start(*_args: Any, **_kwargs: Any) -> asyncio.Task[None]:
+            async def _bg() -> None: ...
+            return asyncio.create_task(_bg())
+
+        mock_bg.side_effect = fake_start
+
+        with patch(
+            "mcpolis.adapters.auth.pending_auth.PendingAuth"
+            ".wait_for_redirect_or_refresh",
+            side_effect=UpstreamUnreachableError(
+                "Authentication failed — please try again.",
+                OAuthFailureReason.token_exchange.value,
+            ),
+        ):
+            result = await initiate_oauth_connection(
+                DEFAULT_ORG_ID, upstream, "__admin__", store,
+                coordinator, cm, SERVER_URL,
+            )
+
+    assert result.connected is False
+    assert result.failure_reason is OAuthFailureReason.token_exchange
+    assert result.error == "Authentication failed — please try again."
+
+
+@pytest.mark.asyncio
+async def test_short_circuited_failure_is_reported_once(
+    tmp_path: Path,
+) -> None:
+    """A failure the background task already reported must not be
+    counted a second time by the connect route.
+
+    The route emits ``upstream_oauth_failed`` for synchronous failures
+    because ``_notify_error`` normally only runs on the async path. Once
+    ``mark_failed`` short-circuits the wait, BOTH fire for the same
+    failure — so the result carries ``error_reported`` to suppress the
+    route's copy. Getting this wrong double-counts every ordinary auth
+    failure on the dashboard this change exists to make accurate.
+    """
+    from mcpolis.adapters.auth.pending_auth import UpstreamUnreachableError
+    from mcpolis.domain.services.upstream_connection_service import (
+        OAuthFailureReason,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    cm = make_client_manager()
+    coordinator = PendingAuthCoordinator(make_signing_key())
+
+    with patch(
+        "mcpolis.domain.services.upstream_connection_service"
+        "._start_background_token_acquisition",
+    ) as mock_bg:
+        def fake_start(*_args: Any, **_kwargs: Any) -> asyncio.Task[None]:
+            async def _bg() -> None: ...
+            return asyncio.create_task(_bg())
+
+        mock_bg.side_effect = fake_start
+
+        with patch(
+            "mcpolis.adapters.auth.pending_auth.PendingAuth"
+            ".wait_for_redirect_or_refresh",
+            side_effect=UpstreamUnreachableError(
+                "Authentication failed — please try again.",
+                OAuthFailureReason.token_exchange.value,
+            ),
+        ):
+            short_circuited = await initiate_oauth_connection(
+                DEFAULT_ORG_ID, upstream, "__admin__", store,
+                coordinator, cm, SERVER_URL,
+            )
+
+        # The discovery deadline elapsing is the other shape: nothing
+        # called on_error, so the route MUST still emit.
+        with patch(
+            "mcpolis.adapters.auth.pending_auth.PendingAuth"
+            ".wait_for_redirect_or_refresh",
+            side_effect=TimeoutError("deadline reached"),
+        ):
+            timed_out = await initiate_oauth_connection(
+                DEFAULT_ORG_ID, upstream, "__admin__", store,
+                coordinator, cm, SERVER_URL,
+            )
+
+    assert short_circuited.error_reported is True
+    assert timed_out.error_reported is False
+
+
+def test_coerce_failure_reason_never_raises() -> None:
+    """Coercion runs inside an ``except`` handler, so an unrecognised
+    reason string must degrade to ``unknown`` rather than turn a handled
+    auth failure into a 500 on the connect endpoint."""
+    from mcpolis.domain.services.upstream_connection_service import (
+        OAuthFailureReason,
+        _coerce_failure_reason,
+    )
+
+    assert _coerce_failure_reason("token_exchange") is (
+        OAuthFailureReason.token_exchange
+    )
+    assert _coerce_failure_reason(None) is (
+        OAuthFailureReason.upstream_unavailable
+    )
+    assert _coerce_failure_reason("not-a-member") is (
+        OAuthFailureReason.unknown
+    )

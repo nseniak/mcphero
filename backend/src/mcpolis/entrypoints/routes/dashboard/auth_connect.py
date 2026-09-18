@@ -130,11 +130,18 @@ def create_auth_connect_router(deps: DashboardDeps) -> APIRouter:
                 notify_policy_change(deps, user=email)
             else:
                 notify_policy_change(deps)
-        elif result.error and not result.authorization_url:
-            # Synchronous failure (timeout, post-refresh connection
-            # error). _notify_error is only invoked from the async
-            # token-acquisition task, so emit the analytics event here
-            # to keep the failure dashboard whole.
+        elif result.error and not result.authorization_url and (
+            not result.error_reported
+        ):
+            # Synchronous failure that nothing else reported — e.g. the
+            # discovery deadline elapsing, or a post-refresh connection
+            # error. Emit here to keep the failure dashboard whole.
+            #
+            # ``error_reported`` guards the other shape: when the
+            # background token-acquisition task short-circuits the wait
+            # via ``mark_failed`` it has ALREADY run ``_notify_error``,
+            # which emits the same event. Without the guard every such
+            # failure lands on the dashboard twice.
             sync_reason = result.failure_reason or OAuthFailureReason.unknown
             get_analytics().track_async(
                 email,

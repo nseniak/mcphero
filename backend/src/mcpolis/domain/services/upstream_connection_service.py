@@ -32,6 +32,7 @@ from mcp.shared.auth import (
     OAuthClientMetadata,
     OAuthMetadata,
 )
+from mcp.types import LATEST_PROTOCOL_VERSION
 from pydantic import AnyUrl
 
 from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
@@ -64,6 +65,93 @@ async def _inject_accept_json(request: httpx.Request) -> None:
     Workaround for: https://github.com/modelcontextprotocol/typescript-sdk/issues/759
     """
     request.headers.setdefault("Accept", "application/json")
+
+
+# Streamable-HTTP MCP servers require BOTH media types on the probe
+# request; a bare ``application/json`` is rejected by spec-strict
+# servers before the auth layer ever runs.
+_MCP_PROBE_ACCEPT = "application/json, text/event-stream"
+
+
+def _auth_probe_body() -> dict[str, Any]:
+    """Minimal MCP ``initialize`` payload, used only to provoke a 401."""
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": LATEST_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "mcpolis", "version": "1"},
+        },
+    }
+
+
+async def probe_upstream_for_auth(
+    url: str,
+    oauth_auth: httpx.Auth,
+    *,
+    timeout: float | None = None,
+) -> None:
+    """Poke an upstream so the SDK's ``OAuthClientProvider`` runs.
+
+    Every OAuth side-effect we need — fresh consent, silent refresh,
+    401 recovery — is driven by ``OAuthClientProvider`` wrapping an
+    outgoing request. The response is irrelevant and routinely an
+    error; only the auth-side-effect matters.
+
+    The request MUST be a ``POST`` carrying an MCP ``initialize``
+    body. This used to be a bare ``GET``, which silently broke fresh
+    consent against any server that does not route ``GET`` on its MCP
+    path: ``mcp.mixpanel.com`` answers ``405 Allow: POST, DELETE``,
+    and the SDK only enters its authorization flow on a ``401``. No
+    401 meant no discovery, no DCR, no redirect URL — the caller then
+    waited out its full deadline and reported the upstream as
+    unreachable, when in fact the server was healthy and merely
+    refusing the verb. See ``_start_background_token_acquisition``.
+
+    Callers are expected to swallow transport errors; ``timeout``
+    bounds the call for the refresh paths, which must not hang the
+    periodic sweep.
+    """
+    async with httpx.AsyncClient(
+        auth=oauth_auth,
+        event_hooks={"request": [_inject_accept_json]},
+        transport=SafeAsyncHTTPTransport(),
+    ) as client:
+        # Explicit Accept wins over ``_inject_accept_json``'s
+        # ``setdefault``; the hook still supplies plain JSON on the
+        # auth-flow sub-requests (token endpoint / DCR), which is the
+        # GitHub form-encoding workaround it exists for.
+        request = client.post(
+            url,
+            json=_auth_probe_body(),
+            headers={"Accept": _MCP_PROBE_ACCEPT},
+        )
+        if timeout is None:
+            await request
+        else:
+            await asyncio.wait_for(request, timeout=timeout)
+
+
+def _coerce_failure_reason(reason: str | None) -> OAuthFailureReason:
+    """Map a stringly-typed failure reason back to the enum.
+
+    ``PendingAuth`` carries the reason as a plain string (it is an
+    adapter and must not import this module's enum). Coercion happens
+    inside an ``except`` handler, so an unrecognised value must not
+    raise: a ``ValueError`` there would turn a handled auth failure
+    into a 500 on the connect endpoint.
+    """
+    if reason is None:
+        return OAuthFailureReason.upstream_unavailable
+    try:
+        return OAuthFailureReason(reason)
+    except ValueError:
+        logger.warning(
+            "upstream.oauth.failure_reason.unrecognised", reason=reason,
+        )
+        return OAuthFailureReason.unknown
 
 
 def _unwrap_error(e: BaseException) -> str:
@@ -105,11 +193,19 @@ class OAuthConnectResult:
         authorization_url: str | None = None,
         error: str | None = None,
         failure_reason: OAuthFailureReason | None = None,
+        error_reported: bool = False,
     ) -> None:
         self.connected = connected
         self.authorization_url = authorization_url
         self.error = error
         self.failure_reason = failure_reason
+        # True when the background token-acquisition task already ran
+        # the caller's ``on_error`` for this failure. The connect route
+        # emits its own ``upstream_oauth_failed`` for synchronous
+        # failures, so without this flag any failure that BOTH signals
+        # the foreground (``mark_failed``) and calls ``on_error`` is
+        # counted twice on the failure dashboard.
+        self.error_reported = error_reported
 
 
 REFRESH_FAILURE_BODY_LIMIT = 512
@@ -826,13 +922,19 @@ async def initiate_oauth_connection(
         )
     except UpstreamUnreachableError as e:
         # Background task already classified the error and called
-        # on_error — surface the same message synchronously so the
-        # connect endpoint returns within seconds instead of waiting
-        # the 30s discovery deadline.
+        # on_error — surface the same message AND the same reason
+        # synchronously, so the connect endpoint returns within seconds
+        # instead of waiting the 30s discovery deadline. Falling back to
+        # ``upstream_unavailable`` only when the background task didn't
+        # say: blaming the network for an auth failure is what made the
+        # Mixpanel report unreadable.
         auth_coordinator.cleanup(org_id, upstream.id, effective_user)
         return OAuthConnectResult(
             error=e.user_message,
-            failure_reason=OAuthFailureReason.upstream_unavailable,
+            failure_reason=_coerce_failure_reason(e.reason),
+            # Every path that reaches ``mark_failed`` has already called
+            # ``on_error``; the route must not emit a second event.
+            error_reported=True,
         )
 
     if auth_url is None:
@@ -874,14 +976,11 @@ def _start_background_token_acquisition(
 
     async def _acquire_tokens() -> None:
         try:
-            async with httpx.AsyncClient(
-                auth=auth, event_hooks={"request": [_inject_accept_json]},
-                transport=SafeAsyncHTTPTransport(),
-            ) as client:
-                # The request target doesn't matter — the
-                # OAuthClientProvider handles the 401 and runs
-                # the full OAuth flow as a side-effect.
-                await client.get(url)
+            # The response doesn't matter — the OAuthClientProvider
+            # handles the 401 and runs the full OAuth flow as a
+            # side-effect. The verb does matter; see
+            # ``probe_upstream_for_auth``.
+            await probe_upstream_for_auth(url, auth)
         except BaseException as e:
             # Expected: the upstream is an MCP server, so the
             # HTTP response may not be clean.  We only care
@@ -909,7 +1008,7 @@ def _start_background_token_acquisition(
             unreachable = _classify_upstream_unreachable(e)
             if unreachable is not None:
                 user_msg, reason = unreachable
-                pending.mark_failed(user_msg)
+                pending.mark_failed(user_msg, reason.value)
                 if on_error is not None:
                     on_error(user_msg, reason)
                 return
@@ -943,11 +1042,20 @@ def _start_background_token_acquisition(
             if on_tokens_acquired is not None:
                 on_tokens_acquired()
         else:
+            # Terminal failure with no redirect and no tokens. Unblock
+            # the foreground waiter with the REAL message: without this
+            # ``mark_failed`` the connect endpoint rides its full
+            # discovery deadline and then reports "Could not reach this
+            # MCP server", blaming the network for what is almost always
+            # an auth-flow failure against a perfectly healthy upstream.
+            # (Mixpanel, 2026-09-18: 155 ms to fail here, 30 s to say so,
+            # and the wrong cause.)
+            message = "Authentication failed — please try again."
+            pending.mark_failed(
+                message, OAuthFailureReason.token_exchange.value,
+            )
             if on_error is not None:
-                on_error(
-                    "Authentication failed — please try again.",
-                    OAuthFailureReason.token_exchange,
-                )
+                on_error(message, OAuthFailureReason.token_exchange)
 
     return asyncio.create_task(_acquire_tokens())
 
@@ -1253,7 +1361,7 @@ async def _classify_reconnect_failure(
 async def _trigger_silent_refresh(
     oauth_auth: OAuthClientProvider, url: str,
 ) -> None:
-    """Trigger a token-refresh side-effect via a lightweight HTTP GET.
+    """Trigger a token-refresh side-effect via a lightweight probe.
 
     The SDK's ``OAuthClientProvider`` wraps every outgoing request: if
     the access token is within the refresh margin (or already expired
@@ -1262,21 +1370,16 @@ async def _trigger_silent_refresh(
     the caller can re-read the token row to see whether refresh
     actually produced a usable bearer.
 
-    The request itself is *expected to fail*. MCP servers don't serve
-    plain HTTP — they speak the streamable-HTTP / SSE transport — so
-    the GET typically returns a non-200 or trips a transport error.
-    That's fine; we only care about the auth-side-effect that has
-    already happened. The bare ``except`` swallows the transport-level
+    The request itself is *expected to fail*. The probe sends an MCP
+    ``initialize`` it never completes a session for, so the upstream
+    typically returns a non-200 or trips a transport error. That's
+    fine; we only care about the auth-side-effect that has already
+    happened. The bare ``except`` swallows the transport-level
     failure rather than masking a refresh problem (the refresh outcome
     is observed by the caller via ``storage.get_tokens()``).
     """
     try:
-        async with httpx.AsyncClient(
-            auth=oauth_auth,
-            event_hooks={"request": [_inject_accept_json]},
-            transport=SafeAsyncHTTPTransport(),
-        ) as client:
-            await asyncio.wait_for(client.get(url), timeout=10)
+        await probe_upstream_for_auth(url, oauth_auth, timeout=10)
     except Exception:
         pass
 
