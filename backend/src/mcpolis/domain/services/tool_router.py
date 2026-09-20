@@ -480,6 +480,15 @@ class ToolRouter:
         mapping.
         """
         auth_identity = f"{upstream.auth.mode.value}:{upstream.id}"
+        # A verb earns a retry only by declaring itself safe to repeat.
+        # There is deliberately no exception for the sandbox-wake case:
+        # a woken sandbox is detected by its own watcher and the
+        # session is rebuilt BEFORE this method writes anything, so a
+        # wake never produces a lost request that would need
+        # re-sending. Reintroducing a "this one is safe to repeat"
+        # exception here means reintroducing a proof that it is, and
+        # two rounds of adversarial review each found a hole in that
+        # proof. See ``watch_stream`` in the E2B service.
         max_attempts = 2 if verb.retry_safe else 1
 
         start = time.monotonic()

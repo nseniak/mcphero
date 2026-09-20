@@ -18,6 +18,7 @@ from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.services.tool_router import ToolRouter
 from mcpolis.domain.ports import DEFAULT_ORG_ID
+from tests.unit.stall_client_manager_fake import StallClientManagerFake
 from tests.unit.factories import make_discovered_tool, make_upstream_definition
 
 
@@ -220,25 +221,8 @@ async def test_route_call_upstream_error_returns_error_result(tmp_path: Path) ->
     assert entry["response_status"] == "error"
 
 
-class _FakeStallManager:
-    """The slice of ``UpstreamClientManager`` that ``acquire_upstream_session``
-    + ``route_call``'s recovery touch for a service_account upstream. Returns a
-    fixed scripted session and counts fresh reconnects so a stall-recovery
-    test needs no real sandbox."""
-
-    def __init__(self, session: Any) -> None:
-        self._session = session
-        self.ensure_calls = 0
-        self.fresh_calls = 0
-
-    async def ensure_shared_connected(self, upstream: Any) -> None:
-        self.ensure_calls += 1
-
-    def get_session(self, upstream_id: str, user_id: str | None = None) -> Any:
-        return self._session
-
-    async def reconnect_shared_fresh(self, upstream: Any) -> None:
-        self.fresh_calls += 1
+# The stall-manager fake is shared; see stall_client_manager_fake.
+_FakeStallManager = StallClientManagerFake
 
 
 def make_stall_router(

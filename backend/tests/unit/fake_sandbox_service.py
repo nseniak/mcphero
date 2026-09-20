@@ -227,6 +227,13 @@ class FakeSandboxService:
         # ENTERED. Single-flight / coalescing tests assert this is
         # exactly 1 after N concurrent reconnect attempts.
         self.session_open_count = 0
+        # (org_id, upstream_id) per preserve request.
+        self.preserve_calls: list[tuple[str, str]] = []
+        # ``session_open_count`` sampled INSIDE each preserve call.
+        # Occurrence alone is not enough: preserving after the reopen
+        # is useless, and review showed an occurrence-only assertion
+        # passes with the call in the wrong place.
+        self.opens_at_preserve: list[int] = []
         # Every handle ever opened, newest last. ``last_session`` is the
         # common accessor; ``sessions`` is for tests that open several.
         self.sessions: list[SessionHandle] = []
@@ -412,6 +419,26 @@ class FakeSandboxService:
                 stream.close()
 
     # ---------- pause / persistence (mostly no-op for the fake) ----------
+
+    def preserve_sessions_for_upstream(
+        self, *, org_id: str, upstream_id: str,
+    ) -> int:
+        """Record the heal's request to keep the sandbox alive.
+
+        Recorded rather than no-op'd so a test can assert the heal
+        asks BEFORE it closes the session. Getting that order wrong is
+        what made the real sandbox get killed on every wake while the
+        code claimed it was reused.
+        """
+        self.preserve_calls.append((org_id, upstream_id))
+        self.opens_at_preserve.append(self.session_open_count)
+        # Model the real contract: the COUNT MARKED, which is 0 when
+        # nothing is live. Returning the call count instead made
+        # ``connect_shared`` log "1 sandbox preserved" on a first-ever
+        # connect, and left the "harmless on Start/boot" claim
+        # unguarded.
+        live = [h for h in self.sessions if h.is_alive]
+        return len(live)
 
     async def pause(self, session_id: str) -> SnapshotRef | None:
         # The fake never registers a live session for pause, so the

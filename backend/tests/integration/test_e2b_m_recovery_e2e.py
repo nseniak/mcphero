@@ -32,15 +32,17 @@ from typing import cast
 import pytest
 from mcp.client.session import ClientSession
 
+from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (
+    InMemorySandboxPersistenceRepository,
+)
 from mcpolis.adapters.sandbox_e2b.client import E2BSDKError
 from mcpolis.adapters.upstream_clients.log_buffer import LogBuffer
-from tests.integration._e2b_log_capture import reattach_events_since
+from tests.integration._e2b_log_capture import stream_death_events_since
 from tests.integration._e2b_broad_matrix_helpers import (
     E2B_API_KEY,
     INITIALIZE_TIMEOUT,
     REATTACH_WAIT_SECONDS,
     TEST_RUN_ID,
-    TOOL_CALL_TIMEOUT,
     is_template_missing_error,
     make_node_upstream,
     make_resources,
@@ -55,10 +57,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# Reattach-event capture lives in the shared ``_e2b_log_capture`` module: a
+# Pause-evidence capture lives in the shared ``_e2b_log_capture`` module: a
 # single process-global ``structlog.configure`` serves every integration file
 # (a per-file configure would clobber the others — the bug that left M4's
-# capture empty under ``--dist loadfile``). ``reattach_events_since`` is
+# capture empty under ``--dist loadfile``). ``stream_death_events_since`` is
 # imported above.
 
 
@@ -67,22 +69,44 @@ pytestmark = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
+# Two 35s idle windows plus two sandbox opens: the split-per-cycle
+# shape the wake fix forced on this test costs roughly 90-110s, which
+# sits under the global 120s ceiling on a quiet box and over it when
+# the broad matrix is competing for E2B. Raise the ceiling for these
+# two rather than shortening the sleeps, which would stop E2B pausing
+# at all and make the test prove nothing.
+@pytest.mark.timeout(300)
 @pytest.mark.asyncio
-async def test_e2b_m4_timeout_holds_across_two_reattach_cycles_broad_matrix() -> None:
+async def test_e2b_m4_timeout_holds_across_two_wake_cycles_broad_matrix() -> None:
     """E2B-M4: the broad-matrix variant of E2B-T1, run on a DIFFERENT
     tier (cpu2-ram2048 node) than the targeted test (cpu1-ram1024).
-    Proves the post-reattach ``set_timeout`` re-application holds the
-    configured idle window across two auto-pause/reattach cycles on a
-    larger sandbox too (the 300s reset would leave cycle 2 unable to
-    re-pause within the 35s sleep)."""
+
+    Proves the reconnect's ``set_timeout`` re-application holds the
+    configured idle window across two auto-pause/wake cycles on a
+    larger sandbox too (a 300s reset would leave cycle 2 unable to
+    re-pause within the sleep).
+
+    One session per cycle: a wake retires the frozen MCP process and
+    ends the session, which is what the client manager rebuilds from
+    in production. Persistence plus reuse keeps both cycles on the
+    same sandbox, without which cycle 2 would create a fresh one and
+    prove nothing about the post-resume re-application.
+    """
     instance = f"e2e-m4-{TEST_RUN_ID}"
-    service = make_service(instance=instance)
+    persistence = InMemorySandboxPersistenceRepository()
+    service = make_service(
+        instance=instance, persistence=persistence, reuse_on_restart=True,
+    )
     upstream = make_node_upstream("m4")
     errlog = LogBuffer()
-    try:
+    org_id = f"acme-m4-{TEST_RUN_ID}"
+
+    async def one_cycle(cycle: int) -> None:
+        """Open a session, idle past the window, prove it paused."""
+        session_id = f"{instance}-c{cycle}"
         async with service.session(
-            session_id=instance,
-            org_id=f"acme-m4-{TEST_RUN_ID}",
+            session_id=session_id,
+            org_id=org_id,
             upstream=upstream,
             resources=make_resources(2.0, 2048),
             denylist=(),
@@ -95,26 +119,24 @@ async def test_e2b_m4_timeout_holds_across_two_reattach_cycles_broad_matrix() ->
                 await asyncio.wait_for(
                     session.initialize(), timeout=INITIALIZE_TIMEOUT,
                 )
-
-                cycle1_ns = time.monotonic_ns()
+                # Nothing touches the session across this sleep, so a
+                # stream death inside the window can only be the pause.
+                idle_cursor = time.monotonic_ns()
                 await asyncio.sleep(REATTACH_WAIT_SECONDS)
-                await asyncio.wait_for(
-                    session.list_tools(), timeout=TOOL_CALL_TIMEOUT * 2,
+                assert stream_death_events_since(idle_cursor), (
+                    f"cycle {cycle}: the sandbox did not pause within "
+                    "the idle window on the cpu2-ram2048 tier"
                 )
-                assert reattach_events_since(cycle1_ns), (
-                    "cycle 1: reattach.ok did not fire — no auto-pause"
-                )
+                assert sandbox_session.transport_failed is not None
+                assert sandbox_session.transport_failed.is_set()
+            service.mark_session_preserve_on_close(session_id)
 
-                cycle2_ns = time.monotonic_ns()
-                await asyncio.sleep(REATTACH_WAIT_SECONDS)
-                await asyncio.wait_for(
-                    session.list_tools(), timeout=TOOL_CALL_TIMEOUT * 2,
-                )
-                assert reattach_events_since(cycle2_ns), (
-                    "cycle 2: reattach.ok did not fire — post-reattach "
-                    "set_timeout regressed on the cpu2-ram2048 tier "
-                    "(idle window reset to 300s; configured value lost)"
-                )
+    try:
+        await one_cycle(1)
+        # Cycle 2 only re-pauses if the reconnect's set_timeout put the
+        # idle window back; a 300s reset would fail cycle 2's own
+        # in-window assertion.
+        await one_cycle(2)
     except E2BSDKError as exc:
         if is_template_missing_error(exc):
             pytest.skip(

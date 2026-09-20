@@ -423,6 +423,17 @@ class _RealSandboxHandle:
             raise _wrap_sdk_error(exc) from exc
         return _RealCommandHandle(self._sandbox, handle)
 
+    async def kill_command(self, *, pid: int) -> None:
+        # ``commands.kill`` returns False when the pid is already gone,
+        # which is the end state we want — don't turn it into an error.
+        # A genuine SDK/transport failure still raises, and the caller
+        # treats that as non-fatal too (a leaked process inside the
+        # sandbox is cheaper than refusing to open the session).
+        try:
+            await self._sandbox.commands.kill(pid)
+        except Exception as exc:
+            raise _wrap_sdk_error(exc) from exc
+
     async def pause(self) -> str:
         try:
             await self._sandbox.pause()

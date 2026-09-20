@@ -58,6 +58,7 @@ from mcpolis.domain.services.tool_router import (  # pyright: ignore[reportPriva
     _is_post_delivery_stall,
     _SessionResult,
 )
+from tests.unit.stall_client_manager_fake import StallClientManagerFake
 from tests.unit.factories import (
     make_discovered_tool,
     make_upstream_definition,
@@ -91,15 +92,21 @@ class _StallThenSucceedSession:
     real result. The counter therefore measures how many times the
     upstream-side side effect actually executed."""
 
-    def __init__(self, stall_factory: Any) -> None:
+    def __init__(
+        self, stall_factory: Any, *, always_stall: bool = False,
+    ) -> None:
         self._stall = stall_factory
+        # ``always_stall`` models an upstream that is down rather than
+        # momentarily interrupted, which is what proves a retry grant
+        # cannot renew itself into a loop.
+        self._always_stall = always_stall
         self.read_calls = 0
         self.prompt_calls = 0
         self.tool_calls = 0
 
     async def read_resource(self, uri: AnyUrl) -> mcp_types.ReadResourceResult:
         self.read_calls += 1
-        if self.read_calls == 1:
+        if self.read_calls == 1 or self._always_stall:
             raise self._stall()
         return mcp_types.ReadResourceResult(
             contents=[mcp_types.TextResourceContents(uri=uri, text="ok")],
@@ -109,7 +116,7 @@ class _StallThenSucceedSession:
         self, name: str, arguments: dict[str, str] | None,
     ) -> mcp_types.GetPromptResult:
         self.prompt_calls += 1
-        if self.prompt_calls == 1:
+        if self.prompt_calls == 1 or self._always_stall:
             raise self._stall()
         return mcp_types.GetPromptResult(messages=[])
 
@@ -117,21 +124,13 @@ class _StallThenSucceedSession:
         self, name: str, arguments: dict[str, Any],
     ) -> mcp_types.CallToolResult:
         self.tool_calls += 1
-        if self.tool_calls == 1:
+        if self.tool_calls == 1 or self._always_stall:
             raise self._stall()
         return mcp_types.CallToolResult(content=[], isError=False)
 
 
-class _HealOnlyClientManager:
-    """Just enough of ``UpstreamClientManager`` for ``heal_stalled_session``
-    on a ``service_account`` upstream: ``reconnect_shared_fresh`` succeeds
-    so the heal completes and the retry loop proceeds."""
-
-    def __init__(self) -> None:
-        self.reconnects = 0
-
-    async def reconnect_shared_fresh(self, upstream: Any) -> None:
-        self.reconnects += 1
+# The stall-manager fake is shared; see stall_client_manager_fake.
+_HealOnlyClientManager = StallClientManagerFake
 
 
 class _CountingAudit:
@@ -173,7 +172,9 @@ def make_router(
 ) -> _RecordingRouter:
     """A router wired to *session*, a heal-only client manager, and a
     ``service_account`` upstream. *tool_annotations*, when given, seed one
-    discovered tool so the ``call_tool`` path can derive ``retry_safe``."""
+    discovered tool so the ``call_tool`` path can derive ``retry_safe``.
+
+    """
     upstream = make_upstream_definition(id=UPSTREAM_ID)
     client_manager = cast(UpstreamClientManager, _HealOnlyClientManager())
     registry = ToolRegistry([upstream], client_manager)
@@ -350,9 +351,17 @@ async def test_readonly_tool_still_retries_post_delivery_stall() -> None:
 
 @pytest.mark.asyncio
 async def test_non_idempotent_tool_runs_once_and_settles() -> None:
-    """Control: a non-idempotent tool is invoked once on any stall, surfaces
-    an error, and settles OAuth — the protection reads/prompts now share for
-    the post-delivery case."""
+    """Control: a non-idempotent tool is invoked once on ANY stall.
+
+    "Any" includes a sandbox wake. An earlier design carved out an
+    exception for that case, on the argument that the request provably
+    never left the gateway; two independent review passes each found a
+    way for a DIFFERENT, already-delivered request to claim it. The
+    exception is gone — a woken sandbox is detected by its own watcher
+    and the session is rebuilt before anything is written, so there is
+    no lost request to compensate for. This test is the guard against
+    reintroducing it.
+    """
     session = _StallThenSucceedSession(_timeout)
     router = make_router(
         session,
@@ -369,9 +378,6 @@ async def test_non_idempotent_tool_runs_once_and_settles() -> None:
     assert session.tool_calls == 1, "a non-idempotent tool must not be retried"
     assert result.isError
     assert router.settle_calls == 1
-
-
-# --- observability (fix C): a re-executed read is auditable ------------------
 
 
 @pytest.mark.asyncio

@@ -118,6 +118,13 @@ class SandboxSession:
     # zombie (which raises ``BrokenResourceError`` on the next send).
     # ``None`` for backends that don't track it (the session is then
     # always treated as alive — current behaviour).
+    #
+    # The E2B backend sets this the moment its output stream ends,
+    # which for a paused sandbox is the pause itself. That timing is
+    # the whole wake design: ``ensure_shared_connected`` refuses a
+    # session whose transport is dead, and it runs before the gateway
+    # writes anything, so a request is never handed to a frozen
+    # process and never has to be re-sent.
     transport_failed: asyncio.Event | None = None
 
 
@@ -365,6 +372,27 @@ class SandboxService(Protocol):
         parent-directory creation.
         """
         ...
+
+    def preserve_sessions_for_upstream(
+        self, *, org_id: str, upstream_id: str,
+    ) -> int:
+        """Mark this upstream's live sessions so their teardown keeps
+        the underlying sandbox alive. Returns the count marked.
+
+        Called before a heal closes and reopens a shared session. The
+        close-then-open sequence would otherwise destroy the sandbox
+        on the way out (the teardown deletes the persisted ref and
+        kills the sandbox), so the reopen could only ever fresh-create
+        — turning every wake into a full cold start, package download
+        and all. Marking first is what makes "reuse the sandbox,
+        replace the process" actually happen rather than merely being
+        intended.
+
+        Default is a no-op returning 0, for providers with no sandbox
+        worth preserving.
+        """
+        del org_id, upstream_id
+        return 0
 
     async def pause(self, session_id: str) -> SnapshotRef | None:
         """Snapshot the running sandbox referenced by ``session_id``.

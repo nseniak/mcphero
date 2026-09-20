@@ -80,7 +80,7 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 # Opt-in raw-stdout tracing for diagnosing the intermittent
 # post-reattach discovery stall (some JSON-RPC responses stop arriving
-# after a ``connect_command`` reattach). When ``MCPOLIS_E2B_DEBUG_RAW_STDOUT=1``
+# after waking a paused sandbox). When ``MCPOLIS_E2B_DEBUG_RAW_STDOUT=1``
 # the stdout demux logs, per inbound JSON-RPC line, a ``stdout.line``
 # event the instant envd delivers it AND a ``stdout.forwarded`` event
 # once the ClientSession read loop has consumed it. A ``line`` without
@@ -348,12 +348,14 @@ class E2BSandboxService:
             SessionMessage
         ](0)
 
-        # Fatal-transport signal. Set when the stdin pump gives up on
-        # an unrecoverable failure (sandbox gone, reattach/send failed)
-        # — NOT on a transient auto-pause the pump reattaches through.
-        # The connection task surfaces this via ``is_transport_alive()``
-        # so the manager reconnects a dead shared session instead of
-        # reusing the zombie. See ``_fail_transport`` below.
+        # Fatal-transport signal. Set when the stdin pump gives up:
+        # the sandbox is gone, a send failed, or the sandbox woke from
+        # a pause and its frozen process was retired. The connection
+        # task surfaces this via ``is_transport_alive()`` so the
+        # manager rebuilds the session instead of reusing the zombie.
+        # A wake is no longer "transient" — it ends the session by
+        # design, because the process on the other side cannot be
+        # trusted after a freeze. See ``_fail_transport`` below.
         transport_failed = asyncio.Event()
 
         async def _fail_transport() -> None:
@@ -376,6 +378,7 @@ class E2BSandboxService:
         # leftover so a newline-free stream can't grow per-session memory
         # without bound (SBX-7 / BUG-6).
         stdout_lines = BoundedLineBuffer()
+
 
         async def on_stdout(chunk: bytes) -> None:
             text = chunk.decode("utf-8", errors="replace")
@@ -414,7 +417,19 @@ class E2BSandboxService:
                         method=getattr(_root, "method", None),
                         nbytes=len(line),
                     )
-                await read_writer.send(SessionMessage(message=msg))
+                #
+                try:
+                    await read_writer.send(SessionMessage(message=msg))
+                except (
+                    anyio.ClosedResourceError, anyio.BrokenResourceError,
+                ):
+                    # The read side is shut. Since the watcher fails the
+                    # transport on EVERY session end, not just failures,
+                    # a chatty server still flushing output at teardown
+                    # lands here routinely. Swallow it: raising would
+                    # surface as an uncaught exception inside the E2B
+                    # SDK's own callback task, once per late chunk.
+                    return
                 if _E2B_DEBUG_RAW_STDOUT:
                     logger.info(
                         "sandbox.e2b.stdout.forwarded",
@@ -445,12 +460,10 @@ class E2BSandboxService:
                 )
 
         argv = [cfg.command, *list(cfg.args)]
-        # Acquire the (sandbox, process) pair: try reconnect to a
-        # persisted live ref first if reuse-on-restart is enabled,
-        # else fresh-create. Returns ``(sandbox, process,
-        # was_reconnect)``; ``was_reconnect=True`` skips persisting
-        # a new ref since the existing ref is still valid.
-        sandbox, process, _was_reconnect = await self._acquire_session_handles(
+        # Acquire the (sandbox, process) pair: reuse a persisted
+        # sandbox if reuse-on-restart is enabled, else fresh-create.
+        # Either way the process is new and its pid is persisted below.
+        sandbox, process = await self._acquire_session_handles(
             session_id=session_id,
             org_id=org_id,
             upstream=upstream,
@@ -471,10 +484,9 @@ class E2BSandboxService:
 
         # Persist the live ref iff reuse-on-restart is enabled and
         # this isn't an explicit-pause/resume flow (resume_from gets
-        # its own persistence path on pause()). When ``was_reconnect``
-        # is true, the existing ref is still valid for the same
-        # ``(sandbox_id, pid)``; we just bump ``last_updated`` so an
-        # operator can see "this ref is being actively used".
+        # its own persistence path on pause()). Always written: every
+        # path yields a new pid, so a skipped write would leave the ref
+        # pointing at a process that no longer exists.
         if (
             self._reuse_sandboxes_on_restart
             and resume_from is None
@@ -486,6 +498,12 @@ class E2BSandboxService:
                     upstream=upstream,
                     sandbox_id=sandbox.sandbox_id,
                     pid=process.pid,
+                    # Records the size this sandbox was built with, so
+                    # a later reuse refuses once the operator edits
+                    # cpu/ram (a reconnect cannot re-size).
+                    template=self._resolve_template(
+                        upstream=upstream, resources=resources,
+                    ),
                 )
                 self._session_owners[session_id] = (org_id, upstream.id)
             except Exception:
@@ -510,30 +528,86 @@ class E2BSandboxService:
         # Detect the dead stream by watching ``process.wait()`` in a
         # sidecar task: any return (clean exit OR raised exception)
         # means "no more output will arrive on this handle." On hit,
-        # the stdin pump reattaches a fresh handle pointed at the same
-        # pid via ``sandbox.connect_command(pid=…)``. The pid is
-        # stable across pause/resume in E2B v2.
+        # the stdin pump retires the process and fails the transport
+        # so the session is rebuilt against the same sandbox. It used
+        # to reattach to the same pid here; see the long note at that
+        # branch for why a process cannot outlive a freeze.
         stream_dead = asyncio.Event()
 
         async def watch_stream(p: E2BProcessHandle) -> None:
             exit_code: int | None = None
+            # Distinguishes the two reasons this task ends. Without it
+            # ``exit_code`` is null for both a pause and an ordinary
+            # close, so the ``stream_dead`` rate chart is unreadable:
+            # an operator cannot tell "sandboxes are pausing more" from
+            # "sessions are being restarted more".
+            cause = "severed"
             try:
                 exit_code = await p.wait()
+            except asyncio.CancelledError:
+                # Teardown cancelled us; the session is closing on
+                # purpose. Re-raised below after the bookkeeping.
+                cause = "closed"
+                raise
             except BaseException:
                 # Any exception out of wait() also means the events
                 # stream is no longer delivering — fold it into the
-                # same dead-stream signal so the pump reattaches.
+                # same dead-stream signal so the pump retires the
+                # process and hands off to a session rebuild.
                 # ``exit_code`` stays ``None``; the snapshot will
                 # report "exited (code unknown)".
                 pass
             finally:
                 # ``mark_exited`` is no-op after the first call, so
-                # the post-reattach watcher (re-spawned at line ~570
-                # when the SDK's auto-pause severs the streaming RPC)
-                # can't overwrite a real subprocess-exit observation
-                # captured during the init window.
+                # a later observation can't overwrite a real
+                # subprocess-exit one captured during the init window.
+                # There is only one watcher per session now: the pump
+                # ends the session on a wake rather than re-pointing
+                # at a new handle, so no second watcher is spawned.
                 exit_signal.mark_exited(exit_code)
                 stream_dead.set()
+                logger.info(
+                    "sandbox.e2b.stream_dead",
+                    session_id=session_id,
+                    exit_code=exit_code,
+                    cause=cause,
+                )
+                # Declare the transport dead HERE, not when something
+                # next tries to write. E2B's pause severs the streaming
+                # RPC, so this fires during the idle window: measured
+                # 8.7s before the next request arrived. Spending that
+                # head start is what makes the whole problem go away.
+                #
+                # ``ensure_shared_connected`` refuses a session whose
+                # ``is_transport_alive()`` is false, and it runs inside
+                # ``_resolve_session`` BEFORE the gateway writes
+                # anything. So the next request finds a dead session,
+                # gets a rebuilt one, and lands on a fresh MCP process.
+                # No request is ever handed to a frozen process, which
+                # means none is ever lost, which means nothing needs
+                # re-sending.
+                #
+                # That is why there is no "may I retry?" machinery in
+                # this file. An earlier design let the request reach a
+                # dead session, then tried to prove after the fact that
+                # re-sending was safe. Two rounds of adversarial review
+                # each found a hole in that proof. This ordering has no
+                # proof to get wrong.
+                #
+                # LIMIT, stated because an earlier comment here got it
+                # backwards: if E2B ever goes QUIET instead of severing
+                # the stream, this watcher never fires, and the pump's
+                # branch below cannot cover for it — that branch is
+                # gated on ``stream_dead``, which only this line sets.
+                # The frame would then be written to a frozen process
+                # with dead pooled sockets: Sentry MCPOLIS-BACKEND-16
+                # again, silently. Severing is what E2B does today
+                # (measured: the watcher fires 8.7s before the next
+                # request), but nothing in our code enforces it. An
+                # independent detector — a last-stdout age check, or an
+                # unconditional respawn on every session open — is the
+                # fix if that ever changes.
+                await _fail_transport()
 
         watch_task: asyncio.Task[None] = asyncio.create_task(
             watch_stream(process),
@@ -549,114 +623,76 @@ class E2BSandboxService:
         # is what caused tool calls to hang after the E2B sandbox
         # had been killed by the on_timeout backstop.
         async def stdin_pump() -> None:
-            nonlocal process, watch_task
+            # No ``nonlocal``: the pump no longer swaps ``process`` or
+            # ``watch_task`` mid-session. A woken sandbox retires its
+            # process and ends the session instead of re-pointing at a
+            # new handle, so both are read-only closures here.
             try:
                 async with write_reader:
                     async for session_message in write_reader:
                         if stream_dead.is_set():
-                            # Time ``connect_command`` — this call
-                            # encompasses E2B's auto_resume of the
-                            # paused sandbox + re-establishing the
-                            # streaming RPC. Surfaced as
-                            # ``reattach_duration_ms`` on the
-                            # ``sandbox.e2b.reattach.ok`` event so
-                            # ops dashboards can graph wake-from-
-                            # paused latency over time and alert on
-                            # regressions (E2B side or ours). The
-                            # integration suite extracts this same
-                            # field into a ``wake_from_paused_ms``
-                            # column.
-                            connect_start = time.monotonic()
+                            # The sandbox auto-paused and this frame is
+                            # the first traffic since. We do NOT reattach
+                            # to the frozen MCP process.
+                            #
+                            # Reattaching used to happen right here, and
+                            # it is what produced two user-visible bugs.
+                            # A process resumed from a snapshot believes
+                            # it still owns every TCP connection its HTTP
+                            # client had pooled; those were severed while
+                            # it slept. It writes into them and gets
+                            # ECONNRESET, one failed request per pooled
+                            # socket, which reaches the user as an opaque
+                            # "Upstream tool call failed". Measured 20 out
+                            # of 20 wakes, failure count tracking pool
+                            # size exactly, in
+                            # ``tests/integration/diagnose_wake_network.py``.
+                            # The same reuse carries envd's fan-out wedge,
+                            # which is the silent-stdout stall.
+                            #
+                            # Backstop, not the main path. The watcher
+                            # normally declares the transport dead the
+                            # moment the stream ends, so the gateway
+                            # rebuilds before writing and no frame
+                            # reaches here. This branch catches the one
+                            # real race: a dispatch that passed the
+                            # liveness gate microseconds before the
+                            # watcher fired. It does NOT cover a
+                            # watcher that never fires — see the note
+                            # at ``watch_stream``.
+                            #
+                            # Either way the frame is NOT written: the
+                            # dispatch fails and the manager rebuilds.
+                            # The caller eats one error, which is the
+                            # honest outcome when we cannot tell
+                            # whether an earlier request on this
+                            # session already ran.
+                            kill_started = time.monotonic()
                             try:
-                                new_handle = await sandbox.connect_command(
-                                    pid=process.pid,
-                                    on_stdout=on_stdout,
-                                    on_stderr=on_stderr,
-                                )
+                                await sandbox.kill_command(pid=process.pid)
                             except (
                                 ConnectionError, OSError, E2BSDKError,
                             ) as exc:
+                                # Non-fatal: the replacement session is
+                                # what matters, and a resident process
+                                # costs memory inside a sandbox we may
+                                # be about to abandon anyway.
                                 logger.warning(
-                                    "sandbox.e2b.reattach.failed",
+                                    "sandbox.e2b.wake.kill_failed",
                                     session_id=session_id,
                                     pid=process.pid,
-                                    error=str(exc),
-                                    reattach_duration_ms=round(
-                                        (time.monotonic() - connect_start) * 1000, 1,
-                                    ),
-                                )
-                                await _fail_transport()
-                                return
-                            reattach_duration_ms = round(
-                                (time.monotonic() - connect_start) * 1000, 1,
-                            )
-                            # When ``commands.connect(pid)``
-                            # triggers ``auto_resume``, E2B replaces
-                            # our configured ``on_timeout`` with the
-                            # SDK's default (``default_sandbox_timeout``
-                            # = 300s). Re-apply our value so the
-                            # ``MCPOLIS_E2B_IDLE_PAUSE_SECONDS`` knob
-                            # actually holds across multiple
-                            # auto-pause/reattach cycles. Verified
-                            # 2026-05-01 via the diagnostic at
-                            # ``backend/tests/integration/diagnose_double_reattach.py``.
-                            set_timeout_start = time.monotonic()
-                            set_timeout_duration_ms: float | None = None
-                            try:
-                                await sandbox.set_timeout(
-                                    self._on_timeout_seconds,
-                                )
-                                set_timeout_duration_ms = round(
-                                    (time.monotonic() - set_timeout_start) * 1000, 1,
-                                )
-                            except (
-                                ConnectionError, OSError, E2BSDKError,
-                            ) as exc:
-                                # Best-effort: a failed re-apply only
-                                # costs extra running time, doesn't
-                                # break the session. Log and continue.
-                                logger.warning(
-                                    "sandbox.e2b.reattach.set_timeout_failed",
-                                    session_id=session_id,
                                     error=str(exc),
                                 )
                             logger.info(
-                                "sandbox.e2b.reattach.ok",
+                                "sandbox.e2b.wake.process_retired",
                                 session_id=session_id,
-                                pid=new_handle.pid,
-                                reattach_duration_ms=reattach_duration_ms,
-                                set_timeout_duration_ms=set_timeout_duration_ms,
+                                pid=process.pid,
+                                kill_duration_ms=round(
+                                    (time.monotonic() - kill_started) * 1000, 1,
+                                ),
                             )
-                            # Tear down the OLD handle's streaming
-                            # RPC explicitly before dropping the
-                            # reference. Without this, the SDK's
-                            # events-iteration generator (holding an
-                            # open httpx stream context manager) is
-                            # left to be aclose'd by GC at an
-                            # arbitrary later point, racing the
-                            # httpx generator's own ``__aexit__``
-                            # and surfacing as ``RuntimeError:
-                            # athrow(): asynchronous generator is
-                            # already running`` on stderr after the
-                            # last scenario finishes. Best-effort:
-                            # release errors are noisy in logs but
-                            # don't break the session.
-                            old_process = process
-                            try:
-                                await old_process.release()
-                            except (
-                                ConnectionError, OSError, E2BSDKError,
-                            ) as exc:
-                                logger.warning(
-                                    "sandbox.e2b.reattach.release_failed",
-                                    session_id=session_id,
-                                    error=str(exc),
-                                )
-                            process = new_handle
-                            stream_dead.clear()
-                            watch_task = asyncio.create_task(
-                                watch_stream(new_handle),
-                            )
+                            await _fail_transport()
+                            return
                         body = session_message.message.model_dump_json(
                             by_alias=True, exclude_none=True,
                         )
@@ -792,8 +828,8 @@ class E2BSandboxService:
         on_stdout: "Callable[[bytes], Awaitable[None] | None]",
         on_stderr: "Callable[[bytes], Awaitable[None] | None]",
         materialize_files: Sequence[MaterializeFile] | None = None,
-    ) -> tuple[E2BSandboxHandle, E2BProcessHandle, bool]:
-        """Return ``(sandbox, process, was_reconnect)`` for a session.
+    ) -> tuple[E2BSandboxHandle, E2BProcessHandle]:
+        """Return ``(sandbox, process)`` for a session.
 
         Three paths:
 
@@ -805,22 +841,26 @@ class E2BSandboxService:
            inside the snapshot is dropped and a new one starts.
         2. **Reuse-on-restart** (``_reuse_sandboxes_on_restart`` is
            on AND persistence has a live ref):
-           ``connect_sandbox(sandbox_id)`` + skip ``run_command``,
-           instead ``connect_command(pid)`` to reattach the
-           streaming RPC against the existing MCP process. Returns
-           ``was_reconnect=True`` so the caller skips the
-           persist-ref step (existing ref is still valid). Falls
-           through to (3) on any failure (sandbox died, network
-           blip). Reattach is unconditional: a config edit on disk
-           does NOT propagate until the user explicitly Stop+Restart
-           the upstream.
+           ``connect_sandbox(sandbox_id)`` + ``kill_command`` on the
+           recorded pid + a fresh ``run_command``. The sandbox is
+           reused; the MCP process inside it never is. Falls through
+           to (3) on any failure (sandbox died, network blip). Reuse
+           is unconditional: a config edit on disk does NOT propagate
+           until the user explicitly Stop+Restart the upstream.
         3. **Fresh create** (default): ``create_sandbox`` +
            ``run_command``. Returns ``was_reconnect=False``.
 
-        Path (2) is what eliminates deploy downtime — the
-        ~25 s cold-install becomes a ~700 ms wake-from-paused
-        because the MCP process and its filesystem survive in the
-        sandbox snapshot from the previous boot.
+        Paths (1) and (2) are now the same shape, which is the point:
+        a process that has been through a snapshot is never handed
+        back to a caller. Path (2) still avoids most of the cold-start
+        cost, because the expensive part of a fresh create is
+        downloading the MCP's package (7-22 s in production) and that
+        cache lives on the sandbox filesystem, which survives.
+
+        Returns ``(sandbox, process)``. The old third element,
+        ``was_reconnect``, is gone: it existed so the caller could skip
+        re-persisting the ref on a reattach, and every path now yields
+        a new pid that must be persisted.
         """
         # Path 1: explicit-pause resume. Existing flow, unchanged.
         if resume_from is not None:
@@ -837,7 +877,7 @@ class E2BSandboxService:
                 argv, env=merged_env,
                 on_stdout=on_stdout, on_stderr=on_stderr,
             )
-            return sandbox, process, False
+            return sandbox, process
 
         # Path 2: reuse-on-restart — try reconnect to a persisted
         # live ref. Only fires when the operator has opted in AND
@@ -849,8 +889,12 @@ class E2BSandboxService:
             reconnect = await self._try_reconnect(
                 org_id=org_id,
                 upstream=upstream,
+                resources=resources,
+                argv=argv,
+                merged_env=merged_env,
                 on_stdout=on_stdout,
                 on_stderr=on_stderr,
+                materialize_files=materialize_files,
             )
             if reconnect is not None:
                 logger.info(
@@ -861,7 +905,7 @@ class E2BSandboxService:
                     sandbox_id=reconnect[0].sandbox_id,
                     pid=reconnect[1].pid,
                 )
-                return reconnect[0], reconnect[1], True
+                return reconnect[0], reconnect[1]
 
         # Path 3: fresh create. The default flow.
         #
@@ -894,10 +938,18 @@ class E2BSandboxService:
             )
             # docker-language sandboxes have the Docker engine installed
             # but no running daemon — start it now before the MCP command
-            # runs. Resume (path 1) and reconnect (path 2) skip this:
-            # resume restores the frozen microVM state (dockerd survives
-            # the snapshot), and reconnect reattaches to an already-live
-            # sandbox.
+            # runs. Resume (path 1) and reuse (path 2) skip this because
+            # the frozen microVM state restores with dockerd already
+            # running.
+            #
+            # NOTE: path 2's justification used to be "it reattaches to
+            # an already-live process", which stopped being true when
+            # the wake fix made it spawn a fresh ``docker run`` instead.
+            # The remaining claim — dockerd survives the snapshot — is
+            # the same one path 1 has always relied on, so this is not
+            # new exposure, but it is now load-bearing in a second
+            # place. Worth a real docker-template check if the flock /
+            # socket hazard in CLAUDE.md ever resurfaces.
             cfg = upstream.stdio
             if cfg is not None and language_for_command(cfg.command) == "docker":
                 await self._start_docker_daemon(sandbox)
@@ -911,22 +963,74 @@ class E2BSandboxService:
                     org_id=org_id, upstream=upstream, prior=prior_ref,
                 )
             raise
-        return sandbox, process, False
+        return sandbox, process
+
+    def _resolve_template(
+        self,
+        *,
+        upstream: UpstreamDefinition,
+        resources: SandboxResources,
+    ) -> str:
+        """The published template name for this upstream's language and
+        requested size.
+
+        One implementation for two callers that MUST agree: the create
+        path, and the reuse check in :meth:`_try_reconnect`. Size is
+        baked into the template at create time and a reconnect cannot
+        re-size, so if these two ever disagreed a resized upstream
+        would silently keep running at its old size.
+        """
+        cfg = upstream.stdio
+        assert cfg is not None
+        language = language_for_command(cfg.command)
+        if language is None:
+            raise ResourcesUnsupported(
+                "cpu_vcpus",
+                cfg.command,
+                allowed=(
+                    "npx", "uvx", "uv", "node", "python", "python3", "docker",
+                ),
+            )
+        return self._grid.template_name(
+            language=language,
+            cpu_vcpus=resources.cpu_vcpus,
+            memory_mb=resources.memory_mb,
+        )
 
     async def _try_reconnect(
         self,
         *,
         org_id: str,
         upstream: UpstreamDefinition,
+        resources: SandboxResources,
+        argv: list[str],
+        merged_env: dict[str, str],
         on_stdout: "Callable[[bytes], Awaitable[None] | None]",
         on_stderr: "Callable[[bytes], Awaitable[None] | None]",
+        materialize_files: Sequence[MaterializeFile] | None = None,
     ) -> tuple[E2BSandboxHandle, E2BProcessHandle] | None:
-        """Look up persistence for a live ref and try to reconnect.
+        """Reuse a persisted sandbox, but never its MCP process.
 
         Returns ``(sandbox, process)`` on success, ``None`` on any
         miss/failure (caller falls back to fresh create). Logs the
         specific reason for the miss so operators can diagnose
         unexpected fresh-creates.
+
+        The sandbox is reconnected (keeping its warm filesystem and
+        package cache, which is where nearly all of a cold start's
+        7-22 s goes) but the MCP process recorded in the ref is KILLED
+        and replaced with a fresh one. Reattaching to it instead — what
+        this method used to do — hands back a process that was frozen
+        mid-flight: its HTTP client's pooled sockets were severed
+        while it slept, it cannot tell, and it writes into them. That
+        surfaces to the user as one opaque failure per pooled socket
+        on the first calls after a wake, measured 20 out of 20 wakes
+        in ``tests/integration/diagnose_wake_network.py``, and is the
+        same reuse that carries the envd fan-out wedge behind the
+        silent-stdout stall.
+
+        Because the pid changes, the caller re-persists the live ref
+        (it already writes ``process.pid`` unconditionally).
         """
         assert self._persistence is not None  # guarded by caller
         try:
@@ -953,14 +1057,44 @@ class E2BSandboxService:
                 paused_snapshot_id=ref.paused_snapshot_id,
             )
             return None
-        # Drift contract: a config edit on disk does NOT take effect
-        # until the user explicitly Stop+Restart the upstream. On
-        # boot reconnect we therefore reattach unconditionally to
-        # whatever sandbox is alive, regardless of whether the live
-        # config has changed since the sandbox was created. The
-        # previous config-hash gate silently applied pending edits
-        # across deploys, which surprised operators who hadn't asked
-        # for them.
+        # Sandbox reuse is unconditional: we reuse whatever sandbox is
+        # alive regardless of whether the live config changed since it
+        # was created. The old config-hash gate was removed because it
+        # silently applied pending edits across deploys.
+        #
+        # DRIFT CAVEAT (changed by the wake fix, 2026-09): the
+        # replacement process started below gets the CURRENT argv/env
+        # and freshly materialized Sandbox files. While a wake was a
+        # transparent reattach, an edit really could not take effect
+        # without an explicit Stop+Restart. Now a wake ends the session
+        # and the manager rebuilds through here, so a pending edit goes
+        # live on the next wake and ``connect_shared`` re-persists
+        # ``started_config_hash``, clearing the dirty-config banner on
+        # its own. That is a behaviour change for the operator, not an
+        # accident; see the CLAUDE.md wake section.
+        # A sandbox's CPU and RAM come from the template it was
+        # created with, and reconnecting attaches by id — it cannot
+        # re-size. So a size edit has to fresh-create, or the upstream
+        # silently keeps running at the old size while the dashboard
+        # clears its dirty-config banner (``cpu_vcpus`` / ``memory_mb``
+        # are in the runtime hash, and every reopen re-persists it).
+        # Caught in review after the preserve-the-sandbox change made
+        # reuse the norm; before that, reopens fresh-created anyway.
+        wanted_template = self._resolve_template(
+            upstream=upstream, resources=resources,
+        )
+        ref_template = ref.metadata.get("e2b_template")
+        if ref_template is not None and ref_template != wanted_template:
+            logger.info(
+                "sandbox.e2b.reconnect.template_changed",
+                org_id=org_id, upstream_id=upstream.id,
+                sandbox_id=ref.sandbox_id,
+                from_template=ref_template,
+                to_template=wanted_template,
+                fallback="fresh_create",
+            )
+            return None
+
         # Try the actual reconnect.
         try:
             sandbox = await self._client.connect_sandbox(ref.sandbox_id)
@@ -981,33 +1115,78 @@ class E2BSandboxService:
                 "sandbox.e2b.reconnect.set_timeout_failed",
                 sandbox_id=ref.sandbox_id, exc_info=True,
             )
-        connect_command_started = time.monotonic()
+        # Kill the frozen MCP process before starting its replacement.
+        # Best-effort: a pid that is already gone is the end state we
+        # want, and a genuine failure costs one resident process
+        # rather than the session. Skipping it entirely would leave
+        # one dead MCP server per wake, and a busy sandbox wakes
+        # dozens of times a day.
         try:
-            process = await sandbox.connect_command(
-                pid=ref.pid,
-                on_stdout=on_stdout,
-                on_stderr=on_stderr,
+            await sandbox.kill_command(pid=ref.pid)
+        except E2BSDKError as exc:
+            logger.warning(
+                "sandbox.e2b.reconnect.kill_stale_process_failed",
+                org_id=org_id, upstream_id=upstream.id,
+                sandbox_id=ref.sandbox_id, pid=ref.pid, error=str(exc),
+            )
+        # Sandbox files are re-materialized before the replacement
+        # process starts, mirroring the snapshot-resume path: the
+        # sandbox disk survived, but a Variable edited since the
+        # sandbox was created must reach the new process.
+        #
+        # ``_materialize_files`` treats a write failure as fatal and
+        # lets it propagate, which is right on the fresh-create path
+        # (a sandbox that cannot take its credential files is no use)
+        # but wrong here: this method's contract is to return ``None``
+        # on a PROVIDER failure so the caller fresh-creates. An
+        # unwrapped raise would abort the session open instead,
+        # turning a stale sandbox into a user-visible error. A
+        # ``ValueError`` from ``confine_to_sandbox_home`` is
+        # deliberately NOT caught — a path escaping the sandbox home
+        # is a config bug that a fresh create would hit identically,
+        # so it should surface rather than loop.
+        try:
+            await self._materialize_files(
+                sandbox=sandbox,
+                upstream_id=upstream.id,
+                materialize_files=materialize_files,
+            )
+        except (ConnectionError, OSError, E2BSDKError) as exc:
+            logger.warning(
+                "sandbox.e2b.reconnect.materialize_failed",
+                org_id=org_id, upstream_id=upstream.id,
+                sandbox_id=ref.sandbox_id, error=str(exc),
+                fallback="fresh_create",
+            )
+            await self._kill_stale_sandbox(
+                sandbox_id=ref.sandbox_id, sandbox=sandbox,
+            )
+            return None
+        respawn_started = time.monotonic()
+        try:
+            process = await sandbox.run_command(
+                argv, env=merged_env,
+                on_stdout=on_stdout, on_stderr=on_stderr,
             )
         except E2BSDKError as exc:
             elapsed_ms = round(
-                (time.monotonic() - connect_command_started) * 1000.0, 1,
+                (time.monotonic() - respawn_started) * 1000.0, 1,
             )
             # Severity is ``warning`` (not ``info``) because this path
-            # delays a user-visible Start click by up to the SDK's
-            # connect_command timeout (~60s on a port-not-open
-            # ``TimeoutException``) before falling back to a fresh
-            # create. ``elapsed_ms`` and ``error_class`` let dashboards
-            # split routine "sandbox auto-stopped" reattach failures
-            # (fast, expected) from "E2B API degraded" timeouts (slow,
-            # actionable) without grepping the freeform ``error``
-            # string. ``fallback="fresh_create"`` makes the self-
-            # healing handoff explicit so a single log line carries
-            # the full story rather than implying it from the
+            # delays a user-visible Start click by the full respawn
+            # attempt before falling back to a fresh create.
+            # ``elapsed_ms`` and ``error_class`` let dashboards split
+            # routine "sandbox auto-stopped" failures (fast, expected)
+            # from "E2B API degraded" ones (slow, actionable) without
+            # grepping the freeform ``error`` string.
+            # ``fallback="fresh_create"`` makes the self-healing
+            # handoff explicit so a single log line carries the full
+            # story rather than implying it from the
             # ``sandbox.e2b.create`` event ~hundreds-of-ms later.
             logger.warning(
-                "sandbox.e2b.reconnect.connect_command_failed",
+                "sandbox.e2b.reconnect.respawn_failed",
                 org_id=org_id, upstream_id=upstream.id,
-                sandbox_id=ref.sandbox_id, pid=ref.pid,
+                sandbox_id=ref.sandbox_id, stale_pid=ref.pid,
                 elapsed_ms=elapsed_ms,
                 error_class=type(exc).__name__,
                 error=str(exc),
@@ -1030,10 +1209,10 @@ class E2BSandboxService:
     ) -> None:
         """Best-effort kill of a stale sandbox during reconnect recovery.
 
-        Used by :meth:`_try_reconnect` when ``connect_command`` fails:
-        the process is gone but the sandbox might still be alive, so
-        we kill it to avoid a leak before the caller's fresh-create
-        path produces a new one.
+        Used by :meth:`_try_reconnect` when the respawn fails: we
+        could not start a process in this sandbox, so it is no use to
+        us, and killing it avoids a leak before the caller's
+        fresh-create path produces a replacement.
 
         Always best-effort — a failure here can't block the caller's
         fresh-create path. The reconciler is the eventual-consistency
@@ -1057,9 +1236,14 @@ class E2BSandboxService:
         upstream: UpstreamDefinition,
         sandbox_id: str,
         pid: int,
+        template: str | None = None,
     ) -> None:
         """Write a live-ref to persistence so the next boot can
         reconnect via :meth:`_try_reconnect`.
+
+        ``template`` records the size the sandbox was built with, so a
+        later reuse can refuse when the operator has changed cpu/ram.
+        ``None`` leaves whatever the row already had.
 
         Preserves any pre-existing ``metadata`` / ``paused_snapshot_id``
         on the row (e.g. ``e2b_volume_id`` for persistent-disk
@@ -1073,6 +1257,8 @@ class E2BSandboxService:
         merged_metadata = (
             dict(existing.metadata) if existing is not None else {}
         )
+        if template is not None:
+            merged_metadata["e2b_template"] = template
         ref = SandboxPersistedRef(
             provider="e2b",
             org_id=org_id,
@@ -1511,19 +1697,8 @@ class E2BSandboxService:
 
         cfg = upstream.stdio
         assert cfg is not None  # guarded above
-        language = language_for_command(cfg.command)
-        if language is None:
-            raise ResourcesUnsupported(
-                "cpu_vcpus",
-                cfg.command,
-                allowed=(
-                    "npx", "uvx", "uv", "node", "python", "python3", "docker",
-                ),
-            )
-        template = self._grid.template_name(
-            language=language,
-            cpu_vcpus=resources.cpu_vcpus,
-            memory_mb=resources.memory_mb,
+        template = self._resolve_template(
+            upstream=upstream, resources=resources,
         )
         metadata: dict[str, str] = {
             "mcpolis_org": org_id,
@@ -1658,6 +1833,44 @@ class E2BSandboxService:
         for sid in list(self._live_sandboxes):
             self._preserve_on_close[sid] = True
         return len(self._live_sandboxes)
+
+    def preserve_sessions_for_upstream(
+        self, *, org_id: str, upstream_id: str,
+    ) -> int:
+        """See :meth:`SandboxService.preserve_sessions_for_upstream`.
+
+        Scoped by ``_session_owners``, which the session flow fills
+        whenever reuse-on-restart is wired — precisely the case where
+        preserving is worth anything. Sessions belonging to other
+        upstreams are untouched, so a reopen of one MCP cannot leak
+        another's sandbox past its own teardown.
+
+        Within ONE upstream this marks every live session, while a
+        reopen closes only the shared one. A second live session would
+        therefore carry a stale mark into an unrelated teardown.
+        Unreachable today: ``validate_stdio_uses_service_account``
+        forbids non-service-account stdio, so there is only ever one.
+        Revisit if stdio ever gains per-user sessions.
+
+        CONTRACT: the caller must CLOSE the session it marks. The mark
+        is a latch with no expiry — marking and then leaving the
+        session open means its eventual, unrelated teardown silently
+        skips killing the sandbox. ``connect_shared`` satisfies this
+        by closing immediately afterwards.
+        """
+        marked = 0
+        for session_id, owner in list(self._session_owners.items()):
+            if owner != (org_id, upstream_id):
+                continue
+            if session_id in self._live_sandboxes:
+                self._preserve_on_close[session_id] = True
+                marked += 1
+        if marked:
+            logger.info(
+                "sandbox.e2b.preserve_for_heal",
+                org_id=org_id, upstream_id=upstream_id, sessions=marked,
+            )
+        return marked
 
     def active_session_ids(self) -> list[str]:
         """Snapshot of session ids with a live sandbox right now.

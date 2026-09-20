@@ -463,6 +463,18 @@ class LocalSubprocessSandboxService:
                 exit_code=process.returncode,
             )
 
+    def preserve_sessions_for_upstream(
+        self, *, org_id: str, upstream_id: str,
+    ) -> int:
+        """No-op: a local subprocess has no sandbox to preserve.
+
+        The E2B backend uses this to keep a warm sandbox alive across
+        a heal. Here the "sandbox" is the process itself, which the
+        heal is replacing on purpose, so there is nothing to save.
+        """
+        del org_id, upstream_id
+        return 0
+
     async def pause(self, session_id: str) -> SnapshotRef | None:
         # Subprocesses on the host can't be snapshotted; caller falls
         # back to close + cold-restart per the SandboxService contract.

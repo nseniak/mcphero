@@ -20,6 +20,9 @@ import uuid
 
 from mcpolis.adapters.sandbox_e2b import E2BSandboxService, RealE2BClient
 from mcpolis.adapters.sandbox_e2b.client import E2BSDKError
+from mcpolis.domain.ports.sandbox_persistence_repository import (
+    SandboxPersistenceRepository,
+)
 from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.domain.services.sandbox_service import SandboxResources
 from tests.unit.factories import make_upstream_definition
@@ -55,12 +58,24 @@ def make_service(
     *,
     instance: str,
     on_timeout_seconds: int = IDLE_PAUSE_SECONDS,
+    persistence: SandboxPersistenceRepository | None = None,
+    reuse_on_restart: bool = False,
 ) -> E2BSandboxService:
+    """Build a real-SDK service.
+
+    ``persistence`` + ``reuse_on_restart`` are needed by any test that
+    drives more than one session against the SAME sandbox — a wake
+    ends the session, so a multi-cycle test reopens one, and only the
+    persisted ref makes the second open land on the paused sandbox
+    instead of creating a fresh one.
+    """
     assert E2B_API_KEY is not None  # guarded by pytestmark
     return E2BSandboxService(
         RealE2BClient(api_key=E2B_API_KEY),
         mcpolis_instance=instance,
         on_timeout_seconds=on_timeout_seconds,
+        persistence=persistence,
+        reuse_sandboxes_on_restart=reuse_on_restart,
     )
 
 

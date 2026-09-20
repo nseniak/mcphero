@@ -189,6 +189,109 @@ async def test_sequential_reconnect_opens_a_fresh_session_each_time() -> None:
     await mgr.stop_all()
 
 
+@pytest.mark.asyncio
+async def test_heal_asks_to_preserve_the_sandbox_before_reopening() -> None:
+    """A heal must keep the warm sandbox, and asking is not optional.
+
+    ``reconnect_shared_fresh`` leaves the persisted ref in place so the
+    reopen can reuse the sandbox. That alone does nothing: the reopen
+    is close-then-open, and the close tears the session down with
+    ``preserve=False``, which deletes the ref and kills the sandbox.
+    The reopen then has nothing to reuse and fresh-creates — 7-22s of
+    package download on every single wake, the opposite of the
+    intent.
+
+    An independent review caught exactly that: the code claimed reuse,
+    logged ``sandbox_reused=True``, and destroyed the sandbox anyway.
+    The only reason the integration tests appeared to show reuse was
+    that they called ``mark_session_preserve_on_close`` by hand, which
+    production never does. This test is the regression gate.
+    """
+    fake = make_fake_sandbox_service(server_factory=make_echo_server)
+    upstream = make_upstream_definition(id="everything2", command="ignored")
+    mgr = make_manager(upstream, fake)
+
+    # A live session first, so "before the reopen" is a real
+    # distinction rather than trivially true on an empty manager.
+    await mgr.connect_shared(upstream)
+    fake.preserve_calls.clear()
+    fake.opens_at_preserve.clear()
+
+    await mgr.reconnect_shared_fresh(upstream)
+    assert fake.preserve_calls, (
+        "the heal must ask the sandbox service to preserve the sandbox; "
+        "without it every wake pays a full cold create"
+    )
+    assert fake.preserve_calls[-1][1] == "everything2", (
+        f"preserve must be scoped to this upstream, not a blanket mark; "
+        f"got {fake.preserve_calls}"
+    )
+    # ORDER, not just occurrence. Asking after the reopen is useless:
+    # the close has already deleted the ref and killed the sandbox.
+    # Review showed the occurrence-only version of this assertion
+    # passed with the call moved after ``connect_shared``, so it
+    # guarded nothing. ``opens_at_preserve`` is the session-open count
+    # sampled inside the preserve call; it must still be pre-heal.
+    assert fake.opens_at_preserve == [1], (
+        "preserve must be asked for BEFORE the reopen; session opens "
+        f"at preserve time = {fake.opens_at_preserve}"
+    )
+
+    await mgr.stop_all()
+
+
+@pytest.mark.asyncio
+async def test_lazy_reattach_after_a_wake_also_preserves_the_sandbox() -> None:
+    """The wake path preserves the sandbox too, not just the heal path.
+
+    This guard was missing, and its absence is how one bug reached
+    review twice by two different routes. The first design healed
+    through ``reconnect_shared_fresh``, so the preserve call went
+    there. The second design detects the pause in the watcher, so the
+    next dispatch resolves through ``ensure_shared_connected``
+    instead — which closed and rebuilt the sandbox with no preserve,
+    silently undoing the whole saving while the heal-path test stayed
+    green.
+
+    Every close-then-open of a live shared session must preserve,
+    whichever entry point reached it.
+    """
+    fake = make_fake_sandbox_service(server_factory=make_echo_server)
+    upstream = make_upstream_definition(id="everything2", command="ignored")
+    mgr = make_manager(upstream, fake)
+
+    await mgr.connect_shared(upstream)
+    await wait_until(lambda: fake.last_session is not None)
+    handle = fake.last_session
+    assert handle is not None
+
+    # The sandbox pauses: the backend marks the transport dead on its
+    # own, exactly as the E2B watcher now does.
+    handle.kill()
+    fake.preserve_calls.clear()
+    fake.opens_at_preserve.clear()
+
+    # The next dispatch resolves its session through here.
+    await mgr.ensure_shared_connected(upstream)
+
+    assert fake.preserve_calls, (
+        "waking through the lazy-attach path must also ask to keep the "
+        "sandbox; otherwise every idle period ends in a full package "
+        "download"
+    )
+    assert fake.preserve_calls[-1][1] == "everything2"
+    # Order, same as the heal twin. The preserve lives inside
+    # ``connect_shared`` so one assertion technically covers both, but
+    # this is the path carrying production traffic and the one whose
+    # guard was missing last round.
+    assert fake.opens_at_preserve == [1], (
+        "preserve must be asked for BEFORE the reopen; session opens "
+        f"at preserve time = {fake.opens_at_preserve}"
+    )
+
+    await mgr.stop_all()
+
+
 # --- CONC-3: a lazy-connect failure under contention clears the slot and
 #     fails BOTH callers, leaving the upstream FAILED ----------------------
 

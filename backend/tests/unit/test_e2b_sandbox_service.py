@@ -612,19 +612,22 @@ async def test_session_surfaces_stdin_send_failures_on_read_stream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_reattaches_after_stream_dies() -> None:
-    """E2B's ``on_timeout=pause`` severs the SDK's streaming RPC
-    behind the original ``run_command``; ``auto_resume`` reconnects
-    unary calls (``send_stdin``) but does NOT reconnect the streaming
-    RPC. Without reattach, every tool call after a long idle would
-    succeed at sending stdin and then hang waiting for stdout that
-    never arrives.
+async def test_session_retires_process_after_stream_dies() -> None:
+    """A woken sandbox must retire its MCP process, not reattach to it.
 
-    The session watches ``process.wait()`` in a sidecar; any return
-    means "no more stdout on this handle." The stdin pump checks
-    that signal before each send and reattaches via
-    ``sandbox.connect_command(pid=…)`` — same pid, fresh streaming
-    RPC.
+    E2B's ``on_timeout=pause`` severs the streaming RPC behind the
+    original ``run_command``. The session used to reattach to the same
+    pid here, which handed back a process frozen mid-flight: its HTTP
+    client still believed it owned pooled TCP connections that were
+    severed while it slept, so the first calls after a wake failed with
+    ECONNRESET, one per pooled socket (20 of 20 wakes reproduced in
+    ``tests/integration/diagnose_wake_network.py``).
+
+    The pump now kills the frozen process and fails the transport, so
+    the manager rebuilds the session against the same sandbox with a
+    fresh process. Critically, the pending frame must NOT be written to
+    anything: it has not reached the upstream, so the rebuilt session
+    can deliver it exactly once with no risk of double execution.
     """
     from typing import cast
 
@@ -634,17 +637,16 @@ async def test_session_reattaches_after_stream_dies() -> None:
     service, mock = make_e2b_service()
     upstream = make_upstream_definition(id="ups-x", command="npx")
     async with service.session(
-        session_id="reattach-session",
+        session_id="retire-session",
         org_id="acme",
         upstream=upstream,
         resources=make_default_resources(),
         denylist=(),
     ) as session:
-        read_stream, write_stream = session.read_stream, session.write_stream
-        del read_stream  # unused — only the mock-side state is asserted
+        write_stream = session.write_stream
         live_handle = cast(
             MockE2BSandboxHandle,
-            service._live_sandboxes["reattach-session"],  # type: ignore[reportPrivateUsage]
+            service._live_sandboxes["retire-session"],  # type: ignore[reportPrivateUsage]
         )
         original_process = live_handle.last_process
         assert original_process is not None
@@ -666,26 +668,149 @@ async def test_session_reattaches_after_stream_dies() -> None:
         )
         await write_stream.send(request)
 
-        # Pump may need a couple of loop turns to call connect_command
-        # and forward stdin to the new handle.
         for _ in range(50):
-            if mock.connect_commands:
+            if mock.kill_commands:
                 break
             await asyncio.sleep(0.01)
 
-        assert len(mock.connect_commands) == 1
-        assert mock.connect_commands[0].pid == original_pid
-        new_process = live_handle.last_process
-        assert new_process is not None
-        assert new_process is not original_process
-        # Wait for stdin to land on the new handle (reattach + send).
+        assert len(mock.kill_commands) == 1, (
+            f"the frozen process must be killed; kills={mock.kill_commands}"
+        )
+        assert mock.kill_commands[0].pid == original_pid
+        assert not mock.connect_commands, (
+            "a woken sandbox must never reattach to its frozen process; "
+            f"connect_commands={mock.connect_commands}"
+        )
+        assert session.transport_failed is not None
         for _ in range(50):
-            if new_process.stdin_buffer:
+            if session.transport_failed.is_set():
                 break
             await asyncio.sleep(0.01)
-        assert new_process.stdin_buffer, "stdin not delivered to reattached handle"
+        assert session.transport_failed.is_set(), (
+            "retiring the process must fail the transport so the manager "
+            "rebuilds the session"
+        )
+        # Exactly-once: the frame never reached a process, so the
+        # rebuilt session owns its only delivery.
         assert not original_process.stdin_buffer, (
-            "stdin must not be delivered to the dead pre-reattach handle"
+            "the pending frame must not be written to the frozen process"
+        )
+
+
+@pytest.mark.asyncio
+async def test_stream_death_marks_the_transport_dead_immediately() -> None:
+    """The wake design rests entirely on this one ordering.
+
+    E2B severs the output stream when it pauses a sandbox, so the
+    watcher learns of the pause AT the pause — measured 8.7s before the
+    next request arrived, in a real integration run. Declaring the
+    transport dead right there is what lets
+    ``ensure_shared_connected`` refuse the session and rebuild BEFORE
+    the gateway writes anything. No request is handed to a frozen
+    process, so none is lost, so none has to be re-sent.
+
+    Nothing writes to the session in this test. If ``transport_failed``
+    only became set once the pump tripped over a frame, the request
+    that tripped it would already have been lost, and we would be back
+    to needing a "may I re-send this?" proof — which two rounds of
+    adversarial review each punctured.
+    """
+    from typing import cast
+
+    service, _mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="stream-death",
+        org_id="acme",
+        upstream=upstream,
+        resources=make_default_resources(),
+        denylist=(),
+    ) as session:
+        live_handle = cast(
+            MockE2BSandboxHandle,
+            service._live_sandboxes["stream-death"],  # type: ignore[reportPrivateUsage]
+        )
+        process = live_handle.last_process
+        assert process is not None
+        assert session.transport_failed is not None
+        assert not session.transport_failed.is_set()
+
+        # The sandbox pauses: the stream ends, nobody writes anything.
+        process.simulate_exit(0)
+        for _ in range(50):
+            if session.transport_failed.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+        assert session.transport_failed.is_set(), (
+            "the watcher must declare the transport dead on its own. "
+            "Waiting for a write means the writing request is already "
+            "lost, which is the whole problem"
+        )
+        assert not process.stdin_buffer, (
+            "nothing may be written to a frozen process"
+        )
+
+
+@pytest.mark.asyncio
+async def test_session_wake_kill_failure_still_withholds_the_frame() -> None:
+    """A refused kill is non-fatal but must not let the frame through.
+
+    If E2B refuses the kill (API blip, process already reaped), the
+    worst case is one resident process inside a sandbox. What must NOT
+    happen is the pending frame reaching that frozen process, which
+    would hand it to dead pooled sockets.
+
+    The assertion is deliberately NOT ``transport_failed.is_set()``:
+    the watcher sets that the instant the stream ends, before any
+    frame is pushed, so it holds no matter what this branch does.
+    Review caught the earlier version of this test asserting exactly
+    that and therefore guarding nothing.
+    """
+    from typing import cast
+
+    from mcp import types as mcp_types
+    from mcp.shared.message import SessionMessage
+
+    service, mock = make_e2b_service()
+    mock.kill_command_error = E2BSDKError("SandboxError", "kill refused")
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="retire-kill-fails",
+        org_id="acme",
+        upstream=upstream,
+        resources=make_default_resources(),
+        denylist=(),
+    ) as session:
+        write_stream = session.write_stream
+        live_handle = cast(
+            MockE2BSandboxHandle,
+            service._live_sandboxes["retire-kill-fails"],  # type: ignore[reportPrivateUsage]
+        )
+        original_process = live_handle.last_process
+        assert original_process is not None
+        original_process.simulate_exit(0)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        await write_stream.send(SessionMessage(
+            message=mcp_types.JSONRPCMessage.model_validate({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": {"name": "noop", "arguments": {}},
+            }),
+        ))
+
+        for _ in range(50):
+            if mock.kill_commands:
+                break
+            await asyncio.sleep(0.01)
+        assert mock.kill_commands, (
+            "the kill must still be attempted even though it fails"
+        )
+        assert not original_process.stdin_buffer, (
+            "a refused kill must not let the frame reach the frozen "
+            "process"
         )
 
 
@@ -961,20 +1086,22 @@ async def test_reconnect_recovers_from_dead_mcp_process() -> None:
 
     original_connect = mock.connect_sandbox
 
-    async def _connect_with_dead_pid(snapshot_id: str):  # type: ignore[no-untyped-def]
+    async def _connect_with_broken_respawn(snapshot_id: str):  # type: ignore[no-untyped-def]
         handle = await original_connect(snapshot_id)
 
-        async def _raise_not_found(*, pid: int, **_kwargs: Any) -> None:
-            del pid
+        # The reconnect path no longer reattaches to the recorded pid;
+        # it kills it and respawns. The equivalent "sandbox is alive
+        # but unusable" failure is therefore a failing ``run_command``.
+        async def _raise_not_found(*_args: Any, **_kwargs: Any) -> None:
             raise E2BNotFoundError(
                 "E2BNotFoundError",
-                "process with pid 999999999 not found",
+                "cannot spawn in sandbox",
             )
 
-        handle.connect_command = _raise_not_found  # type: ignore[method-assign,assignment]
+        handle.run_command = _raise_not_found  # type: ignore[method-assign,assignment]
         return handle
 
-    mock.connect_sandbox = _connect_with_dead_pid  # type: ignore[method-assign,assignment]
+    mock.connect_sandbox = _connect_with_broken_respawn  # type: ignore[method-assign,assignment]
 
     # Lazy reattach simulating first user call after restart.
     async with service.session(
@@ -990,12 +1117,11 @@ async def test_reconnect_recovers_from_dead_mcp_process() -> None:
     # The service should have killed the stuck sandbox and fresh-
     # created a replacement so the user's tool call works.
     assert len(mock.kills) > kills_before, (
-        "expected the stuck sandbox to be killed after "
-        "connect_command failed; "
-        f"kills={mock.kills}, creates={mock.creates}"
+        "expected the stuck sandbox to be killed after the respawn "
+        f"failed; kills={mock.kills}, creates={mock.creates}"
     )
     assert len(mock.creates) == creates_before + 1, (
-        "expected one fresh-create after the connect_command "
+        "expected one fresh-create after the respawn "
         f"failure; creates={mock.creates}"
     )
     ref = await persistence.get(org_id="acme", upstream_id=upstream.id)
@@ -1004,11 +1130,10 @@ async def test_reconnect_recovers_from_dead_mcp_process() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reconnect_connect_command_failed_log_shape() -> None:
-    """The ``sandbox.e2b.reconnect.connect_command_failed`` log line is
-    the operator's only signal that a reconnect attempt timed out
-    (60s SDK ``TimeoutException``) before falling back to a fresh
-    create. The shape MUST carry the four operator-actionable fields
+async def test_reconnect_respawn_failed_log_shape() -> None:
+    """The ``sandbox.e2b.reconnect.respawn_failed`` log line is
+    the operator's only signal that a reconnect attempt failed
+    before falling back to a fresh create. The shape MUST carry the four operator-actionable fields
     or on-call dashboards lose the ability to:
 
     - filter by severity (``warning`` — this is a user-visible 60s
@@ -1043,20 +1168,19 @@ async def test_reconnect_connect_command_failed_log_shape() -> None:
     # we only care about the LOG output.
     original_connect = mock.connect_sandbox
 
-    async def _connect_with_dead_pid(snapshot_id: str):  # type: ignore[no-untyped-def]
+    async def _connect_with_broken_respawn(snapshot_id: str):  # type: ignore[no-untyped-def]
         handle = await original_connect(snapshot_id)
 
-        async def _raise_not_found(*, pid: int, **_kwargs: Any) -> None:
-            del pid
+        async def _raise_not_found(*_args: Any, **_kwargs: Any) -> None:
             raise E2BNotFoundError(
                 "E2BNotFoundError",
-                "process with pid X not found",
+                "cannot spawn in sandbox",
             )
 
-        handle.connect_command = _raise_not_found  # type: ignore[method-assign,assignment]
+        handle.run_command = _raise_not_found  # type: ignore[method-assign,assignment]
         return handle
 
-    mock.connect_sandbox = _connect_with_dead_pid  # type: ignore[method-assign,assignment]
+    mock.connect_sandbox = _connect_with_broken_respawn  # type: ignore[method-assign,assignment]
 
     with capture_logs() as logs:
         async with service.session(
@@ -1068,15 +1192,15 @@ async def test_reconnect_connect_command_failed_log_shape() -> None:
 
     failed_events = [
         le for le in logs
-        if le.get("event") == "sandbox.e2b.reconnect.connect_command_failed"
+        if le.get("event") == "sandbox.e2b.reconnect.respawn_failed"
     ]
     assert len(failed_events) == 1, (
-        f"expected exactly one connect_command_failed event, "
+        f"expected exactly one respawn_failed event, "
         f"got {len(failed_events)}: {logs}"
     )
     evt = failed_events[0]
     assert evt["log_level"] == "warning", (
-        f"connect_command_failed must be ``warning`` so on-call "
+        f"respawn_failed must be ``warning`` so on-call "
         f"severity filters surface it; got {evt['log_level']!r}"
     )
     assert evt["org_id"] == "acme"
@@ -1096,7 +1220,10 @@ async def test_reconnect_connect_command_failed_log_shape() -> None:
     )
     assert evt["elapsed_ms"] >= 0
     assert "error" in evt, "freeform error string preserved"
-    assert "sandbox_id" in evt and "pid" in evt
+    # ``stale_pid``, not ``pid``: the field names the process we retired,
+    # and there is no live pid at this point — the respawn that would
+    # have produced one is what just failed.
+    assert "sandbox_id" in evt and "stale_pid" in evt
 
 
 @pytest.mark.asyncio
@@ -2129,74 +2256,19 @@ async def test_start_docker_daemon_stops_engine_before_manual_launch() -> None:
 # =====================================================================
 
 
-async def _send_dummy_tool_call(write_stream: Any) -> None:
-    """Push a single JSON-RPC ``tools/call`` through the write stream
-    so the stdin pump runs one iteration (the reattach-or-send path)."""
-    from mcp import types as mcp_types
-    from mcp.shared.message import SessionMessage
-
-    await write_stream.send(SessionMessage(
-        message=mcp_types.JSONRPCMessage.model_validate({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "tools/call",
-            "params": {"name": "noop", "arguments": {}},
-        }),
-    ))
-
-
-async def _drive_reattach(
-    service: E2BSandboxService,
-    mock: MockE2BClient,
-    session_id: str,
-    write_stream: Any,
-) -> tuple[MockE2BProcessHandle, MockE2BProcessHandle]:
-    """Force the stdin_pump reattach branch: kill the streaming RPC via
-    ``simulate_exit``, send one tool call, and wait for ``connect_command``
-    to fire. Returns ``(original_process, new_process)``."""
-    live_handle = cast(
-        MockE2BSandboxHandle,
-        service._live_sandboxes[session_id],  # type: ignore[reportPrivateUsage]
-    )
-    original = live_handle.last_process
-    assert original is not None
-    original.simulate_exit(0)
-    for _ in range(5):
-        await asyncio.sleep(0)
-    await _send_dummy_tool_call(write_stream)
-    for _ in range(50):
-        if mock.connect_commands:
-            break
-        await asyncio.sleep(0.01)
-    # Let the pump finish the set_timeout + send after reattach.
-    for _ in range(20):
-        await asyncio.sleep(0)
-    new = live_handle.last_process
-    assert new is not None
-    return original, new
-
-
-# ---------- SBX-1: set_timeout re-applied after reattach ----------
-
-
-@pytest.mark.asyncio
-async def test_sbx1_set_timeout_reapplied_after_stdin_pump_reattach() -> None:
-    """SBX-1 (P0): the stdin_pump reattach path
-    (``connect_command(pid)`` after auto-pause severs the streaming RPC)
-    MUST re-apply ``set_timeout(on_timeout_seconds)`` — E2B's auto_resume
-    resets the idle timer to its 300s default, so without this the cost
-    knob silently drifts. Pins the defense at service.py:603-622."""
-    service, mock = make_e2b_service()
-    upstream = make_upstream_definition(id="ups-x", command="npx")
-    async with service.session(
-        session_id="sbx1-pump", org_id="acme", upstream=upstream,
-        resources=make_default_resources(), denylist=(),
-    ) as session:
-        await _drive_reattach(service, mock, "sbx1-pump", session.write_stream)
-    # on_timeout_seconds=60 from make_e2b_service — re-applied exactly once
-    # after reattach.
-    assert [t.timeout_seconds for t in mock.set_timeouts] == [60], (
-        f"reattach must re-apply set_timeout(60); got {mock.set_timeouts}"
-    )
+# ---------- SBX-1: set_timeout re-applied on the wake path ----------
+#
+# The stdin_pump variant of this test is gone with the mid-session
+# reattach it pinned: a woken sandbox now retires its process and
+# rebuilds the session, so the pump never calls set_timeout. The
+# invariant still matters and still has a home — ``_try_reconnect``
+# below — because E2B resets the idle timeout to its 300s default on
+# every auto_resume, which would silently defeat the cost knob.
+# SBX-2/3/4 pinned the same removed branch (set_timeout failure after
+# reattach, reattach-then-send-fails, old-handle release failure); the
+# wake path's replacements are
+# ``test_session_retires_process_after_stream_dies`` and
+# ``test_session_wake_kill_failure_still_fails_transport``.
 
 
 @pytest.mark.asyncio
@@ -2230,150 +2302,198 @@ async def test_sbx1_set_timeout_reapplied_in_try_reconnect_path() -> None:
     )
 
 
-# ---------- SBX-2: set_timeout failure after reattach swallowed ----------
-
-
 @pytest.mark.asyncio
-async def test_sbx2_set_timeout_failure_after_reattach_is_swallowed() -> None:
-    """SBX-2 (P1): a ``set_timeout`` that raises after reattach is
-    best-effort — it only costs extra running time, so the pump logs
-    ``reattach.set_timeout_failed`` and keeps the session usable
-    (stdin still delivered to the new handle). Pins service.py:612-622."""
-    from structlog.testing import capture_logs
+async def test_try_reconnect_reuses_sandbox_but_respawns_process() -> None:
+    """The reconnect path keeps the sandbox and replaces the process.
 
-    service, mock = make_e2b_service()
-    upstream = make_upstream_definition(id="ups-x", command="npx")
+    This is the whole shape of the wake fix. Reusing the sandbox is
+    what keeps a wake cheap: the expensive part of a cold start is
+    downloading the MCP's package (7-22 s per server in production)
+    and that cache lives on the sandbox filesystem. Reusing the
+    PROCESS is what produced the bug, because a process resumed from a
+    snapshot still believes it owns TCP connections that were severed
+    while it slept.
+
+    So: one ``connect_sandbox``, no ``connect_command``, a
+    ``kill_command`` aimed at the recorded pid, and a fresh
+    ``run_command`` carrying the upstream's argv and env.
+    """
+    persistence = InMemorySandboxPersistenceRepository()
+    upstream = make_upstream_definition(id="ups-respawn", command="npx")
+    service, mock = make_e2b_service(persistence=persistence)
+    service._reuse_sandboxes_on_restart = True  # type: ignore[reportPrivateUsage]
+
     async with service.session(
-        session_id="sbx2", org_id="acme", upstream=upstream,
+        session_id="warmup", org_id="acme", upstream=upstream,
         resources=make_default_resources(), denylist=(),
-    ) as session:
-        live_handle = cast(
-            MockE2BSandboxHandle,
-            service._live_sandboxes["sbx2"],  # type: ignore[reportPrivateUsage]
-        )
+    ):
+        service.mark_session_preserve_on_close("warmup")
 
-        async def _boom_set_timeout(timeout_seconds: int) -> None:
-            del timeout_seconds
-            raise E2BSDKError("E2BSDKError", "set_timeout boom")
+    ref_after_warmup = await persistence.get(
+        org_id="acme", upstream_id=upstream.id,
+    )
+    assert ref_after_warmup is not None
+    warm_sandbox_id = ref_after_warmup.sandbox_id
+    warm_pid = ref_after_warmup.pid
+    assert warm_sandbox_id is not None and warm_pid is not None
 
-        live_handle.set_timeout = _boom_set_timeout  # type: ignore[method-assign,assignment]
-        with capture_logs() as logs:
-            original, new = await _drive_reattach(
-                service, mock, "sbx2", session.write_stream,
-            )
-        # Session is still usable: stdin reached the reattached handle,
-        # not the dead original.
-        for _ in range(50):
-            if new.stdin_buffer:
-                break
-            await asyncio.sleep(0.01)
-        assert new is not original
-        assert new.stdin_buffer, "stdin must reach the reattached handle"
-        # Transport NOT failed — set_timeout failure is non-fatal.
-        assert session.transport_failed is not None
-        assert not session.transport_failed.is_set()
-    events = [le.get("event") for le in logs]
-    assert "sandbox.e2b.reattach.set_timeout_failed" in events, (
-        f"set_timeout failure must log reattach.set_timeout_failed; "
-        f"got {events}"
+    creates_before = len(mock.creates)
+    commands_before = len(mock.commands)
+
+    async with service.session(
+        session_id="woken", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ):
+        service.mark_session_preserve_on_close("woken")
+
+    assert len(mock.creates) == creates_before, (
+        "the warm sandbox must be reused, not rebuilt; that reuse is "
+        f"where the cold-start saving lives. creates={mock.creates}"
+    )
+    assert not mock.connect_commands, (
+        "a woken sandbox must never reattach to the frozen process; "
+        f"connect_commands={mock.connect_commands}"
+    )
+    assert [k.pid for k in mock.kill_commands] == [warm_pid], (
+        "the recorded pid must be killed exactly once, or every wake "
+        f"leaves a dead MCP server resident. kills={mock.kill_commands}"
+    )
+    respawns = mock.commands[commands_before:]
+    assert len(respawns) == 1, (
+        f"expected exactly one replacement process; got {respawns}"
+    )
+    assert respawns[0].argv == ["npx"], (
+        f"the replacement must run the upstream's command; got {respawns[0]}"
+    )
+
+    ref_after = await persistence.get(org_id="acme", upstream_id=upstream.id)
+    assert ref_after is not None
+    assert ref_after.sandbox_id == warm_sandbox_id, "same sandbox"
+    assert ref_after.pid != warm_pid, (
+        "the ref must record the NEW pid, or the next wake kills a pid "
+        "that no longer exists and reattaches nothing"
     )
 
 
-# ---------- SBX-3: reattach succeeds then send fails ----------
+@pytest.mark.asyncio
+async def test_reuse_is_refused_when_the_size_changed() -> None:
+    """A cpu/ram edit must force a new sandbox, not reuse the old size.
+
+    Sandbox size is baked into the E2B template at create time, and
+    reconnecting attaches by ``sandbox_id`` — it cannot re-size. So a
+    reuse after the operator raised memory would silently keep running
+    at the OLD size.
+
+    That is not merely slow, it is a lie on the dashboard:
+    ``cpu_vcpus`` and ``memory_mb`` are part of the runtime hash, so
+    the dirty-config banner flags the edit, and ``connect_shared``
+    re-persists that hash on every reopen. Reuse would clear the
+    banner while the MCP kept running out of the memory the operator
+    thought they had given it.
+
+    Introduced by the preserve-the-sandbox fix and caught in the
+    fourth review pass: before it, the reopen fresh-created at the new
+    size, so clearing the banner was honest.
+    """
+    persistence = InMemorySandboxPersistenceRepository()
+    upstream = make_upstream_definition(id="ups-resize", command="npx")
+    service, mock = make_e2b_service(persistence=persistence)
+    service._reuse_sandboxes_on_restart = True  # type: ignore[reportPrivateUsage]
+
+    async with service.session(
+        session_id="warmup", org_id="acme", upstream=upstream,
+        resources=SandboxResources(cpu_vcpus=1, memory_mb=1024, disk_gb=0),
+        denylist=(),
+    ):
+        service.mark_session_preserve_on_close("warmup")
+
+    assert mock.creates[-1].template == "mcpolis-node-cpu1-ram1024"
+    creates_before = len(mock.creates)
+
+    # The operator raises memory and the upstream is reopened.
+    async with service.session(
+        session_id="bigger", org_id="acme", upstream=upstream,
+        resources=SandboxResources(cpu_vcpus=2, memory_mb=2048, disk_gb=0),
+        denylist=(),
+    ):
+        service.mark_session_preserve_on_close("bigger")
+
+    assert len(mock.creates) == creates_before + 1, (
+        "a size change must fresh-create; reusing the old sandbox "
+        "keeps the old size while the dashboard reports the new one"
+    )
+    assert mock.creates[-1].template == "mcpolis-node-cpu2-ram2048", (
+        f"the new sandbox must use the requested size; got "
+        f"{mock.creates[-1].template}"
+    )
 
 
 @pytest.mark.asyncio
-async def test_sbx3_reattach_ok_then_send_fails_fails_transport() -> None:
-    """SBX-3 (P1): reattach via ``connect_command`` succeeds but the
-    very next ``send_stdin`` raises (sandbox died between reattach and
-    send). The pump must ``_fail_transport`` — close the read side and
-    set ``transport_failed`` — so the in-flight tool call fails fast
-    instead of hanging. Pins service.py:663-674 reached via the
-    post-reattach send."""
-    service, mock = make_e2b_service()
-    upstream = make_upstream_definition(id="ups-x", command="npx")
+async def test_reuse_still_happens_when_the_size_is_unchanged() -> None:
+    """The size check must not throw away the saving it guards.
+
+    Same size, same template: reuse, so the wake stays cheap.
+    """
+    persistence = InMemorySandboxPersistenceRepository()
+    upstream = make_upstream_definition(id="ups-same-size", command="npx")
+    service, mock = make_e2b_service(persistence=persistence)
+    service._reuse_sandboxes_on_restart = True  # type: ignore[reportPrivateUsage]
+    resources = SandboxResources(cpu_vcpus=1, memory_mb=1024, disk_gb=0)
+
     async with service.session(
-        session_id="sbx3", org_id="acme", upstream=upstream,
-        resources=make_default_resources(), denylist=(),
-    ) as session:
-        live_handle = cast(
-            MockE2BSandboxHandle,
-            service._live_sandboxes["sbx3"],  # type: ignore[reportPrivateUsage]
-        )
-        original = live_handle.last_process
-        assert original is not None
-        original_connect = live_handle.connect_command
+        session_id="warmup", org_id="acme", upstream=upstream,
+        resources=resources, denylist=(),
+    ):
+        service.mark_session_preserve_on_close("warmup")
+    creates_before = len(mock.creates)
 
-        async def _connect_then_doomed(
-            *, pid: int, on_stdout: Any, on_stderr: Any,
-        ) -> MockE2BProcessHandle:
-            handle = cast(MockE2BProcessHandle, await original_connect(
-                pid=pid, on_stdout=on_stdout, on_stderr=on_stderr,
-            ))
-            # The reattached handle's first send fails — sandbox gone.
-            handle.stdin_send_error = E2BSDKError(
-                "E2BNotFoundError", "sandbox sbx-0 not found",
-            )
-            return handle
+    async with service.session(
+        session_id="again", org_id="acme", upstream=upstream,
+        resources=resources, denylist=(),
+    ):
+        service.mark_session_preserve_on_close("again")
 
-        live_handle.connect_command = _connect_then_doomed  # type: ignore[method-assign,assignment]
-
-        original.simulate_exit(0)
-        for _ in range(5):
-            await asyncio.sleep(0)
-        await _send_dummy_tool_call(session.write_stream)
-
-        with pytest.raises(anyio.EndOfStream):
-            await asyncio.wait_for(session.read_stream.receive(), timeout=2.0)
-        assert mock.connect_commands, "reattach must have succeeded first"
-        assert session.transport_failed is not None
-        assert session.transport_failed.is_set()
-
-
-# ---------- SBX-4: old_process.release() failure during reattach ----------
+    assert len(mock.creates) == creates_before, (
+        "an unchanged size must still reuse the warm sandbox"
+    )
 
 
 @pytest.mark.asyncio
-async def test_sbx4_old_handle_release_failure_does_not_break_reattach() -> None:
-    """SBX-4 (P2): tearing down the OLD streaming handle via
-    ``release()`` after a successful reattach is best-effort. A raise
-    there must NOT break the reattach — stdin still reaches the new
-    handle and the transport stays alive. Pins service.py:644-654."""
-    service, mock = make_e2b_service()
-    upstream = make_upstream_definition(id="ups-x", command="npx")
+async def test_try_reconnect_survives_a_refused_kill() -> None:
+    """A refused kill costs one resident process, never the session.
+
+    E2B can refuse the kill (API blip, pid already reaped). Treating
+    that as fatal would turn a cosmetic leak into a failed upstream,
+    so the respawn proceeds regardless.
+    """
+    persistence = InMemorySandboxPersistenceRepository()
+    upstream = make_upstream_definition(id="ups-kill-refused", command="npx")
+    service, mock = make_e2b_service(persistence=persistence)
+    service._reuse_sandboxes_on_restart = True  # type: ignore[reportPrivateUsage]
+
     async with service.session(
-        session_id="sbx4", org_id="acme", upstream=upstream,
+        session_id="warmup", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ):
+        service.mark_session_preserve_on_close("warmup")
+
+    creates_before = len(mock.creates)
+    mock.kill_command_error = E2BSDKError("SandboxError", "kill refused")
+
+    async with service.session(
+        session_id="woken", org_id="acme", upstream=upstream,
         resources=make_default_resources(), denylist=(),
     ) as session:
-        live_handle = cast(
-            MockE2BSandboxHandle,
-            service._live_sandboxes["sbx4"],  # type: ignore[reportPrivateUsage]
-        )
-        original = live_handle.last_process
-        assert original is not None
-
-        async def _boom_release() -> None:
-            raise E2BSDKError("E2BSDKError", "release boom")
-
-        original.release = _boom_release  # type: ignore[method-assign,assignment]
-
-        original.simulate_exit(0)
-        for _ in range(5):
-            await asyncio.sleep(0)
-        await _send_dummy_tool_call(session.write_stream)
-        for _ in range(50):
-            if mock.connect_commands:
-                break
-            await asyncio.sleep(0.01)
-        new = live_handle.last_process
-        assert new is not None and new is not original
-        for _ in range(50):
-            if new.stdin_buffer:
-                break
-            await asyncio.sleep(0.01)
-        assert new.stdin_buffer, "stdin must reach the reattached handle"
         assert session.transport_failed is not None
-        assert not session.transport_failed.is_set()
+        assert not session.transport_failed.is_set(), (
+            "a refused kill must still yield a usable session"
+        )
+        service.mark_session_preserve_on_close("woken")
+
+    assert len(mock.creates) == creates_before, (
+        "a refused kill is not a reason to abandon the warm sandbox"
+    )
+    assert mock.kill_commands, "the kill must still have been attempted"
 
 
 # ---------- SBX-5: _start_docker_daemon TimeoutError + log capture -------
@@ -2481,15 +2601,19 @@ async def test_sbx5_start_docker_daemon_empty_log_renders_placeholder(
     assert "(empty)" in str(exc.value)
 
 
-# ---------- SBX-6: connect_command slow-fail → fresh-create fallback -----
+# ---------- SBX-6: respawn slow-fail → fresh-create fallback -----
 
 
 @pytest.mark.asyncio
 async def test_sbx6_try_reconnect_slow_fail_kills_and_fresh_creates() -> None:
-    """SBX-6 (P1): in ``_try_reconnect`` a ``connect_command`` that
-    raises the timeout-shaped ``E2BSDKError`` (envd port wedged after
-    auto_resume) must kill the stale sandbox and fall through to a
-    fresh create. Pins service.py:965-996."""
+    """SBX-6 (P1): in ``_try_reconnect`` a respawn that raises the
+    timeout-shaped ``E2BSDKError`` (envd wedged after auto_resume)
+    must kill the stale sandbox and fall through to a fresh create.
+
+    The reconnect path reuses the sandbox but never its MCP process,
+    so the wedge now surfaces on ``run_command`` rather than on the
+    retired ``connect_command`` reattach. The recovery contract is
+    unchanged: a sandbox we cannot spawn into is not worth keeping."""
     persistence = InMemorySandboxPersistenceRepository()
     upstream = make_upstream_definition(id="ups-slow", command="npx")
     service, mock = make_e2b_service(persistence=persistence)
@@ -2507,25 +2631,24 @@ async def test_sbx6_try_reconnect_slow_fail_kills_and_fresh_creates() -> None:
     kills_before = len(mock.kills)
     original_connect = mock.connect_sandbox
 
-    async def _connect_with_wedged_pid(snapshot_id: str):  # type: ignore[no-untyped-def]
+    async def _connect_with_wedged_envd(snapshot_id: str):  # type: ignore[no-untyped-def]
         handle = await original_connect(snapshot_id)
 
-        async def _timeout_connect_command(
-            *, pid: int, **_kwargs: Any,
+        async def _timeout_run_command(
+            *_args: Any, **_kwargs: Any,
         ) -> None:
-            del pid
-            # Same shape real_client.connect_command raises when the
-            # 10s wait_for cap trips on a wedged envd port.
+            # Same timeout shape the SDK surfaces when envd is wedged
+            # after an auto_resume and will not accept a new process.
             raise E2BSDKError(
                 "TimeoutException",
-                "commands.connect did not establish within 10s "
+                "spawn did not establish within 10s "
                 "(envd port not open after resume)",
             )
 
-        handle.connect_command = _timeout_connect_command  # type: ignore[method-assign,assignment]
+        handle.run_command = _timeout_run_command  # type: ignore[method-assign,assignment]
         return handle
 
-    mock.connect_sandbox = _connect_with_wedged_pid  # type: ignore[method-assign,assignment]
+    mock.connect_sandbox = _connect_with_wedged_envd  # type: ignore[method-assign,assignment]
 
     async with service.session(
         session_id="slow-recovery", org_id="acme", upstream=upstream,
@@ -2536,7 +2659,7 @@ async def test_sbx6_try_reconnect_slow_fail_kills_and_fresh_creates() -> None:
     # _kill_stale_sandbox fired (the reconnect handle was killed) and a
     # fresh sandbox was created.
     assert len(mock.kills) > kills_before, (
-        f"the stale sandbox must be killed after the slow connect_command "
+        f"the stale sandbox must be killed after the slow respawn "
         f"failure; kills={mock.kills}"
     )
     assert len(mock.creates) == creates_before + 1, (

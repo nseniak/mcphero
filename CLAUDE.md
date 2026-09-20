@@ -227,6 +227,75 @@ Cloud-mode rules enforced by `validate_startup_secrets` in
 - Empty value falls back to `e2b` when an API key is set, else
   `local-subprocess` with a startup warning.
 
+### Waking a paused sandbox never reuses its MCP process
+
+E2B pauses an idle sandbox (`MCPOLIS_E2B_IDLE_PAUSE_SECONDS`,
+default 60s) and resumes it on the next call. On resume the
+service **reuses the sandbox and replaces the MCP process**:
+`connect_sandbox` → `kill_command(old_pid)` → a fresh
+`run_command` → a fresh MCP `initialize`. It does not reattach
+via `connect_command`.
+
+Reattaching is what the service used to do, and it caused two
+production bugs. A process resumed from a snapshot still believes
+it owns every TCP connection its HTTP client had pooled; those
+were severed while it slept. It writes into them and gets
+`ECONNRESET`, producing exactly one opaque tool failure per pooled
+socket on the first calls after a wake. Reproduced 20 of 20 wakes,
+failure count tracking pool size exactly, by
+[backend/tests/integration/diagnose_wake_network.py](backend/tests/integration/diagnose_wake_network.py)
+(run it via `bash backend/tests/integration/run-wake-network.sh`).
+The same reuse carries envd's fan-out wedge, which is the
+silent-stdout stall.
+
+Consequences to keep in mind when touching this area:
+
+- The sandbox is deliberately KEPT on a wake. Nearly all of a cold
+  start is downloading the MCP's package (7-22s per server in
+  production, against ~3s for one already on disk), and that cache
+  lives on the sandbox filesystem. Keeping it takes TWO things:
+  `reconnect_shared_fresh` leaves the persisted ref in place AND
+  calls `preserve_sessions_for_upstream` first. Leaving the ref
+  alone is not enough on its own, because the heal's close-then-open
+  tears the old session down with `preserve=False`, which deletes
+  the ref and kills the sandbox before the reopen can read it. An
+  independent review caught that; the regression gate is
+  `test_heal_asks_to_preserve_the_sandbox_before_reopening`.
+- **There is no retry exception for wakes, and adding one is a
+  mistake we have already made twice.** The watcher sets
+  `transport_failed` the moment the output stream ends, which for a
+  paused sandbox is the pause itself (measured 8.7s before the next
+  request arrived). `ensure_shared_connected` then refuses that
+  session inside `_resolve_session`, before the gateway writes
+  anything, so the request lands on a rebuilt session and a fresh
+  process. Nothing is lost, so nothing needs re-sending.
+  An earlier design let the request reach the dead session and then
+  tried to prove re-sending was safe. Two independent review passes
+  each found a different way for an already-delivered request to
+  claim that proof. If you find yourself reintroducing a
+  "this one is safe to repeat" flag, the ordering above has broken.
+- The pid changes on every wake, so the persisted ref must be
+  re-written. Don't reintroduce a "ref is still valid, skip the
+  persist" shortcut.
+- `set_timeout` must still be re-applied after any resume: E2B
+  resets the idle window to its own 300s default on `auto_resume`.
+- The pump's wake branch is a BACKSTOP, not the main path: it
+  catches the race (a dispatch that passed the liveness gate just
+  before the watcher fired) and the case where E2B goes quiet
+  instead of severing, so the watcher never fires. It never writes
+  the frame; the caller eats one error and the manager rebuilds.
+- A wake APPLIES pending edits to **command, args, env and Sandbox
+  files**, because the replacement process picks them up fresh, and
+  `connect_shared` re-persists `started_config_hash`, so the
+  dirty-config banner clears itself. Deliberate.
+  **CPU and RAM are different**: size is baked into the E2B template
+  at create time and a reconnect attaches by id, so it cannot
+  re-size. `_try_reconnect` therefore compares the requested template
+  against `metadata["e2b_template"]` on the ref and falls through to
+  fresh-create on a mismatch. Without that check the banner would
+  clear while the MCP kept running at the old size — a dashboard
+  asserting something false, found in the fourth review pass.
+
 The 24-template grid (node / python / docker × 8 CPU/RAM pairs) is in
 [runner/e2b-templates/](runner/e2b-templates/); on docker templates,
 `command: docker` MCPs (`docker run -i …`) get a live daemon from

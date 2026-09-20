@@ -37,6 +37,7 @@ from mcpolis.domain.services.tool_router import (  # pyright: ignore[reportPriva
     _session_error_text,
     _SessionResult,
 )
+from tests.unit.stall_client_manager_fake import StallClientManagerFake
 from tests.unit.factories import make_upstream_definition
 
 
@@ -468,23 +469,8 @@ async def test_get_prompt_unknown_upstream_raises(tmp_path: Path) -> None:
 # audit row (R4 no-audit gate).
 
 
-class _FakeStallManager:
-    """service_account manager slice the router touches for a stall:
-    ``ensure_shared_connected`` / ``get_session`` / ``reconnect_shared_fresh``.
-    ``reconnect_shared_fresh`` is the service_account heal."""
-
-    def __init__(self, session: Any) -> None:
-        self._session = session
-        self.fresh_calls = 0
-
-    async def ensure_shared_connected(self, upstream: Any) -> None:
-        pass
-
-    def get_session(self, upstream_id: str, user_id: str | None = None) -> Any:
-        return self._session
-
-    async def reconnect_shared_fresh(self, upstream: Any) -> None:
-        self.fresh_calls += 1
+# The stall-manager fake is shared; see stall_client_manager_fake.
+_FakeStallManager = StallClientManagerFake
 
 
 def make_stall_router(

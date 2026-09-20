@@ -61,6 +61,12 @@ class _RecordedConnectCommand:
 
 
 @dataclass
+class _RecordedKillCommand:
+    sandbox_id: str
+    pid: int
+
+
+@dataclass
 class _RecordedSetTimeout:
     sandbox_id: str
     timeout_seconds: int
@@ -213,7 +219,12 @@ class MockE2BSandboxHandle:
         # Save callbacks so tests can simulate stdout/stderr emission.
         self._client.last_on_stdout = on_stdout
         self._client.last_on_stderr = on_stderr
-        process = MockE2BProcessHandle()
+        # Each spawn gets a distinct pid, as a real sandbox does. A
+        # constant pid here would hide a whole bug class now that the
+        # wake path replaces the process: code that forgets to persist
+        # the new pid, or that kills the wrong one, would still pass.
+        self._client.next_pid += 1
+        process = MockE2BProcessHandle(pid=self._client.next_pid)
         self.last_process = process
         return process
 
@@ -232,6 +243,13 @@ class MockE2BSandboxHandle:
         process = MockE2BProcessHandle(pid=pid)
         self.last_process = process
         return process
+
+    async def kill_command(self, *, pid: int) -> None:
+        self._client.kill_commands.append(
+            _RecordedKillCommand(sandbox_id=self._sandbox_id, pid=pid),
+        )
+        if self._client.kill_command_error is not None:
+            raise self._client.kill_command_error
 
     async def set_timeout(self, timeout_seconds: int) -> None:
         self._client.set_timeouts.append(
@@ -290,6 +308,16 @@ class MockE2BClient(E2BClient):
     connect_commands: list[_RecordedConnectCommand] = field(
         default_factory=list[_RecordedConnectCommand],
     )
+    kill_commands: list[_RecordedKillCommand] = field(
+        default_factory=list[_RecordedKillCommand],
+    )
+    # Set to make ``kill_command`` raise — the service must treat a
+    # failed kill as non-fatal and still hand back a working session.
+    kill_command_error: Exception | None = None
+    # Monotonic pid source so every ``run_command`` is distinguishable.
+    # Starts below the 1234 default so existing fixtures that assert on
+    # the first spawn are unaffected.
+    next_pid: int = 1000
     set_timeouts: list[_RecordedSetTimeout] = field(
         default_factory=list[_RecordedSetTimeout],
     )

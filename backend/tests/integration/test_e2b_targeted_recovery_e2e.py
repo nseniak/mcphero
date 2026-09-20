@@ -36,6 +36,10 @@ To run::
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
+import tempfile
+from pathlib import Path
 import os
 import time
 import uuid
@@ -44,10 +48,14 @@ from io import StringIO
 from typing import cast
 
 import pytest
+from mcp import types as mcp_types
 from mcp.client.session import ClientSession
 
 from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (
     InMemorySandboxPersistenceRepository,
+)
+from mcpolis.adapters.repositories.file_audit_repository import (
+    FileAuditRepository,
 )
 from mcpolis.adapters.sandbox_e2b import E2BSandboxService, RealE2BClient
 from mcpolis.adapters.sandbox_e2b.client import E2BSDKError
@@ -56,11 +64,15 @@ from mcpolis.adapters.upstream_clients.client_manager import (
     UpstreamClientManager,
 )
 from mcpolis.adapters.upstream_clients.log_buffer import LogBuffer
+from mcpolis.domain.model.settings import SettingsConfig
 from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.domain.ports.sandbox_persistence_repository import (
     SandboxPersistedRef,
 )
 from mcpolis.domain.services.sandbox_resolver import SandboxResolver
+from mcpolis.domain.services.policy_engine import PolicyEngine
+from mcpolis.domain.services.tool_router import ToolRouter
+from mcpolis.domain.services.tool_registry import SEPARATOR
 from mcpolis.domain.services.sandbox_service import (
     MaterializeFile,
     SandboxResources,
@@ -69,7 +81,10 @@ from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.services.upstream_connection_service import (
     acquire_upstream_session,
 )
-from tests.integration._e2b_log_capture import reattach_events_since
+from tests.integration._e2b_log_capture import (
+    events_since,
+    stream_death_events_since,
+)
 from tests.unit.factories import make_upstream_definition
 
 
@@ -171,33 +186,54 @@ def is_template_missing_error(exc: BaseException) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# Two 35s idle windows plus two sandbox opens: the split-per-cycle
+# shape the wake fix forced on this test costs roughly 90-110s, which
+# sits under the global 120s ceiling on a quiet box and over it when
+# the broad matrix is competing for E2B. Raise the ceiling for these
+# two rather than shortening the sleeps, which would stop E2B pausing
+# at all and make the test prove nothing.
+@pytest.mark.timeout(300)
 @pytest.mark.asyncio
-async def test_t1_set_timeout_holds_across_two_reattach_cycles() -> None:
+async def test_t1_set_timeout_holds_across_two_wake_cycles() -> None:
     """E2B-T1: the configured idle window must survive TWO consecutive
-    auto-pause/reattach cycles.
+    auto-pause/wake cycles.
 
-    E2B's ``commands.connect(pid)`` triggers an ``auto_resume`` that
-    resets the sandbox timeout to the SDK's 300s default, NOT the
-    value passed to ``Sandbox.create``. The service re-applies
-    ``set_timeout(on_timeout_seconds)`` after each reattach; without
-    that fix, cycle 2's 35s sleep never reaches the (reset) 300s
-    deadline and no second pause fires.
+    E2B's ``auto_resume`` resets the sandbox timeout to the SDK's 300s
+    default, NOT the value passed to ``Sandbox.create``. The service
+    re-applies ``set_timeout(on_timeout_seconds)`` whenever it
+    reconnects to a persisted sandbox; without that, cycle 2's sleep
+    never reaches the (reset) 300s deadline and no second pause fires.
 
-    The assertion is the drift-proof observable the e2e suite already
-    uses (see ``e2b_real_e2e.py::double_reattach``): a SECOND
-    ``sandbox.e2b.reattach.ok`` event after a second 35s sleep is
-    only possible if the idle window stayed at ``IDLE_PAUSE_SECONDS``,
-    proving the value held at exactly that — not the 300s reset.
+    The drift-proof observable is a SECOND wake after a second sleep:
+    only possible if the idle window stayed at ``IDLE_PAUSE_SECONDS``.
+
+    One session per cycle, because a wake now ENDS the session rather
+    than being papered over inside it. The service used to reattach to
+    the frozen MCP process here; it now retires that process, since a
+    process resumed from a snapshot writes into TCP connections that
+    were severed while it slept. Opening a session per cycle is what
+    the client manager does in production when the transport fails.
+    Persistence plus reuse is wired on purpose: cycle 2 must land on
+    the SAME paused sandbox, or ``set_timeout`` would be trivially
+    correct on a freshly created one and the test would prove nothing.
     ~$0.01 of compute (two pause windows).
     """
-    service = make_e2b_service(instance=f"e2e-t1-{TEST_RUN_ID}")
+    persistence = InMemorySandboxPersistenceRepository()
+    service = make_e2b_service(
+        instance=f"e2e-t1-{TEST_RUN_ID}",
+        persistence=persistence,
+        reuse_on_restart=True,
+    )
     upstream = make_everything_upstream("t1")
     errlog = LogBuffer()
-    session_id = f"e2e-t1-{TEST_RUN_ID}"
-    try:
+    org_id = f"acme-t1-{TEST_RUN_ID}"
+
+    async def one_cycle(cycle: int) -> None:
+        """Open a session, idle past the window, prove it paused."""
+        session_id = f"e2e-t1-{TEST_RUN_ID}-c{cycle}"
         async with service.session(
             session_id=session_id,
-            org_id=f"acme-t1-{TEST_RUN_ID}",
+            org_id=org_id,
             upstream=upstream,
             resources=make_default_resources(),
             denylist=(),
@@ -210,34 +246,29 @@ async def test_t1_set_timeout_holds_across_two_reattach_cycles() -> None:
                 await asyncio.wait_for(
                     client_session.initialize(), timeout=INITIALIZE_TIMEOUT,
                 )
-
-                # Cycle 1: idle past the window, then a round-trip that
-                # forces the reattach.
-                cycle1_ns = time.monotonic_ns()
+                # Nothing touches the session across this sleep, so a
+                # stream death inside the window can only be the pause.
+                idle_cursor = time.monotonic_ns()
                 await asyncio.sleep(REATTACH_WAIT_SECONDS)
-                await asyncio.wait_for(
-                    client_session.list_tools(), timeout=TOOL_CALL_TIMEOUT * 2,
+                assert stream_death_events_since(idle_cursor), (
+                    f"cycle {cycle}: the sandbox did not pause within "
+                    "the idle window"
                 )
-                assert reattach_events_since(cycle1_ns), (
-                    "cycle 1: reattach.ok did not fire — the sandbox did "
-                    "not auto-pause in this window"
+                assert sandbox_session.transport_failed is not None
+                assert sandbox_session.transport_failed.is_set(), (
+                    f"cycle {cycle}: the pause must mark the transport "
+                    "dead on its own, so the next request is rebuilt "
+                    "onto a fresh process instead of being lost"
                 )
-
-                # Cycle 2 only re-pauses (and re-reattaches) if the
-                # post-reattach set_timeout put the idle window back at
-                # IDLE_PAUSE_SECONDS. A 300s reset would mean the 35s
-                # sleep never trips the deadline.
-                cycle2_ns = time.monotonic_ns()
-                await asyncio.sleep(REATTACH_WAIT_SECONDS)
-                await asyncio.wait_for(
-                    client_session.list_tools(), timeout=TOOL_CALL_TIMEOUT * 2,
-                )
-                assert reattach_events_since(cycle2_ns), (
-                    "cycle 2: reattach.ok did not fire — post-reattach "
-                    "set_timeout regressed (E2B reset the idle window to "
-                    "300s; the configured value did NOT hold), so the 35s "
-                    "sleep never reached the deadline"
-                )
+            service.mark_session_preserve_on_close(session_id)
+    try:
+        # Cycle 1 proves the sandbox pauses at all.
+        await one_cycle(1)
+        # Cycle 2 only re-pauses if the reconnect's set_timeout put the
+        # idle window back at IDLE_PAUSE_SECONDS. A 300s reset would
+        # mean the sleep never trips the deadline, and cycle 2's own
+        # assertion inside ``one_cycle`` would fail.
+        await one_cycle(2)
     except E2BSDKError as exc:
         if is_template_missing_error(exc):
             pytest.skip(
@@ -248,6 +279,417 @@ async def test_t1_set_timeout_holds_across_two_reattach_cycles() -> None:
         if tail:
             print(f"\n----- sandbox stderr -----\n{tail}\n----- end -----\n")
         raise
+    finally:
+        ref = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        if ref is not None and ref.sandbox_id is not None:
+            with contextlib.suppress(Exception):
+                await RealE2BClient(
+                    api_key=cast(str, E2B_API_KEY),
+                ).kill_sandbox(ref.sandbox_id)
+
+
+# ---------------------------------------------------------------------------
+# E2B-T5 — the ORIGINAL production bug: an MCP that holds an outbound
+#          keep-alive connection must work on the FIRST call after a wake
+# ---------------------------------------------------------------------------
+
+
+# A minimal stdio MCP server that does the one thing every server in our
+# fixtures avoids: it talks to the internet, over a client that POOLS the
+# connection. That pooling is the entire bug. A sandbox snapshot severs
+# the socket while the process is frozen; the process cannot tell, writes
+# into it on the next request, and gets ECONNRESET. Production saw that
+# as one opaque tool failure per pooled socket on the first calls after a
+# wake (Sentry MCPOLIS-BACKEND-16), and no test caught it because
+# server-everything / filesystem / memory answer entirely from memory.
+_POOLING_MCP_JS = r"""
+const https = require('node:https');
+const TARGET = process.env.PROBE_TARGET_URL;
+const agent = new https.Agent({
+  keepAlive: true, keepAliveMsecs: 600000, maxSockets: 1,
+});
+
+function fetchOnce() {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const req = https.request(TARGET, { agent, method: 'GET' }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({
+        ok: true, status: res.statusCode,
+        reused: req.reusedSocket === true, ms: Date.now() - t0,
+      }));
+    });
+    req.on('error', (e) => resolve({
+      ok: false, code: e.code || null, reused: req.reusedSocket === true,
+      ms: Date.now() - t0, msg: String(e.message || e),
+    }));
+    req.end();
+  });
+}
+
+function send(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
+
+async function handle(msg) {
+  if (msg.method === 'initialize') {
+    send({ jsonrpc: '2.0', id: msg.id, result: {
+      protocolVersion: msg.params.protocolVersion,
+      capabilities: { tools: {} },
+      serverInfo: { name: 'pooling-probe', version: '1.0.0' },
+    }});
+  } else if (msg.method === 'tools/list') {
+    send({ jsonrpc: '2.0', id: msg.id, result: { tools: [{
+      name: 'poolfetch',
+      description: 'GET a URL over a pooled keep-alive connection',
+      inputSchema: { type: 'object', properties: {} },
+    }]}});
+  } else if (msg.method === 'tools/call') {
+    const r = await fetchOnce();
+    send({ jsonrpc: '2.0', id: msg.id, result: {
+      content: [{ type: 'text', text: JSON.stringify(r) }],
+      isError: !r.ok,
+    }});
+  } else if (msg.id !== undefined && msg.id !== null) {
+    send({ jsonrpc: '2.0', id: msg.id, error:
+      { code: -32601, message: 'method not found' } });
+  }
+}
+
+let buf = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buf += chunk;
+  let i;
+  while ((i = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, i).trim();
+    buf = buf.slice(i + 1);
+    if (!line) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch (e) { continue; }
+    handle(msg);
+  }
+});
+"""
+
+_PROBE_TARGET = "https://www.google.com/generate_204"
+PROBE_USER = "probe@example.com"
+
+
+def make_pooling_upstream(suffix: str) -> UpstreamDefinition:
+    upstream = make_upstream_definition(
+        id=f"e2e-{suffix}-{TEST_RUN_ID}", command="node",
+    )
+    # Passed inline via ``node -e`` rather than materialized as a
+    # Sandbox file: the file route goes through SandboxFileRepository,
+    # which the manager owns, and wiring a repo here would test the
+    # plumbing instead of the wake. ~2KB of argv is well inside limits.
+    upstream.stdio.args = ["-e", _POOLING_MCP_JS]  # type: ignore[union-attr]
+    upstream.stdio.env = {  # type: ignore[union-attr]
+        "PROBE_TARGET_URL": _PROBE_TARGET,
+    }
+    return upstream
+
+
+# Two idle windows plus two session opens; see the note on E2B-T1.
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+async def test_t5_pooled_connection_survives_a_wake() -> None:
+    """The regression gate for the bug that started all of this.
+
+    Call the tool once so the MCP server has a live pooled connection.
+    Let the sandbox pause. Then call again and require the FIRST call
+    after the wake to SUCCEED.
+
+    Before the fix this failed with ``ECONNRESET`` on a reused socket,
+    reproducibly, 20 wakes out of 20 (see
+    ``diagnose_wake_network.py``). It passes now because the wake
+    retires the frozen process instead of handing it back, so the
+    replacement opens a fresh connection.
+
+    This is the only test in the suite whose MCP server talks to the
+    internet. That property is exactly what every other fixture lacks,
+    and exactly why the production bug reached a customer.
+    """
+    persistence = InMemorySandboxPersistenceRepository()
+    service = make_e2b_service(
+        instance=f"e2e-t5-{TEST_RUN_ID}",
+        persistence=persistence,
+        reuse_on_restart=True,
+    )
+    upstream = make_pooling_upstream("t5")
+    org_id = f"acme-t5-{TEST_RUN_ID}"
+    errlog = LogBuffer()
+
+    manager = make_e2b_manager(upstream, org_id, service)
+    registry = ToolRegistry([upstream], manager)
+    audit_dir = Path(tempfile.mkdtemp())
+    audit = FileAuditRepository(log_path=audit_dir / "audit.jsonl")
+    router = ToolRouter(
+        registry, manager, audit, [upstream],
+        policy_engine=PolicyEngine(SettingsConfig()),
+    )
+
+    def payload_of(result: mcp_types.CallToolResult) -> dict[str, object]:
+        block = result.content[0]
+        assert isinstance(block, mcp_types.TextContent)
+        parsed: object = json.loads(block.text)
+        assert isinstance(parsed, dict)
+        return cast("dict[str, object]", parsed)
+
+    try:
+        # Drive the real gateway path, not a raw session. That matters:
+        # a wake ENDS the session by design, and the thing that rebuilds
+        # it and re-sends the request is the router's stall recovery. A
+        # bare ClientSession would just see "Connection closed", which
+        # proves nothing about what a user experiences.
+        await manager.connect_shared(upstream)
+        await registry.refresh_upstream(upstream.id)
+
+        # Cycle 1 warms the pool: after this the MCP server holds an
+        # open socket, which is the state the snapshot then freezes.
+        warm = await asyncio.wait_for(
+            router.route_call(
+                org_id=org_id,
+                prefixed_name=f"{upstream.id}{SEPARATOR}poolfetch",
+                arguments={}, user_id=PROBE_USER, session_id=None,
+            ),
+            timeout=TOOL_CALL_TIMEOUT * 2,
+        )
+        warm_payload = payload_of(warm)
+        assert warm_payload.get("ok") is True, (
+            f"warm-up call must succeed: {warm_payload}"
+        )
+
+        # Idle past the pause window, then call ONCE.
+        await asyncio.sleep(REATTACH_WAIT_SECONDS)
+        after_wake = await asyncio.wait_for(
+            router.route_call(
+                org_id=org_id,
+                prefixed_name=f"{upstream.id}{SEPARATOR}poolfetch",
+                arguments={}, user_id=PROBE_USER, session_id=None,
+            ),
+            timeout=TOOL_CALL_TIMEOUT * 4,
+        )
+        assert not after_wake.isError, (
+            "the first call after a wake must reach the user as a "
+            f"success; got {after_wake.content}. An opaque 'Upstream "
+            "tool call failed' here is the production symptom back"
+        )
+        wake_payload = payload_of(after_wake)
+        assert wake_payload.get("ok") is True, (
+            "the first call after a wake must succeed. "
+            f"got {wake_payload} — a 'code': 'ECONNRESET' with "
+            "'reused': true is the original production bug back: the "
+            "frozen process was handed back holding a dead socket"
+        )
+        assert wake_payload.get("reused") is not True, (
+            "the replacement process must open its own connection; a "
+            "reused socket here means a frozen process survived"
+        )
+    except E2BSDKError as exc:
+        if is_template_missing_error(exc):
+            pytest.skip(
+                "mcpolis E2B templates not published on the active "
+                "account — run `cd runner/e2b-templates && make build`.",
+            )
+        tail = errlog.get_output()
+        if tail:
+            print(f"\n----- sandbox stderr -----\n{tail}\n----- end -----\n")
+        raise
+    finally:
+        ref = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        if ref is not None and ref.sandbox_id is not None:
+            with contextlib.suppress(Exception):
+                await RealE2BClient(
+                    api_key=cast(str, E2B_API_KEY),
+                ).kill_sandbox(ref.sandbox_id)
+
+
+# ---------------------------------------------------------------------------
+# E2B-T6 — a heal keeps the warm sandbox instead of rebuilding it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+async def test_t6_heal_keeps_the_same_sandbox() -> None:
+    """A heal must replace the MCP process, not the sandbox.
+
+    Reusing the sandbox is where the saving lives: the expensive part
+    of a cold start is downloading the MCP's package (7-22s per server
+    in production, against ~3s when it is already on disk), and that
+    cache lives on the sandbox filesystem.
+
+    This asserts the OUTCOME, not the intention. An independent review
+    found the first version of the fix asked for the sandbox to be
+    kept, logged that it had been kept, and destroyed it anyway: the
+    heal's close-then-open tore the session down with
+    ``preserve=False``, which deleted the ref and killed the sandbox
+    before the reopen could read it. Every unit test passed, because
+    the fake sandbox service has no sandbox to kill. Only a real
+    sandbox id, compared before and after, catches that.
+    """
+    org_id = f"acme-t6-{TEST_RUN_ID}"
+    instance = f"e2e-t6-{TEST_RUN_ID}"
+    persistence = InMemorySandboxPersistenceRepository()
+    service = make_e2b_service(
+        instance=instance, persistence=persistence, reuse_on_restart=True,
+    )
+    upstream = make_everything_upstream("t6")
+    manager = make_e2b_manager(upstream, org_id, service)
+
+    try:
+        await manager.connect_shared(upstream)
+        before = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        assert before is not None and before.sandbox_id is not None
+        sandbox_before = before.sandbox_id
+        pid_before = before.pid
+
+        creates_cursor = time.monotonic_ns()
+        await manager.reconnect_shared_fresh(upstream)
+
+        after = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        assert after is not None and after.sandbox_id is not None
+        assert after.sandbox_id == sandbox_before, (
+            "the heal must keep the warm sandbox; a different id means "
+            "it was destroyed and rebuilt, so every wake pays a full "
+            "package download"
+        )
+        assert not events_since("sandbox.e2b.create", creates_cursor), (
+            "no fresh sandbox may be created by a heal that had a "
+            "healthy one to reuse"
+        )
+        assert after.pid != pid_before, (
+            "the MCP process MUST be replaced even though the sandbox "
+            "is not — reusing a process across a pause is the bug"
+        )
+
+        # And the healed session actually works.
+        session = manager.get_session(upstream.id)
+        result = await asyncio.wait_for(
+            session.list_tools(), timeout=TOOL_CALL_TIMEOUT,
+        )
+        assert result.tools
+    except E2BSDKError as exc:
+        if is_template_missing_error(exc):
+            pytest.skip(
+                "mcpolis E2B templates not published on the active "
+                "account — run `cd runner/e2b-templates && make build`.",
+            )
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            await manager.stop_all()
+        ref = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        if ref is not None and ref.sandbox_id is not None:
+            with contextlib.suppress(Exception):
+                await RealE2BClient(
+                    api_key=cast(str, E2B_API_KEY),
+                ).kill_sandbox(ref.sandbox_id)
+
+
+# ---------------------------------------------------------------------------
+# E2B-T7 — a cpu/ram edit forces a new sandbox instead of reusing the old size
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+async def test_t7_resize_forces_a_fresh_sandbox() -> None:
+    """Sandbox size is fixed at create time, so reuse must refuse it.
+
+    A reconnect attaches by ``sandbox_id`` and cannot re-size. Reusing
+    after the operator raised memory would keep running at the OLD
+    size while `connect_shared` re-persists the config hash and clears
+    the dirty-config banner — a dashboard asserting something false.
+
+    The unit twin (`test_reuse_is_refused_when_the_size_changed`)
+    proves the branch is taken against a mock. This proves E2B
+    actually hands back a bigger machine, which is the part a mock
+    cannot tell you.
+    """
+    org_id = f"acme-t7-{TEST_RUN_ID}"
+    persistence = InMemorySandboxPersistenceRepository()
+    service = make_e2b_service(
+        instance=f"e2e-t7-{TEST_RUN_ID}",
+        persistence=persistence,
+        reuse_on_restart=True,
+    )
+    upstream = make_everything_upstream("t7")
+    small = SandboxResources(cpu_vcpus=1, memory_mb=1024, disk_gb=0)
+    large = SandboxResources(cpu_vcpus=2, memory_mb=2048, disk_gb=0)
+    first_sandbox_id: str | None = None
+
+    async def open_at(resources: SandboxResources, tag: str) -> None:
+        session_id = f"e2e-t7-{TEST_RUN_ID}-{tag}"
+        async with service.session(
+            session_id=session_id, org_id=org_id, upstream=upstream,
+            resources=resources, denylist=(),
+        ) as sandbox_session:
+            client = ClientSession(
+                sandbox_session.read_stream, sandbox_session.write_stream,
+            )
+            async with client:
+                await asyncio.wait_for(
+                    client.initialize(), timeout=INITIALIZE_TIMEOUT,
+                )
+            service.mark_session_preserve_on_close(session_id)
+
+    try:
+        await open_at(small, "small")
+        ref = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        assert ref is not None and ref.sandbox_id is not None
+        first_sandbox_id = ref.sandbox_id
+        assert ref.metadata.get("e2b_template") == (
+            "mcpolis-node-cpu1-ram1024"
+        ), f"the ref must record the size it was built at; got {ref.metadata}"
+
+        # Same size: the warm sandbox is reused, which is the saving
+        # this check must not throw away.
+        await open_at(small, "same")
+        ref_same = await persistence.get(
+            org_id=org_id, upstream_id=upstream.id,
+        )
+        assert ref_same is not None
+        assert ref_same.sandbox_id == first_sandbox_id, (
+            "an unchanged size must still reuse the warm sandbox"
+        )
+
+        # Bigger: reuse must be refused and a new sandbox created.
+        await open_at(large, "large")
+        ref_big = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        assert ref_big is not None and ref_big.sandbox_id is not None
+        assert ref_big.sandbox_id != first_sandbox_id, (
+            "a size change must fresh-create; reusing the old sandbox "
+            "keeps the old size while the dashboard reports the new one"
+        )
+        assert ref_big.metadata.get("e2b_template") == (
+            "mcpolis-node-cpu2-ram2048"
+        ), f"the new sandbox must be the requested size; got {ref_big.metadata}"
+    except E2BSDKError as exc:
+        if is_template_missing_error(exc):
+            pytest.skip(
+                "mcpolis E2B templates not published on the active "
+                "account — run `cd runner/e2b-templates && make build`.",
+            )
+        raise
+    finally:
+        for sid in {first_sandbox_id} | {
+            (await persistence.get(
+                org_id=org_id, upstream_id=upstream.id,
+            ) or SandboxPersistedRef(
+                provider="e2b", org_id=org_id, upstream_id=upstream.id,
+                mcpolis_instance="x", sandbox_id=None,
+                paused_snapshot_id=None, pid=None, metadata={},
+                cached_server_info=None, cached_self_description=None,
+                last_updated=datetime.now(UTC),
+            )).sandbox_id,
+        }:
+            if sid is None:
+                continue
+            with contextlib.suppress(Exception):
+                await RealE2BClient(
+                    api_key=cast(str, E2B_API_KEY),
+                ).kill_sandbox(sid)
 
 
 # ---------------------------------------------------------------------------

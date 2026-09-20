@@ -161,13 +161,40 @@ class E2BSandboxHandle(Protocol):
         """Reattach to a still-running process by ``pid`` and rewire
         the stdout/stderr stream callbacks.
 
-        Required because E2B's ``on_timeout=pause`` lifecycle severs
-        the streaming RPC behind the original ``run_command`` handle
-        when the sandbox snapshots; the SDK does not reconnect it on
-        ``auto_resume``. The service detects the dead stream
-        (``E2BProcessHandle.wait`` returns) and calls this method to
-        get a fresh handle pointed at the same pid. The pid is stable
-        across E2B pause/resume in v2."""
+        .. warning::
+            **Not usable across a pause.** A process that has been
+            through a snapshot/resume carries dead state: every TCP
+            connection its HTTP client had pooled was severed while
+            frozen, and the process does not know, so it writes into
+            them and gets ``ECONNRESET`` — one failed request per
+            pooled socket. Measured 20 out of 20 wakes, with the
+            failure count tracking the pool size exactly (see
+            ``tests/integration/diagnose_wake_network.py``). The same
+            reuse also carries the envd fan-out wedge behind the
+            silent-stdout stall.
+
+            The service therefore no longer reattaches after a pause;
+            it kills the frozen process and starts a fresh one in the
+            SAME sandbox (:meth:`kill_command` + :meth:`run_command`),
+            which keeps the sandbox's warm filesystem and package
+            cache while guaranteeing clean in-process state. This
+            method remains for reattaching to a process whose sandbox
+            never paused."""
+        ...
+
+    async def kill_command(self, *, pid: int) -> None:
+        """Terminate a process by ``pid`` inside a live sandbox.
+
+        Used when waking a paused sandbox: the frozen MCP process is
+        killed and replaced rather than reattached (see the warning on
+        :meth:`connect_command`). Without the kill, every wake would
+        leave the previous MCP server resident, so a sandbox woken
+        dozens of times a day would accumulate dozens of them.
+
+        Best-effort by contract: the caller treats a failure as
+        non-fatal, because a leaked process is cheaper than a failed
+        session. Implementations should not raise for "no such
+        process" — that is the desired end state."""
         ...
 
     async def pause(self) -> str:
@@ -197,8 +224,9 @@ class E2BSandboxHandle(Protocol):
     async def set_timeout(self, timeout_seconds: int) -> None:
         """Re-apply the sandbox's idle ``on_timeout`` window.
 
-        Required after :meth:`connect_command` triggers an
-        ``auto_resume``: E2B resets the timeout to the SDK default
+        Required after any call triggers an ``auto_resume``
+        (today: :meth:`kill_command` or :meth:`run_command` on a
+        paused sandbox): E2B resets the timeout to the SDK default
         (``default_sandbox_timeout`` = 300s as of e2b 2.20.x), NOT
         the value passed to ``Sandbox.create``. Verified empirically
         2026-05-01 — see ``backend/tests/integration/diagnose_double_reattach.py``.

@@ -1456,6 +1456,34 @@ class UpstreamClientManager:
         no longer usable. That tradeoff is intentional and matches
         the legacy behavior the integration tests pin.
         """
+        # Keep the sandbox across the close-then-open. The teardown
+        # otherwise deletes the persisted ref and kills the sandbox,
+        # so the reopen can only fresh-create and every wake pays the
+        # MCP's full package download (7-22s in production, against
+        # ~3s to respawn into a warm one).
+        #
+        # It lives HERE, not at the call sites, because putting it at
+        # a call site is a mistake this change has now made twice: the
+        # first version wired it into ``reconnect_shared_fresh``, and
+        # when the wake moved onto ``ensure_shared_connected`` the
+        # preserve stayed behind and every wake silently went back to
+        # a cold create — with the guard test still green, because it
+        # guarded the abandoned path. Every reopen funnels through
+        # this method, so from here it cannot be orphaned again.
+        #
+        # Harmless when there is nothing live (Start, boot): the
+        # backends return 0 and nothing is marked.
+        preserved = 0
+        for service in self._sandbox_services.values():
+            preserved += service.preserve_sessions_for_upstream(
+                org_id=self._org_id, upstream_id=upstream.id,
+            )
+        if preserved:
+            logger.info(
+                "upstream.client.sandbox_preserved_for_reopen",
+                upstream_id=upstream.id,
+                sessions=preserved,
+            )
         await self._close_shared_inplace(upstream.id)
         session, task = await self._create_task(
             upstream, user_id="__shared__",
@@ -1501,21 +1529,29 @@ class UpstreamClientManager:
         bearer_token: str | None = None,
         auth: httpx.Auth | None = None,
     ) -> None:
-        """Force a FRESH shared session, never a reattach.
+        """Force a FRESH shared session, never a reused MCP process.
 
         Used to recover from a transport that connected but then went
-        silent — most importantly E2B's intermittent post-reattach
-        stdout stall, where ``commands.connect`` to a resumed sandbox
-        delivers a response or two and then stops. Plain
-        ``connect_shared`` would (under reuse-on-restart) reattach to
-        that same flaky sandbox via the persisted live ref and stall
-        again. Dropping the ref first forces the sandbox service down
-        its fresh-create path (new sandbox, new streaming RPC), so the
-        retry runs on a clean transport.
+        silent, and from the wake path that deliberately retires a
+        frozen process. Either way the fix is the same: a new MCP
+        process and a new ``initialize``.
 
-        The stale/flaky sandbox is closed by ``connect_shared``'s
-        close-then-open sequence and reaped by the reconciler; the cost
-        of a fresh create on the rare stall buys a reliable session.
+        The sandbox itself is KEPT. It used to be discarded here (the
+        persisted ref was deleted so the service fell down its
+        fresh-create path), which was the right call while
+        ``_try_reconnect`` reattached to the recorded pid — reusing the
+        sandbox meant reusing the poisoned process. That is no longer
+        true: ``_try_reconnect`` now kills the recorded pid and spawns
+        a replacement, so reconnecting already yields a clean process.
+
+        Keeping the sandbox matters because it is where the cost is.
+        A fresh create re-downloads the MCP's package, which measured
+        7-22 s per server in production, against roughly 3 s for a
+        server whose package is already on disk. Deleting the sandbox
+        on every wake would have made the fix more expensive than the
+        bug. If the sandbox is genuinely unusable, ``_try_reconnect``
+        fails and the service fresh-creates anyway, so the escape
+        hatch is unchanged.
 
         Single-flight per upstream id (R1): concurrent healers — several
         gateway dispatches that all stalled on the SAME poisoned shared
@@ -1540,17 +1576,10 @@ class UpstreamClientManager:
             # session is poisoned, so force a fresh one even if it still
             # looks live).
             async with self._shared_connect_lock(upstream.id):
-                if self._sandbox_persistence is not None:
-                    try:
-                        await self._sandbox_persistence.delete(
-                            org_id=self._org_id, upstream_id=upstream.id,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "upstream.client.reconnect_fresh.ref_delete_failed",
-                            upstream_id=upstream.id,
-                            exc_info=True,
-                        )
+                # The persisted ref is deliberately left in place and
+                # ``connect_shared`` marks the live session
+                # preserve-on-close, so the reopen reuses this
+                # sandbox and only replaces the MCP process inside it.
                 logger.info(
                     "upstream.client.reconnect_shared_fresh",
                     upstream_id=upstream.id,
@@ -1748,10 +1777,10 @@ class UpstreamClientManager:
         upstream that's in DEFERRED_ATTACH (post-boot lazy-reattach
         with a persistence ref but no in-memory task) actually kills
         the underlying sandbox. Without this, the next Start's
-        reuse-on-restart path Path 2 reattaches to the same sandbox
-        and the user sees an empty Server-logs panel because the
-        per-session ``LogBuffer.clear()`` ran but no fresh install /
-        startup output replaced it.
+        reuse-on-restart path Path 2 reuses the same sandbox and the
+        user sees an empty Server-logs panel because the per-session
+        ``LogBuffer.clear()`` ran but no fresh install / startup
+        output replaced it.
 
         Fans out across every registered provider — same idempotency
         contract as :meth:`cleanup_sandbox_state_for_upstream`. Errors
