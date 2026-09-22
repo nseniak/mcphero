@@ -7,6 +7,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import mcp.types as mcp_types
+from mcp.shared.exceptions import McpError
 import pytest
 import structlog
 
@@ -482,3 +483,113 @@ async def test_route_call_no_recovered_marker_on_clean_call(
     assert len(completed) == 1
     assert completed[0]["stalled"] is False
     assert completed[0]["attempts"] == 1
+
+
+# --- 4xx pass-through: the caller's own mistake reaches the caller ----------
+
+
+@pytest.mark.asyncio
+async def test_client_error_status_reaches_the_caller(tmp_path: Path) -> None:
+    """A 4xx from the upstream must tell the caller their request was wrong.
+
+    Masking every upstream failure behind "Upstream tool call failed"
+    protects internal hostnames and stack detail from a tool caller who
+    may not be the admin who configured the server. But a 4xx means the
+    upstream understood the request and rejected its CONTENTS, which is
+    the caller's own mistake and the one thing they can act on.
+
+    Production case: an Elasticsearch MCP returned 400 for a malformed
+    ES|QL query. The user retried the same broken query because nothing
+    told them it was broken.
+
+    Only the status line crosses the boundary, and it is OUR canonical
+    phrase for that code, never the upstream's text — so the URL in the
+    original message cannot escape.
+    """
+    err = McpError(mcp_types.ErrorData(
+        code=mcp_types.INTERNAL_ERROR,
+        message=(
+            "HTTP status client error (400 Bad Request) for url "
+            "(https://logs-collector.infra-elk.example.internal/_query)"
+        ),
+    ))
+    router, _call_tool, _cm = make_stall_router(
+        tmp_path, annotations=None, call_behaviours=[err],
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID, prefixed_name="mee6__do_thing",
+        arguments={}, user_id="alice", session_id="s1",
+    )
+
+    assert result.isError
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "400 Bad Request" in text, (
+        f"the caller must learn their request was rejected; got {text!r}"
+    )
+    assert "infra-elk" not in text and "https://" not in text, (
+        f"the upstream's URL must never cross the boundary; got {text!r}"
+    )
+    assert "Reference:" in text, "the correlation id stays, for admin lookup"
+
+
+@pytest.mark.asyncio
+async def test_server_error_status_stays_opaque(tmp_path: Path) -> None:
+    """A 5xx is about the infrastructure, so it stays hidden.
+
+    This is the line the pass-through must not cross: 5xx bodies and
+    messages are where internal hostnames, stack detail and library
+    versions live, and they are not the caller's fault or the caller's
+    business.
+    """
+    err = McpError(mcp_types.ErrorData(
+        code=mcp_types.INTERNAL_ERROR,
+        message=(
+            "HTTP status server error (500 Internal Server Error) for url "
+            "(https://logs-collector.infra-elk.example.internal/_query)"
+        ),
+    ))
+    router, _call_tool, _cm = make_stall_router(
+        tmp_path, annotations=None, call_behaviours=[err],
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID, prefixed_name="mee6__do_thing",
+        arguments={}, user_id="alice", session_id="s1",
+    )
+
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "500" not in text and "infra-elk" not in text, (
+        f"a server-side failure must stay opaque; got {text!r}"
+    )
+    assert "Reference:" in text
+
+
+@pytest.mark.asyncio
+async def test_a_bare_number_is_not_mistaken_for_a_status(
+    tmp_path: Path,
+) -> None:
+    """Detection keys on the canonical reason phrase, not a loose digit.
+
+    A message mentioning "400" for any other reason (a row count, a
+    port, a byte size) must not be reported as a client error. The
+    check requires the digits AND the standard phrase together, so a
+    coincidental number cannot trigger it.
+    """
+    err = McpError(mcp_types.ErrorData(
+        code=mcp_types.INTERNAL_ERROR,
+        message="index has 400 shards on host db-internal-7.example.internal",
+    ))
+    router, _call_tool, _cm = make_stall_router(
+        tmp_path, annotations=None, call_behaviours=[err],
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID, prefixed_name="mee6__do_thing",
+        arguments={}, user_id="alice", session_id="s1",
+    )
+
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "400" not in text and "db-internal" not in text, (
+        f"a coincidental number must not leak anything; got {text!r}"
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from http import HTTPStatus
 import sys
 import time
 import uuid
@@ -57,6 +58,50 @@ _T = TypeVar("_T")
 # 16-20s ``resources/read`` (R7) and a slow prompt render are safe.
 _DISPATCH_PROBE_INTERVAL = 30.0
 _DISPATCH_PING_TIMEOUT = 10.0
+
+
+# Canonical "<code> <reason>" strings for every 4xx, built once from
+# Python's own table. Matching against THIS set, rather than parsing the
+# upstream's message, is what makes the pass-through below safe: the
+# only text that can reach a caller is a string we generated.
+_CLIENT_ERROR_PHRASES: tuple[tuple[str, str], ...] = tuple(
+    (f"{st.value} {st.phrase}", f"{st.value} {st.phrase}")
+    for st in HTTPStatus
+    if 400 <= st.value < 500
+)
+
+
+def client_error_status(exc: BaseException) -> str | None:
+    """``"400 Bad Request"`` when *exc* reports a 4xx, else ``None``.
+
+    A 4xx means the upstream understood the request and rejected its
+    CONTENTS. That is the caller's own mistake and the one failure they
+    can actually fix, so it is worth telling them — unlike a 5xx or a
+    connection error, which are about infrastructure they may have no
+    business knowing about.
+
+    Production case (Sentry MCPOLIS-BACKEND-17): an Elasticsearch MCP
+    returned 400 for a malformed ES|QL query, the caller saw only
+    "Upstream tool call failed", and retried the same broken query.
+
+    Two properties make this safe to surface:
+
+    - **Closed output.** The returned string is built from
+      :class:`http.HTTPStatus`, never from the upstream's message. The
+      message is only searched, never echoed, so the URL and hostname
+      it usually carries cannot escape.
+    - **Fail-closed.** No recognised phrase means ``None`` means fully
+      opaque, which is the old behaviour.
+
+    Detection requires the digits AND the canonical reason together, so
+    a message that merely happens to contain "400" (a row count, a
+    port) does not trigger it.
+    """
+    message = str(exc)
+    for needle, label in _CLIENT_ERROR_PHRASES:
+        if needle.lower() in message.lower():
+            return label
+    return None
 
 
 async def dispatch_with_liveness(
@@ -228,7 +273,8 @@ class _DispatchVerb(Generic[_T]):
     RAISE ``UpstreamRouterError`` carrying the same actionable text (so
     the gateway surfaces it via a clean Read/GetPrompt result)."""
 
-    on_dispatch_error: Callable[[str], _T]
+    # (correlation_id, client_error_status | None) -> result
+    on_dispatch_error: Callable[[str, str | None], _T]
     """Map an opaque dispatch failure (given a correlation id) to the
     verb's surface (R4): tools RETURN ``CallToolResult(isError=True)``;
     resources/prompts RAISE ``UpstreamRouterError``."""
@@ -393,16 +439,23 @@ class ToolRouter:
 
         def _on_dispatch_error(
             correlation_id: str,
+            client_error: str | None,
         ) -> mcp_types.CallToolResult:
             # Don't leak internal exception content (URLs, hostnames, stack
             # detail, library versions) to MCP clients — the full exception is
             # logged server-side; return an opaque error with a correlation id
             # the user can quote when asking an admin to investigate.
+            #
+            # The one exception is a 4xx, which says the caller's own
+            # request was wrong. See ``client_error_status``: the text
+            # added here is generated from ``http.HTTPStatus``, never
+            # copied from the upstream, so nothing internal rides along.
+            detail = f" ({client_error})" if client_error else ""
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(
                     type="text",
                     text=(
-                        f"Upstream tool call failed. "
+                        f"Upstream tool call failed{detail}. "
                         f"Reference: {correlation_id}"
                     ),
                 )],
@@ -618,14 +671,16 @@ class ToolRouter:
                                 )
                     response_status = "error"
                     correlation_id = uuid.uuid4().hex[:12]
+                    client_error = client_error_status(exc)
                     logger.exception(
                         verb.failure_log_event,
                         org_id=org_id,
                         upstream_id=upstream.id,
                         correlation_id=correlation_id,
+                        client_error=client_error,
                         **verb.failure_log_fields,
                     )
-                    return verb.on_dispatch_error(correlation_id)
+                    return verb.on_dispatch_error(correlation_id, client_error)
             # The loop always returns (success, opaque error, or session
             # error) or continues; it never falls through.
             raise AssertionError(
@@ -787,9 +842,12 @@ class ToolRouter:
 
         def _on_dispatch_error(
             correlation_id: str,
+            client_error: str | None,
         ) -> mcp_types.ReadResourceResult:
+            detail = f" ({client_error})" if client_error else ""
             raise UpstreamRouterError(
-                f"Upstream resource read failed. Reference: {correlation_id}",
+                f"Upstream resource read failed{detail}. "
+                f"Reference: {correlation_id}",
             )
 
         verb: _DispatchVerb[mcp_types.ReadResourceResult] = _DispatchVerb(
@@ -845,9 +903,12 @@ class ToolRouter:
 
         def _on_dispatch_error(
             correlation_id: str,
+            client_error: str | None,
         ) -> mcp_types.GetPromptResult:
+            detail = f" ({client_error})" if client_error else ""
             raise UpstreamRouterError(
-                f"Upstream prompt failed. Reference: {correlation_id}",
+                f"Upstream prompt failed{detail}. "
+                f"Reference: {correlation_id}",
             )
 
         verb: _DispatchVerb[mcp_types.GetPromptResult] = _DispatchVerb(
