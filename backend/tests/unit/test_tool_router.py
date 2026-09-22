@@ -593,3 +593,74 @@ async def test_a_bare_number_is_not_mistaken_for_a_status(
     assert "400" not in text and "db-internal" not in text, (
         f"a coincidental number must not leak anything; got {text!r}"
     )
+
+
+# --- a caller's own bad request is not an application error ----------------
+
+
+async def _level_of_failure(tmp_path: Path, message: str) -> str:
+    """Route one call that fails with *message*; return its log level."""
+    err = McpError(mcp_types.ErrorData(
+        code=mcp_types.INTERNAL_ERROR, message=message,
+    ))
+    router, _call_tool, _cm = make_stall_router(
+        tmp_path, annotations=None, call_behaviours=[err],
+    )
+    with structlog.testing.capture_logs() as logs:
+        await router.route_call(
+            org_id=DEFAULT_ORG_ID, prefixed_name="mee6__do_thing",
+            arguments={}, user_id="alice", session_id="s1",
+        )
+    failures = [e for e in logs if e.get("event") == "tool.call.failed"]
+    assert len(failures) == 1, f"expected one failure log, got {failures}"
+    return str(failures[0]["log_level"])
+
+
+@pytest.mark.asyncio
+async def test_a_bad_request_is_logged_as_a_warning(tmp_path: Path) -> None:
+    """A malformed request is the caller's mistake, not our outage.
+
+    Sentry turns ERROR-level records into issues, so logging these as
+    errors means every user typo raises an alert on the operator's
+    dashboard and has to be resolved by hand — where it reopens the
+    next time anyone mistypes. Sentry MCPOLIS-BACKEND-17 was exactly
+    that: one malformed ES|QL query, filed as a platform fault.
+
+    WARNING keeps the record, with its traceback, in the searchable
+    logs where it is useful for analysis, and below the threshold that
+    pages a human.
+    """
+    level = await _level_of_failure(
+        tmp_path, "HTTP status client error (400 Bad Request) for url (x)",
+    )
+    assert level == "warning", (
+        f"a caller's bad request must not page anyone; logged as {level}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_auth_failure_is_still_an_error(tmp_path: Path) -> None:
+    """401 and 403 are 4xx but they are OUR problem, so they still page.
+
+    An upstream answering 403 usually means its credentials expired or
+    were revoked — the operator has to go and fix something. Quietly
+    demoting it along with the typos would hide a real outage behind a
+    rule written for typos. This upstream really did throw 403s in July
+    for that reason.
+    """
+    level = await _level_of_failure(
+        tmp_path, "HTTP status client error (403 Forbidden) for url (x)",
+    )
+    assert level == "error", (
+        f"an auth failure must still raise an issue; logged as {level}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_server_failure_is_still_an_error(tmp_path: Path) -> None:
+    """The control: 5xx is untouched by any of this."""
+    level = await _level_of_failure(
+        tmp_path,
+        "HTTP status server error (500 Internal Server Error) for url (x)",
+    )
+    assert level == "error"

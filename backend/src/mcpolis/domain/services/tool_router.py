@@ -104,6 +104,37 @@ def client_error_status(exc: BaseException) -> str | None:
     return None
 
 
+# 4xx codes that are still OUR problem, so they keep ERROR severity and
+# keep raising a Sentry issue. Everything else in the 4xx range is the
+# caller asking for something impossible, which is not an application
+# fault and must not page anyone.
+#
+# - 401 / 403: the upstream's credentials have expired or been revoked.
+#   An operator has to go and fix something. This exact upstream threw
+#   403s in July for precisely that reason.
+# - 429: we are being throttled. Nobody typed anything wrong; our own
+#   call rate is the problem.
+_ACTIONABLE_CLIENT_ERRORS: frozenset[int] = frozenset({401, 403, 429})
+
+
+def is_caller_fault(client_error: str | None) -> bool:
+    """Whether *client_error* is a mistake in the caller's own request.
+
+    ``True`` demotes the failure log from ERROR to WARNING: the record
+    and its traceback stay in the searchable logs, where they are
+    useful, but drop below the level Sentry turns into an issue.
+
+    Sentry MCPOLIS-BACKEND-17 is why this exists. One malformed ES|QL
+    query was filed as a platform fault, and resolving it by hand would
+    only have held until the next typo, since Sentry reopens a resolved
+    issue when it recurs.
+    """
+    if client_error is None:
+        return False
+    code = int(client_error.split(" ", 1)[0])
+    return code not in _ACTIONABLE_CLIENT_ERRORS
+
+
 async def dispatch_with_liveness(
     session: Any,
     make_op: Callable[[], Awaitable[_T]],
@@ -672,12 +703,21 @@ class ToolRouter:
                     response_status = "error"
                     correlation_id = uuid.uuid4().hex[:12]
                     client_error = client_error_status(exc)
-                    logger.exception(
+                    # A caller's own bad request is logged, not raised as
+                    # an issue. ``logger.exception`` is ERROR, which is
+                    # what Sentry captures; ``warning`` with exc_info
+                    # keeps the traceback in the logs without paging.
+                    log_failure = (
+                        logger.warning if is_caller_fault(client_error)
+                        else logger.exception
+                    )
+                    log_failure(
                         verb.failure_log_event,
                         org_id=org_id,
                         upstream_id=upstream.id,
                         correlation_id=correlation_id,
                         client_error=client_error,
+                        exc_info=True,
                         **verb.failure_log_fields,
                     )
                     return verb.on_dispatch_error(correlation_id, client_error)
