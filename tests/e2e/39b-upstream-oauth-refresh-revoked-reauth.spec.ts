@@ -116,7 +116,7 @@ test("admin_oauth: total token revocation surfaces a re-auth signal on the next 
 test(
   "admin_oauth: total token revocation disconnects the dashboard (tool-call path)",
   async ({ page, request }) => {
-    test.setTimeout(60_000);
+    test.setTimeout(120_000);
 
     await resetArmAndConnect(request);
 
@@ -126,8 +126,17 @@ test(
     await new Promise((r) => setTimeout(r, POST_EXPIRY_SLEEP_MS));
     await request.post(`${OAUTH_TEST_MCP_URL}/test/revoke-all-tokens`);
 
-    // Trigger the gateway tool-call failure (re-auth surfaced).
-    await callSecretEcho(request, ADMIN, "after-total-revoke");
+    // Trigger the gateway tool-call failure (re-auth surfaced), and WAIT
+    // for the gateway's answer. The revoked session dies silently, so the
+    // gateway only notices at its liveness probe (up to 30 s, plus a 10 s
+    // ping), then evicts that session and runs the reconnect that drops
+    // the dead token row. Giving up after the helper's default 10 s used to
+    // pass only by accident: the PREVIOUS test's (or attempt's) abandoned
+    // call reached its probe ~30 s in, evicted THIS test's fresh session by
+    // key, and dropped the token row for it. Evicting another request's
+    // fresh session was a bug (Sentry MCPOLIS-BACKEND-W sweep), now fixed,
+    // so this test has to wait for its own call.
+    await callSecretEcho(request, ADMIN, "after-total-revoke", 60_000);
 
     // EXPECTED once fixed: the admin upstream row flips to not-ready
     // because the dead token row is dropped.

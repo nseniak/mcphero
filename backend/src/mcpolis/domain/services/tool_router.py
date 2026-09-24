@@ -19,6 +19,9 @@ from mcpolis.adapters.repositories.connection_store import ConnectionStore
 from mcpolis.adapters.upstream_clients.client_manager import (
     UpstreamClientManager,
 )
+from mcpolis.adapters.upstream_clients.session_single_flight import (
+    ConnectAborted,
+)
 from mcpolis.domain.model.audit import AuditEntry
 from mcpolis.domain.model.policy import AuthMode
 from mcpolis.domain.model.upstream import UpstreamDefinition
@@ -638,19 +641,27 @@ class ToolRouter:
                                 upstream=upstream,
                                 effective_user=session_result.effective_user,
                                 client_manager=self._client_manager,
+                                stalled_session=session,
                             )
-                        except Exception:
+                        except Exception as heal_exc:
                             # The heal itself failed (e.g. E2B unreachable
                             # during the fresh reconnect). Don't let it
                             # propagate raw — that would leak internal detail
                             # AND skip the opaque-error return below. Fall
                             # through to the opaque error; the next call
-                            # retries the heal.
-                            logger.exception(
+                            # retries the heal. A heal that a Stop aborted
+                            # is expected, not an alert.
+                            log_heal_failure = (
+                                logger.warning
+                                if isinstance(heal_exc, ConnectAborted)
+                                else logger.exception
+                            )
+                            log_heal_failure(
                                 "upstream.dispatch.heal_failed",
                                 org_id=org_id,
                                 upstream_id=upstream.id,
                                 op=verb.audit_tool,
+                                exc_info=True,
                             )
                         else:
                             if not is_last and verb.may_retry(exc):

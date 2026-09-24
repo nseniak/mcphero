@@ -19,8 +19,8 @@ contract; this test pins the links mocks can't prove:
   the real tool result.
 
 Only the OAuth token exchange is substituted (the patched
-``reconnect_with_stored_tokens`` reconnects with a bearer instead of
-walking the token-refresh dance) — that seam is covered end-to-end by
+``_reconnect_from_stored_tokens`` connects through the manager's real
+opener instead of walking the token-refresh dance) — that seam is covered end-to-end by
 the e2e OAuth specs (16-per-user-oauth, 18a-token-refresh-silent).
 """
 # NOTE: no `from __future__ import annotations` — FastMCP tool registration
@@ -169,25 +169,23 @@ async def test_route_call_recovers_after_real_server_death(
         server_url="http://localhost:8000",
     )
 
-    # Stand-in for the OAuth token dance only: a "reconnect from stored
-    # tokens" that re-opens the per-user session over the real adapter.
+    # Stand-in for the OAuth token dance only: the reconnect opens the
+    # per-user session through the manager's real opener, over the real
+    # adapter, from inside the manager's real shared reconnect.
     reconnects: list[str] = []
 
-    async def fake_reconnect(**kwargs: Any) -> None:
+    async def fake_reconnect(**kwargs: Any) -> Any:
         reconnects.append(kwargs["effective_user"])
-        await client_manager.connect_upstream_for_user(
-            upstream, kwargs["effective_user"], bearer_token="t",
-        )
-        return None
+        return await kwargs["open_session"](None)
 
     monkeypatch.setattr(
-        ucs_module, "reconnect_with_stored_tokens", fake_reconnect
+        ucs_module, "_reconnect_from_stored_tokens", fake_reconnect
     )
 
     server, server_task = await start_server(port)
     try:
         # A real per-user session over the real HTTP adapter.
-        await client_manager.connect_upstream_for_user(
+        await client_manager.ensure_user_session(
             upstream, USER, bearer_token="t",
         )
         first = await router.route_call(

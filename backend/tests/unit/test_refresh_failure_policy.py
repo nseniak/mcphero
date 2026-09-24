@@ -67,7 +67,10 @@ from tests.unit.factories import (
 
 
 UPSTREAM_ID = "notion"
-USER_ID = "__admin__"
+# A real email: sessions (and the stored-token reconnect that builds
+# them) are keyed by the signed-in user. The old ``__admin__`` slot
+# is gone, and the manager now refuses that sentinel.
+USER_ID = "admin@example.com"
 UPSTREAM_URL = "https://mcp.example.invalid/mcp"
 SERVER_URL = "https://gateway.example.invalid"
 CALLBACK_URL = f"{SERVER_URL}/api/oauth/upstream/callback"
@@ -128,9 +131,14 @@ async def test_purge_user_oauth_state_drops_token_client_and_metadata(
         make_oauth_metadata().model_dump(mode="json"),
     )
     await store.record_refresh_failure(DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID)
+    stored = await store.get_user_token(DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID)
+    assert stored is not None
 
-    await purge_user_oauth_state(store, DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID)
+    purged = await purge_user_oauth_state(
+        store, DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID, sign_in=stored.revision,
+    )
 
+    assert purged is True
     assert await store.get_user_token(
         DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
     ) is None
@@ -143,6 +151,32 @@ async def test_purge_user_oauth_state_drops_token_client_and_metadata(
     assert await store.get_refresh_failures(
         DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_purge_keeps_a_sign_in_saved_after_the_failure(
+    tmp_path: Path,
+) -> None:
+    """The failure was about the sign-in read earlier; the user signed in
+    again since. The purge must leave the new sign-in and its app
+    registration alone."""
+    store = FileConnectionStore(tmp_path)
+    await _seed(store)
+    old = await store.get_user_token(DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID)
+    assert old is not None
+    await _seed(store)  # the user signs in again: a new row
+
+    purged = await purge_user_oauth_state(
+        store, DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID, sign_in=old.revision,
+    )
+
+    assert purged is False
+    assert await store.get_user_token(
+        DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
+    ) is not None
+    assert await store.get_client_info(
+        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+    ) is not None
 
 
 def test_transient_failure_below_threshold_keeps_tokens() -> None:
@@ -251,7 +285,7 @@ def _install_failing_reconnect(
     2. Make ``_build_oauth_provider`` return a provider with the given
        ``last_refresh_failure`` preseeded — that's the signal the
        outer except would have read from a real refresh response.
-    3. Make the client manager's ``connect_upstream_for_user`` raise
+    3. Make the client manager's per-user connect raise
        (simulating Step-3 connection failure after a rejected refresh).
     """
     class _DummyClient:
@@ -286,7 +320,7 @@ def _install_failing_reconnect(
 
 def _make_failing_client_manager() -> UpstreamClientManager:
     cm = UpstreamClientManager(upstreams=[])
-    cm.connect_upstream_for_user = AsyncMock(  # type: ignore[method-assign]
+    cm._open_user_session = AsyncMock(  # type: ignore[method-assign]
         side_effect=RuntimeError("step3 simulated reject"),
     )
     return cm
@@ -470,7 +504,7 @@ async def test_reconnect_success_resets_failure_counter(
         store._write(data)  # pyright: ignore[reportPrivateUsage]
 
     cm = UpstreamClientManager(upstreams=[])
-    cm.connect_upstream_for_user = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    cm._open_user_session = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
     # No network in Step 1 — dummy client that no-ops.
     class _NoopClient:
@@ -581,7 +615,7 @@ async def test_silent_reconnect_auth_required_synthesizes_invalid_grant_and_dele
     # by raising the marker exception wrapped in an ExceptionGroup
     # (the anyio shape that bit us in prod).
     cm = UpstreamClientManager(upstreams=[])
-    cm.connect_upstream_for_user = AsyncMock(  # type: ignore[method-assign]
+    cm._open_user_session = AsyncMock(  # type: ignore[method-assign]
         side_effect=BaseExceptionGroup(
             "unhandled errors in a TaskGroup (1 sub-exception)",
             [SilentReconnectAuthRequired(
@@ -791,7 +825,7 @@ async def test_reconnect_timeout_returns_connection_timeout(
     )
 
     cm = UpstreamClientManager(upstreams=[])
-    cm.connect_upstream_for_user = AsyncMock(  # type: ignore[method-assign]
+    cm._open_user_session = AsyncMock(  # type: ignore[method-assign]
         side_effect=TimeoutError("simulated step3 timeout"),
     )
 

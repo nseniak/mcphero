@@ -22,6 +22,9 @@ from mcpolis.adapters.repositories.upstream_config_store import UpstreamConfigSt
 from mcpolis.adapters.upstream_clients.client_manager import (
     UpstreamClientManager,
 )
+from mcpolis.adapters.upstream_clients.session_single_flight import (
+    ConnectAborted,
+)
 
 OnUpstreamToolsChanged = Callable[[str, str], None]
 OnUpstreamResourcesChanged = Callable[[str, str], None]
@@ -360,12 +363,19 @@ class OrgRuntimeManager:
                     # Service-account HTTP: no cache mechanism, but
                     # the cost-per-failed-attempt is also negligible
                     # (TCP handshake + MCP initialize, no sandbox
-                    # spawn). Eager connect every boot, with the
-                    # auto-disable-on-failure as a circuit breaker
-                    # so a permanently broken HTTP MCP eventually
-                    # stops being retried.
+                    # spawn). Eager connect every boot.
                     try:
                         await runtime.client_manager.connect_shared(upstream)
+                    except ConnectAborted:
+                        # An admin Stop (or the org's teardown) aborted
+                        # this connect. Not a boot failure: the Stop owns
+                        # the state, so record and disable nothing.
+                        logger.info(
+                            "upstream.connect.aborted",
+                            upstream_id=upstream.id,
+                            org_id=org_id,
+                        )
+                        return
                     except Exception as exc:
                         status.failed.add(upstream.id)
                         logger.exception(
@@ -373,33 +383,18 @@ class OrgRuntimeManager:
                             upstream_id=upstream.id,
                             org_id=org_id,
                         )
-                        # In-memory: mark DISABLED with last_failure
-                        # so the dashboard surfaces why. Persistence:
-                        # write ``enabled:False`` so the next boot
-                        # respects the auto-disable.
-                        await runtime.client_manager.transition_to_disabled(
+                        # FAILED, not stopped. Stopped means an admin
+                        # chose it, and a stopped upstream refuses tool
+                        # calls until someone clicks Start. A server that
+                        # was only briefly down at deploy time would then
+                        # stay off until someone noticed. FAILED stays
+                        # retryable: the next tool call reconnects it, and
+                        # so does the next boot.
+                        await runtime.client_manager.transition_to_failed(
                             upstream.id,
                             last_failure=str(exc),
-                            reason="auto_disable_on_failure",
+                            reason="boot_connect_failed",
                         )
-                        try:
-                            await self._connection_repo.set_disabled(
-                                org_id, upstream.id,
-                            )
-                        except Exception:
-                            logger.exception(
-                                "upstream.connect.failed.set_disabled_failed",
-                                upstream_id=upstream.id,
-                                org_id=org_id,
-                            )
-                        else:
-                            logger.info(
-                                "upstream.connect.auto_disabled",
-                                upstream_id=upstream.id,
-                                org_id=org_id,
-                                error_class=type(exc).__name__,
-                                error=str(exc),
-                            )
                         return
                     status.connected.add(upstream.id)
                     logger.info(

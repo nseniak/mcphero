@@ -332,14 +332,16 @@ async def test_non_network_error_breaks_immediately(
 
 
 @pytest.mark.asyncio
-async def test_tokens_restored_when_vanished_after_network_error(
+async def test_a_sign_in_deleted_during_a_refresh_stays_deleted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If the OAuth middleware clears stored tokens mid-flight AND the
-    failure was a network error, restore from backup. Otherwise a
-    transient DNS blip would force every user to re-authenticate."""
+    """The user disconnects while the periodic refresh is failing on a
+    network error. Nothing in the refresh deletes stored tokens (the SDK
+    only clears its in-memory copy), so a missing row means someone
+    deleted it on purpose. Writing the backup back used to undo the
+    Disconnect and sign the user in again."""
     store = FileConnectionStore(tmp_path)
-    seeded = await _seed(store)
+    await _seed(store)
 
     async def _wipe_then_raise() -> None:
         await store.delete_user_token(
@@ -361,12 +363,9 @@ async def test_tokens_restored_when_vanished_after_network_error(
         server_url=SERVER_URL,
     )
 
-    restored = await store.get_user_token(
+    assert await store.get_user_token(
         DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
-    )
-    assert restored is not None
-    assert restored.access_token == seeded.access_token
-    assert restored.refresh_token == seeded.refresh_token
+    ) is None, "the refresh brought back a sign-in that was deleted"
 
 
 @pytest.mark.asyncio
@@ -1461,3 +1460,153 @@ async def test_distributed_lock_released_after_refresh_completes(
 
     lock.acquire.assert_awaited_once()
     lock.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_sign_in_saved_while_a_rejected_refresh_notifies_is_kept(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The periodic refresh of the stored sign-in is rejected
+    (``invalid_grant``) and emails the user, who signs in again right
+    then. The cleanup that follows must delete only the rejected sign-in,
+    never the new one."""
+    from mcp.client.auth import OAuthClientProvider
+
+    from mcpolis.adapters.email.stub_email_sender import StubEmailSender
+    from mcpolis.domain.services.upstream_connection_service import (  # pyright: ignore[reportPrivateUsage]
+        RefreshFailureSignature,
+        _InitializingOAuthClientProvider,
+        _build_oauth_provider,
+    )
+
+    store = FileConnectionStore(tmp_path)
+    await _seed(store)
+    _install_fake_client(monkeypatch, [None])
+    _install_fake_sleep(monkeypatch)
+    real_build = _build_oauth_provider
+
+    async def _build_with_sig(*args: Any, **kwargs: Any) -> OAuthClientProvider:
+        provider = await real_build(*args, **kwargs)
+        if isinstance(provider, _InitializingOAuthClientProvider):
+            provider.last_refresh_failure = RefreshFailureSignature(
+                status_code=400,
+                body_excerpt='{"error":"invalid_grant"}',
+                error_code="invalid_grant",
+                timestamp=datetime.now(UTC),
+            )
+        return provider
+
+    monkeypatch.setattr(oauth_refresh, "_build_oauth_provider", _build_with_sig)
+
+    async def _resolver_while_the_user_signs_in(_org_id: str) -> list[str]:
+        await store.put_user_token(
+            DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
+            OAuthToken(
+                access_token="new-at",
+                refresh_token="new-rt",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                scopes=[],
+            ),
+        )
+        return ["admin@example.invalid"]
+
+    await refresh_token_for_user(
+        org_id=DEFAULT_ORG_ID,
+        upstream=_make_upstream(),
+        user_id=USER_ID,
+        connection_store=store,
+        server_url=SERVER_URL,
+        email_sender=StubEmailSender(),
+        admin_email_resolver=_resolver_while_the_user_signs_in,
+        hmac_key=b"test-hmac-key",
+    )
+
+    stored = await store.get_user_token(DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID)
+    assert stored is not None and stored.access_token == "new-at", (
+        "the rejected refresh's cleanup deleted the sign-in made meanwhile"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_of_a_replaced_sign_in_is_not_counted_or_emailed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The periodic refresh is rejected, and the user signs in again just
+    as the refresh looks at the outcome. The rejection was about the old
+    sign-in: nothing may be counted against the new one, and nobody is
+    emailed to sign in again. (Review of the follow-up fixes, F6.)"""
+    from mcp.client.auth import OAuthClientProvider
+
+    from mcpolis.adapters.email.stub_email_sender import StubEmailSender
+    from mcpolis.domain.services.upstream_connection_service import (  # pyright: ignore[reportPrivateUsage]
+        RefreshFailureSignature,
+        _InitializingOAuthClientProvider,
+        _build_oauth_provider,
+    )
+
+    class SignsInOnTheNextRead(FileConnectionStore):
+        armed = False
+
+        async def get_user_token(
+            self, org_id: str, user_id: str, upstream_id: str,
+        ) -> OAuthToken | None:
+            row = await super().get_user_token(org_id, user_id, upstream_id)
+            if self.armed:
+                self.armed = False
+                await self.put_user_token(
+                    org_id, user_id, upstream_id,
+                    OAuthToken(
+                        access_token="new-at",
+                        refresh_token="new-rt",
+                        expires_at=datetime.now(UTC) + timedelta(hours=1),
+                        scopes=[],
+                    ),
+                )
+            return row
+
+    store = SignsInOnTheNextRead(tmp_path)
+    await _seed(store)
+
+    async def refresh_rejected() -> None:
+        store.armed = True  # the user signs in as the outcome is read
+
+    _install_fake_client(monkeypatch, [refresh_rejected])
+    _install_fake_sleep(monkeypatch)
+    real_build = _build_oauth_provider
+
+    async def _build_with_sig(*args: Any, **kwargs: Any) -> OAuthClientProvider:
+        provider = await real_build(*args, **kwargs)
+        if isinstance(provider, _InitializingOAuthClientProvider):
+            provider.last_refresh_failure = RefreshFailureSignature(
+                status_code=400,
+                body_excerpt='{"error":"invalid_grant"}',
+                error_code="invalid_grant",
+                timestamp=datetime.now(UTC),
+            )
+        return provider
+
+    monkeypatch.setattr(oauth_refresh, "_build_oauth_provider", _build_with_sig)
+    sender = StubEmailSender()
+
+    async def _resolver(_org_id: str) -> list[str]:
+        return ["admin@example.invalid"]
+
+    await refresh_token_for_user(
+        org_id=DEFAULT_ORG_ID,
+        upstream=_make_upstream(),
+        user_id=USER_ID,
+        connection_store=store,
+        server_url=SERVER_URL,
+        email_sender=sender,
+        admin_email_resolver=_resolver,
+        hmac_key=b"test-hmac-key",
+    )
+
+    assert sender.sent == [], "the user was emailed about a sign-in they replaced"
+    assert await store.get_refresh_failures(
+        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+    ) is None, "the old sign-in's rejection was counted against the new one"
+    stored = await store.get_user_token(DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID)
+    assert stored is not None and stored.access_token == "new-at"

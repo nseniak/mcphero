@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import httpx
 import structlog
@@ -16,6 +16,10 @@ from mcpolis.adapters.sandbox_services import (
 from mcpolis.adapters.upstream_clients.http_adapter import HttpConnectionTask
 from mcpolis.adapters.upstream_clients.log_buffer import LogBuffer
 from mcpolis.adapters.upstream_clients.log_buffer_region import LogBufferRegion
+from mcpolis.adapters.upstream_clients.session_single_flight import (
+    ConnectAborted,
+    SessionSingleFlight,
+)
 from mcpolis.adapters.upstream_clients.stdio_adapter import (
     SandboxConnectionTask,
 )
@@ -69,15 +73,26 @@ OnUpstreamToolsChanged = Callable[[str], None]
 OnUpstreamResourcesChanged = Callable[[str], None]
 OnUpstreamPromptsChanged = Callable[[str], None]
 
+# Opens (close-then-open) one user's session with the given auth. Handed
+# to a reconnect body by ``ensure_user_session``, so the body can connect
+# only from inside its own flight.
+OpenUserSession = Callable[[httpx.Auth | None], Awaitable[ClientSession]]
+UserReconnect = Callable[[OpenUserSession], Awaitable[ClientSession]]
+
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
-__all__ = ["ADMIN_USER_ID", "UpstreamClientManager"]
+__all__ = ["UpstreamClientManager", "UpstreamStopped"]
 
 # Per-user session idle timeout
 USER_SESSION_IDLE_TIMEOUT = 30 * 60  # 30 minutes
 USER_SESSION_SWEEP_INTERVAL = 5 * 60  # 5 minutes
 
 ConnectionTask = SandboxConnectionTask | HttpConnectionTask
+
+
+class UpstreamStopped(ConnectAborted):
+    """An admin stopped this upstream, and only their Start opens it
+    again. A tool call gets "not available" instead of starting it."""
 
 
 def _resources_for(upstream: UpstreamDefinition) -> SandboxResources:
@@ -100,6 +115,21 @@ def _resources_for(upstream: UpstreamDefinition) -> SandboxResources:
     )
 
 
+async def _wait_until_unwound(
+    aborted: list[asyncio.Task[ClientSession]],
+) -> None:
+    """Wait for connects a teardown aborted to finish unwinding, so the
+    teardown returns only once they have let go of their transport.
+
+    Never waits on the calling task: a connect that tears down its own
+    slot would wait on itself forever.
+    """
+    me = asyncio.current_task()
+    pending = {task for task in aborted if task is not me}
+    if pending:
+        await asyncio.wait(pending)
+
+
 class UpstreamClientManager:
     """Manages long-lived MCP client sessions to upstream servers.
 
@@ -108,17 +138,19 @@ class UpstreamClientManager:
 
     * **Upstream-level** (``_state[upstream_id]``): one
       :class:`UpstreamState` record per upstream id. Carries the
-      shared discovery session AND the admin OAuth session (if any),
-      cached metadata, in-flight reconnect task, last failure context,
-      and the lifecycle phase (:class:`UpstreamConnectionState`).
-      Single source of truth for "what state is this upstream in?";
-      every accessor and every mutation goes through it.
+      shared session, cached metadata, in-flight reconnect task, last
+      failure context, and the lifecycle phase
+      (:class:`UpstreamConnectionState`). Single source of truth for
+      "what state is this upstream in?"; every accessor and every
+      mutation goes through it.
     * **Per-user** (``_user_sessions``): one per ``(user_id,
-      upstream_id)``, for ``per_user_oauth`` upstreams. Idle-swept
-      after ``USER_SESSION_IDLE_TIMEOUT`` — users log in, use a
-      tool, walk away, resources freed. Orthogonal to upstream-level
-      state because per-user sessions are personal artefacts of
-      individual sign-in, not properties of the upstream itself.
+      upstream_id)``, for the OAuth upstreams: each user's own sign-in
+      for ``per_user_oauth``, the slot owner's for ``admin_oauth``.
+      Idle-swept after ``USER_SESSION_IDLE_TIMEOUT`` — users log in,
+      use a tool, walk away, resources freed. Orthogonal to
+      upstream-level state because per-user sessions are personal
+      artefacts of individual sign-in, not properties of the upstream
+      itself.
     * **Log buffers** (``self.log_buffers``, a :class:`LogBufferRegion`):
       captured stderr per stdio upstream. Lifecycle outlives session
       reconnects — kept across transitions so the admin can read logs
@@ -127,9 +159,8 @@ class UpstreamClientManager:
     The state record's only mutation surface is the
     ``transition_to_*`` methods (``transition_to_disabled``,
     ``transition_to_failed``, ``transition_to_deferred_attach``,
-    ``transition_to_connecting``, ``transition_to_live_shared``,
-    ``transition_to_live_admin``) plus the close helpers
-    (``_close_shared_inplace``, ``_close_admin_inplace``). External
+    ``transition_to_connecting``, ``transition_to_live_shared``) plus
+    the close helper ``_close_shared_inplace``. External
     code should never poke ``_state`` directly — every reader has a
     typed accessor (``is_connected``, ``is_starting``,
     ``ready_upstream_ids``, etc.) on the manager.
@@ -209,24 +240,24 @@ class UpstreamClientManager:
         }
 
         # ── Orthogonal: per-user OAuth sessions ────────────────
-        # Keyed by ``(user_id, upstream_id)``. Idle-swept. Admin
-        # sessions never land here — they're upstream-level state
-        # (in ``_state[uid].admin_session``) so they survive the
-        # idle sweep and user logout.
+        # Keyed by ``(user_id, upstream_id)``. Idle-swept.
         self._user_sessions: dict[tuple[str, str], ClientSession] = {}
         self._user_tasks: dict[tuple[str, str], ConnectionTask] = {}
         self._user_session_last_used: dict[tuple[str, str], float] = {}
         self._sweep_task: asyncio.Task[None] | None = None
-        # Per-key serialization for ``connect_upstream_for_user``.
-        # Two concurrent callers for the same ``(user, upstream)``
-        # would otherwise race their disconnect+create sequences and
-        # silently leak the loser's task (overwritten in the dicts
-        # without anyone awaiting its ``close()``). With the lock,
-        # the second caller's ``disconnect_user_session`` observes
-        # the first caller's stored task and closes it cleanly
-        # before creating the replacement — preserving "the latest
-        # connect wins, prior session torn down" semantics.
-        self._user_connect_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # One connect at a time per ``(user, upstream)``. This used to be
+        # a lock, which SERIALISED concurrent connects: the second caller
+        # waited, then began its own connect by closing the session the
+        # first had just built for its caller (Sentry MCPOLIS-BACKEND-W).
+        # A caller that needs the session now joins the connect in
+        # flight; only a deliberate replacement (a fresh sign-in) waits
+        # it out and builds its own. See ``session_single_flight``.
+        self._user_flights: SessionSingleFlight[tuple[str, str]] = (
+            SessionSingleFlight(
+                "user",
+                lambda key: {"user": key[0], "upstream_id": key[1]},
+            )
+        )
 
         # ── Orthogonal: stderr capture for stdio upstreams ─────
         # Kept across reconnects so the admin can read crash logs.
@@ -234,46 +265,22 @@ class UpstreamClientManager:
         # facade (internal/plans/manager-region-split.md, Phase 1).
         self.log_buffers = LogBufferRegion()
 
-        # ── Orthogonal: single-flight lazy-attach infra ─────────
-        # When boot deferred ``connect_shared`` (because the
-        # persisted ref carried cached metadata), the first
-        # concurrent caller of ``ensure_shared_connected`` creates a
-        # task and parks it here; siblings await it instead of
-        # stampeding ``Sandbox.connect`` for the same upstream.
-        # Cleared on success or failure. NOT a state — the lazy
-        # attach is a transition mechanism that runs while the
-        # upstream is in DEFERRED_ATTACH and lands it in LIVE
-        # (success) or FAILED (failure) without going through
-        # CONNECTING — ``CONNECTING`` is reserved for admin-clicked
-        # Reconnect, which is cross-tab visible.
-        self._lazy_connect_tasks: dict[str, asyncio.Task[None]] = {}
-
-        # ── Orthogonal: single-flight heal infra (R1) ──────────────
-        # ``reconnect_shared_fresh`` (the stall-heal) deletes the
-        # persisted sandbox ref and force-creates a fresh sandbox.
-        # It bypasses ``_lazy_connect_tasks`` (it never goes through
-        # ``ensure_shared_connected``), so without its own single-flight,
-        # N gateway dispatches that all stalled on the SAME poisoned
-        # shared session and raced into the heal at once would each
-        # force a fresh E2B sandbox — N-1 immediately orphaned — and
-        # race the ref delete/re-persist. Concurrent healers coalesce
-        # onto the first in-flight reconnect here instead.
-        self._reconnect_fresh_tasks: dict[str, asyncio.Task[None]] = {}
-
-        # ── Per-upstream shared-connect mutex (R1) ─────────────────
-        # The two single-flights above each coalesce their OWN kind, but
-        # ``ensure_shared_connected`` (lazy acquire) and
-        # ``reconnect_shared_fresh`` (heal) BOTH call ``connect_shared``
-        # on the shared service_account session — which otherwise has no
-        # mutual exclusion. A heal mid-connect (``connect_shared`` has
-        # already nulled the session via ``_close_shared_inplace``)
-        # racing a concurrent lazy acquire would start a SECOND
-        # ``connect_shared`` → two sandboxes (one orphaned) + a ref
-        # delete/re-persist race. This per-upstream lock serializes the
-        # connect across BOTH paths; the lazy path also re-checks
-        # liveness after acquiring it, so a waiter that finds the heal
-        # already produced a live session skips its own connect.
-        self._shared_connect_locks: dict[str, asyncio.Lock] = {}
+        # ── Orthogonal: one shared connect at a time per upstream ──
+        # Every shared-session connect runs here: the lazy attach on a
+        # tool call, the dashboard's Start, the boot connect, the
+        # discovery connect and the stall heal. Callers that arrive
+        # while one runs share it. Two of those entry points used to
+        # coalesce through locks and task slots held at their own call
+        # sites; the other three opened a second sandbox for the same
+        # upstream whenever they overlapped, and the loser's teardown
+        # could delete the winner's sandbox record. Keyed per upstream,
+        # so boot still connects every upstream in parallel. NOT a
+        # state: a lazy attach lands DEFERRED_ATTACH in LIVE or FAILED
+        # without going through CONNECTING, which stays reserved for
+        # the admin-clicked Start that every tab can see.
+        self._shared_flights: SessionSingleFlight[str] = SessionSingleFlight(
+            "shared", lambda upstream_id: {"upstream_id": upstream_id},
+        )
 
         # Optional callbacks invoked when an upstream reports that its
         # tools / resources / prompts list has changed. Wired from above
@@ -353,8 +360,8 @@ class UpstreamClientManager:
         upstream_id=foo``). The ``from_state`` / ``to_state`` pair
         lets you see "boot found cache → DEFERRED_ATTACH" or "admin
         Reconnect → CONNECTING → LIVE" as a sequence. ``extra``
-        carries reason codes and slot kinds (``shared`` / ``admin``)
-        for transitions that affect a specific session.
+        carries reason codes and the slot kind (``shared``) for
+        transitions that affect a specific session.
         """
         logger.info(
             "upstream.state.transition",
@@ -364,41 +371,31 @@ class UpstreamClientManager:
             **extra,
         )
 
-    def _recompute_state_after_session_drop(
-        self,
-        state: UpstreamState,
-        *,
-        drop_shared: bool,
-        drop_admin: bool,
+    def _state_after_shared_drop(
+        self, state: UpstreamState,
     ) -> UpstreamConnectionState:
         """Return the lifecycle phase that *would* result from
-        dropping the named session(s) on ``state`` while preserving
-        all other slots.
+        dropping the shared session on ``state``.
 
         The decision tree:
 
         1. A non-done ``background_task`` keeps the upstream in
            CONNECTING regardless of session changes (admin clicked
            Reconnect — cross-tab visibility wins).
-        2. If any session remains → LIVE.
-        3. Else if cached metadata (server_info AND self_description)
+        2. Else if cached metadata (server_info AND self_description)
            is present → DEFERRED_ATTACH (the cache satisfies the
            dashboard's Ready pill; the next tool dispatch will
            reattach lazily).
-        4. Else preserve DISABLED (admin-set), otherwise FAILED.
+        3. Else preserve DISABLED (admin-set), otherwise FAILED.
 
-        Used by ``_close_shared_inplace`` / ``_close_admin_inplace``
-        to compute the post-drop state.
+        Used by ``_close_shared_inplace`` to compute the post-drop
+        state.
         """
         if (
             state.background_task is not None
             and not state.background_task.done()
         ):
             return UpstreamConnectionState.CONNECTING
-        shared_present = state.shared_session is not None and not drop_shared
-        admin_present = state.admin_session is not None and not drop_admin
-        if shared_present or admin_present:
-            return UpstreamConnectionState.LIVE
         if (
             state.server_info is not None
             and state.self_description is not None
@@ -418,8 +415,7 @@ class UpstreamClientManager:
 
         Used by transitions that drop a session — close failures
         shouldn't block state-machine progress, so they're recorded
-        and elided. ``kind`` is ``"shared"`` or ``"admin"`` for
-        log-grep readability.
+        and elided. ``kind`` names the slot for log-grep readability.
         """
         if task is None:
             return
@@ -436,6 +432,8 @@ class UpstreamClientManager:
         self,
         upstream_id: str,
         old: UpstreamState | None,
+        *,
+        cancel_background: bool = True,
     ) -> None:
         """Cancel + close every task referenced by ``old``.
 
@@ -443,24 +441,23 @@ class UpstreamClientManager:
         (``transition_to_disabled``, ``transition_to_failed``,
         ``transition_to_deferred_attach``). Idempotent — safe on a
         record that's already been drained, or on ``None``.
+        ``cancel_background=False`` leaves the admin's Start running.
         """
         if old is None:
             return
         bg = old.background_task
-        if bg is not None and not bg.done():
+        if cancel_background and bg is not None and not bg.done():
             bg.cancel()
             try:
                 await bg
             except (asyncio.CancelledError, Exception):
                 pass
         await self._safe_close_task(old.shared_task, "shared", upstream_id)
-        await self._safe_close_task(old.admin_task, "admin", upstream_id)
 
     async def transition_to_disabled(
         self,
         upstream_id: str,
         *,
-        last_failure: str | None = None,
         reason: str = "admin_disconnect",
     ) -> None:
         """Tear down all sessions, mark the upstream DISABLED.
@@ -469,9 +466,12 @@ class UpstreamClientManager:
 
         - admin-initiated Stop (``disconnect_upstream``).
         - admin-initiated upstream removal (``unregister_upstream``).
-        - kill-switch enforcement (``kill_all_for_upstream``).
-        - auto-disable-on-failure in the boot reconciler — pass
-          ``last_failure`` so the dashboard can surface why.
+        - boot, for an upstream persisted as stopped.
+        - an upstream the admin just added or imported, which starts
+          stopped.
+
+        Only an admin's Start opens a DISABLED service_account upstream
+        again (see ``_refuse_if_stopped``).
 
         Drops cached metadata too: a DISABLED upstream has no live
         session AND should not be served from cache (the admin
@@ -479,19 +479,26 @@ class UpstreamClientManager:
         be a lie).
         """
         old = self._state.get(upstream_id)
-        new = UpstreamState(
-            state=UpstreamConnectionState.DISABLED,
-            last_failure=last_failure,
-        )
+        new = UpstreamState(state=UpstreamConnectionState.DISABLED)
         self._state[upstream_id] = new
         self._log_transition(
             upstream_id,
             old.state if old is not None else None,
             UpstreamConnectionState.DISABLED,
             reason=reason,
-            last_failure=last_failure,
         )
+        # Stop the connect running right now, including one a tool call
+        # joined: it would otherwise land a live session after this Stop.
+        # The abort and the drain's cancel of the admin's own Start both
+        # happen before anything here awaits, so that connect takes no
+        # step past the DISABLED mark, and Start reads as cancelled rather
+        # than as a failed connect that paints an error on the dashboard.
+        # A tool call that arrives after this is refused until Start (see
+        # ``_refuse_if_stopped``).
+        aborted = self._shared_flights.abort(upstream_id)
         await self._drain_state_resources(upstream_id, old)
+        if aborted is not None:
+            await _wait_until_unwound([aborted])
         # Drained state may have left a persisted live ref behind —
         # specifically when ``old`` was DEFERRED_ATTACH (no in-memory
         # task for ``_session_cm.finally`` to clean up via). Fan out
@@ -505,6 +512,7 @@ class UpstreamClientManager:
         *,
         last_failure: str | None = None,
         reason: str = "connect_failed",
+        cancel_background: bool = True,
     ) -> None:
         """Tear down all sessions, mark the upstream FAILED.
 
@@ -518,12 +526,21 @@ class UpstreamClientManager:
         a transient connect failure shouldn't lose the metadata, so
         the next attempt can render the dashboard from cache while
         retrying.
+
+        ``cancel_background=False`` keeps the admin's Start running and
+        tracked. For a failure the Start shares: it is waiting on the same
+        connect and will record the failure itself; cancelling it would
+        make it read as a Stop and drop the error.
         """
         old = self._state.get(upstream_id)
         new = UpstreamState(
             state=UpstreamConnectionState.FAILED,
             server_info=old.server_info if old is not None else None,
             self_description=old.self_description if old is not None else None,
+            background_task=(
+                None if cancel_background or old is None
+                else old.background_task
+            ),
             last_failure=last_failure,
         )
         self._state[upstream_id] = new
@@ -534,7 +551,9 @@ class UpstreamClientManager:
             reason=reason,
             last_failure=last_failure,
         )
-        await self._drain_state_resources(upstream_id, old)
+        await self._drain_state_resources(
+            upstream_id, old, cancel_background=cancel_background,
+        )
 
     async def compute_runtime_hash(
         self, upstream: UpstreamDefinition,
@@ -688,8 +707,6 @@ class UpstreamClientManager:
             state=UpstreamConnectionState.CONNECTING,
             shared_session=old.shared_session if old is not None else None,
             shared_task=old.shared_task if old is not None else None,
-            admin_session=old.admin_session if old is not None else None,
-            admin_task=old.admin_task if old is not None else None,
             server_info=old.server_info if old is not None else None,
             self_description=old.self_description if old is not None else None,
             background_task=background_task,
@@ -722,9 +739,7 @@ class UpstreamClientManager:
         """Record a freshly-opened shared session, advance to LIVE.
 
         Sync — the caller has already awaited ``_create_task`` and
-        just needs the state machine updated. Preserves any admin
-        session that was already in place (OAuth upstreams can have
-        both shared discovery + admin authenticated simultaneously).
+        just needs the state machine updated.
 
         Clears ``background_task`` (the connect succeeded) and
         ``last_failure`` (stale failure context after a successful
@@ -740,8 +755,6 @@ class UpstreamClientManager:
             state=UpstreamConnectionState.LIVE,
             shared_session=session,
             shared_task=task,
-            admin_session=old.admin_session if old is not None else None,
-            admin_task=old.admin_task if old is not None else None,
             server_info=(
                 server_info
                 if server_info is not None
@@ -777,65 +790,6 @@ class UpstreamClientManager:
                 name=f"close_orphan_shared_{upstream_id}",
             )
 
-    def transition_to_live_admin(
-        self,
-        upstream_id: str,
-        *,
-        session: ClientSession,
-        task: ConnectionTask,
-        server_info: ServerInfo | None,
-        self_description: UpstreamSelfDescription | None,
-        started_config_hash: str | None = None,
-    ) -> None:
-        """Record a freshly-opened admin OAuth session, advance to LIVE.
-
-        Symmetric to ``transition_to_live_shared`` — preserves any
-        shared session already in place. Used by
-        ``connect_admin_session`` after a successful OAuth-bound
-        connect.
-        """
-        old = self._state.get(upstream_id)
-        new = UpstreamState(
-            state=UpstreamConnectionState.LIVE,
-            shared_session=old.shared_session if old is not None else None,
-            shared_task=old.shared_task if old is not None else None,
-            admin_session=session,
-            admin_task=task,
-            server_info=(
-                server_info
-                if server_info is not None
-                else (old.server_info if old is not None else None)
-            ),
-            self_description=(
-                self_description
-                if self_description is not None
-                else (old.self_description if old is not None else None)
-            ),
-            background_task=None,
-            last_failure=None,
-            started_config_hash=(
-                started_config_hash
-                if started_config_hash is not None
-                else (old.started_config_hash if old is not None else None)
-            ),
-        )
-        self._state[upstream_id] = new
-        self._log_transition(
-            upstream_id,
-            old.state if old is not None else None,
-            UpstreamConnectionState.LIVE,
-            session_kind="admin",
-        )
-        if (
-            old is not None
-            and old.admin_task is not None
-            and old.admin_task is not task
-        ):
-            asyncio.create_task(
-                self._safe_close_task(old.admin_task, "admin", upstream_id),
-                name=f"close_orphan_admin_{upstream_id}",
-            )
-
     async def _close_shared_inplace(self, upstream_id: str) -> None:
         """Close the shared session (if any), recompute state.
 
@@ -844,9 +798,8 @@ class UpstreamClientManager:
         ``Sandbox.connect`` so we never run two sandboxes for the
         same upstream concurrently.
 
-        After close: if ``admin_session`` is still live the upstream
-        stays LIVE; else if cached metadata is present it falls back
-        to DEFERRED_ATTACH; else it becomes FAILED (or stays
+        After close: if cached metadata is present the upstream falls
+        back to DEFERRED_ATTACH; else it becomes FAILED (or stays
         DISABLED, if it already was).
         """
         old = self._state.get(upstream_id)
@@ -855,15 +808,11 @@ class UpstreamClientManager:
             or (old.shared_session is None and old.shared_task is None)
         ):
             return
-        new_enum = self._recompute_state_after_session_drop(
-            old, drop_shared=True, drop_admin=False,
-        )
+        new_enum = self._state_after_shared_drop(old)
         new = UpstreamState(
             state=new_enum,
             shared_session=None,
             shared_task=None,
-            admin_session=old.admin_session,
-            admin_task=old.admin_task,
             server_info=old.server_info,
             self_description=old.self_description,
             background_task=old.background_task,
@@ -880,45 +829,6 @@ class UpstreamClientManager:
         if old.shared_session is not None:
             logger.info(
                 "upstream.client.shared_session.closed",
-                upstream_id=upstream_id,
-            )
-
-    async def _close_admin_inplace(self, upstream_id: str) -> None:
-        """Close the admin session (if any), recompute state.
-
-        Symmetric to ``_close_shared_inplace``.
-        """
-        old = self._state.get(upstream_id)
-        if (
-            old is None
-            or (old.admin_session is None and old.admin_task is None)
-        ):
-            return
-        new_enum = self._recompute_state_after_session_drop(
-            old, drop_shared=False, drop_admin=True,
-        )
-        new = UpstreamState(
-            state=new_enum,
-            shared_session=old.shared_session,
-            shared_task=old.shared_task,
-            admin_session=None,
-            admin_task=None,
-            server_info=old.server_info,
-            self_description=old.self_description,
-            background_task=old.background_task,
-            last_failure=old.last_failure,
-        )
-        self._state[upstream_id] = new
-        self._log_transition(
-            upstream_id, old.state, new_enum,
-            session_kind="admin", action="closed",
-        )
-        await self._safe_close_task(
-            old.admin_task, "admin", upstream_id,
-        )
-        if old.admin_session is not None:
-            logger.info(
-                "upstream.client.admin_session.closed",
                 upstream_id=upstream_id,
             )
 
@@ -1051,6 +961,13 @@ class UpstreamClientManager:
             if upstream.auth.mode == AuthMode.service_account:
                 try:
                     deferred = await self.connect_shared_or_defer(upstream)
+                except ConnectAborted:
+                    # A Stop or the teardown aborted it; not a failure.
+                    logger.info(
+                        "upstream.client.connect.aborted",
+                        upstream_id=upstream_id,
+                    )
+                    return
                 except Exception as exc:
                     await self.transition_to_failed(
                         upstream_id,
@@ -1095,14 +1012,26 @@ class UpstreamClientManager:
     async def stop_all(self) -> None:
         """Tear down every session. Manager is unusable afterwards.
 
-        Iterates the per-user dicts (admin sessions and shared
-        sessions are inside the state record, so a single pass over
-        ``_state`` drains them via ``_drain_state_resources``).
+        Iterates the per-user dicts (shared sessions are inside the
+        state record, so a single pass over ``_state`` drains them via
+        ``_drain_state_resources``).
         """
         # Cancel sweep task
         if self._sweep_task is not None:
             self._sweep_task.cancel()
             self._sweep_task = None
+
+        # Stop connects still in flight and refuse new ones, so none lands
+        # a session after the teardown below. Bounded: shutdown must not
+        # hang on one. Cancel the admins' Starts first, in the same step,
+        # so they read as cancelled rather than as failed connects that
+        # record an error.
+        for state in self._state.values():
+            if state.background_task is not None:
+                state.background_task.cancel()
+        aborted = self._shared_flights.shut_down() + self._user_flights.shut_down()
+        if aborted:
+            await asyncio.wait(aborted, timeout=5.0)
 
         # Clean up per-user sessions (orthogonal storage).
         for key, task in list(self._user_tasks.items()):
@@ -1119,8 +1048,8 @@ class UpstreamClientManager:
         self._user_tasks.clear()
         self._user_session_last_used.clear()
 
-        # Clean up upstream-level state (shared + admin tasks live
-        # in the state record).
+        # Clean up upstream-level state (shared tasks live in the
+        # state record).
         for upstream_id, state in list(self._state.items()):
             try:
                 await self._drain_state_resources(upstream_id, state)
@@ -1443,19 +1372,77 @@ class UpstreamClientManager:
         upstream: UpstreamDefinition,
         bearer_token: str | None = None,
         auth: httpx.Auth | None = None,
-    ) -> None:
-        """Connect a shared upstream — close any prior shared
-        session, open a fresh one, transition to LIVE.
+    ) -> ClientSession:
+        """Make the upstream's shared session live, and return it.
 
-        The close-then-open order is deliberate: it frees the
-        sandbox slot before the next ``Sandbox.connect``, preventing
-        two sandboxes from briefly running for the same upstream.
-        If creating the new task fails (mid-step), the upstream
-        falls into FAILED via the caller's exception handler — the
-        prior session is gone so the previously-live upstream is
-        no longer usable. That tradeoff is intentional and matches
-        the legacy behavior the integration tests pin.
+        Joins a connect already running for this upstream, reuses a live
+        session, and otherwise opens one (see ``_open_shared``). The
+        dashboard's Start, the boot connect, the discovery connect and the
+        dev demo seed all come through here, and they share one connect
+        per upstream with ``ensure_shared_connected`` (lazy attach) and
+        ``reconnect_shared_fresh`` (heal). Callers used to overlap: the
+        lazy attach and the heal coalesced through locks at their own call
+        sites, the rest did not, so a Start or boot connect that raced a
+        tool call opened a second sandbox for one upstream.
+
+        Reusing a live session is right for every caller here. The
+        dashboard's Start disconnects before it connects, so a live
+        session at this point was built after the admin clicked.
+
+        A caller that joins a running connect gets that connect's session;
+        its own ``bearer_token`` / ``auth`` are not used. No caller passes
+        them today.
         """
+        return await self._shared_flights.ensure(
+            upstream.id,
+            current=lambda: self._live_shared_session(upstream.id),
+            open_session=lambda: self._open_shared(
+                upstream, bearer_token=bearer_token, auth=auth,
+            ),
+        )
+
+    def _live_shared_session(self, upstream_id: str) -> ClientSession | None:
+        """The shared session if its transport is alive, else ``None``.
+
+        A session whose transport died (sandbox paused or gone) is still
+        registered and looks present, but every send on it fails. Treat it
+        as absent so the caller reconnects instead of reusing the zombie.
+        """
+        state = self._state.get(upstream_id)
+        if state is None or state.shared_session is None:
+            return None
+        task = state.shared_task
+        if task is not None and not task.is_transport_alive():
+            logger.info(
+                "upstream.client.shared_session.dead_reconnecting",
+                upstream_id=upstream_id,
+            )
+            return None
+        return state.shared_session
+
+    async def _open_shared(
+        self,
+        upstream: UpstreamDefinition,
+        *,
+        bearer_token: str | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> ClientSession:
+        """Close any prior shared session, open a fresh one, go LIVE.
+
+        Runs only as the body of a shared flight, so it never overlaps
+        another open of the same upstream. Call ``connect_shared``,
+        ``ensure_shared_connected`` or ``reconnect_shared_fresh``, never
+        this directly.
+
+        The close-then-open order is deliberate: it frees the sandbox slot
+        before the next ``Sandbox.connect``, so two sandboxes never run for
+        one upstream. If opening the new task fails midway, the upstream
+        falls into FAILED through the caller's handler; the prior session
+        is gone, so a previously live upstream is no longer usable. That
+        tradeoff is intentional and is what the integration tests pin.
+        """
+        aborts_at_start = self._shared_flights.abort_count(upstream.id)
+        self._refuse_if_stopped(upstream)
         # Keep the sandbox across the close-then-open. The teardown
         # otherwise deletes the persisted ref and kills the sandbox,
         # so the reopen can only fresh-create and every wake pays the
@@ -1469,7 +1456,8 @@ class UpstreamClientManager:
         # preserve stayed behind and every wake silently went back to
         # a cold create — with the guard test still green, because it
         # guarded the abandoned path. Every reopen funnels through
-        # this method, so from here it cannot be orphaned again.
+        # this method, so from here it cannot be orphaned again. It
+        # runs once per reopen: callers who join a flight do not run it.
         #
         # Harmless when there is nothing live (Start, boot): the
         # backends return 0 and nothing is marked.
@@ -1485,13 +1473,20 @@ class UpstreamClientManager:
                 sessions=preserved,
             )
         await self._close_shared_inplace(upstream.id)
+        # The config this session starts from, taken before the connect:
+        # between the connect returning a live session and recording it
+        # there must be no await, or a cancel landing there leaves a
+        # session (and its sandbox) that nothing holds or ever closes.
+        started_config_hash = await self.compute_runtime_hash(upstream)
         session, task = await self._create_task(
             upstream, user_id="__shared__",
             bearer_token=bearer_token, auth=auth,
         )
-        # Snapshot the runtime hash *after* the task has spun up
-        # successfully; if the connect failed we'd never reach here.
-        started_config_hash = await self.compute_runtime_hash(upstream)
+        if self._shared_flights.aborted_since(upstream.id, aborts_at_start):
+            # A Stop (or shutdown) aborted this connect and its cancel was
+            # lost on the way: going LIVE now would undo the Stop.
+            await self._safe_close_task(task, "shared", upstream.id)
+            raise ConnectAborted("the shared connect was aborted while it ran")
         self.transition_to_live_shared(
             upstream.id,
             session=session,
@@ -1511,30 +1506,60 @@ class UpstreamClientManager:
             "upstream.client.shared_session.created",
             upstream_id=upstream.id,
         )
+        return session
 
-    def _shared_connect_lock(self, upstream_id: str) -> asyncio.Lock:
-        """Per-upstream mutex serializing ``connect_shared`` of the shared
-        session across the lazy-acquire and heal paths (R1). Created
-        lazily; the get-then-set is await-free, so it's atomic under the
-        single-threaded event loop."""
-        lock = self._shared_connect_locks.get(upstream_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._shared_connect_locks[upstream_id] = lock
-        return lock
+    def _refuse_if_stopped(self, upstream: UpstreamDefinition) -> None:
+        """Keep a stopped upstream stopped.
+
+        Stop marks the upstream DISABLED, and only the admin's Start may
+        open it again; Start moves it to CONNECTING before it connects.
+        Anything else that would reopen it (a tool call's lazy attach, a
+        heal, a delayed tool refresh) used to start it right back up, and
+        a sandbox with it, minutes after the admin stopped it.
+
+        service_account only. OAuth tool calls run on each user's own
+        session, not this one, and an OAuth upstream can still read
+        DISABLED here after an admin signs in again, until the next
+        restart.
+        """
+        state = self._state.get(upstream.id)
+        if (
+            upstream.auth.mode == AuthMode.service_account
+            and state is not None
+            and state.state == UpstreamConnectionState.DISABLED
+        ):
+            raise UpstreamStopped(
+                f"upstream {upstream.id!r} is stopped; an admin's Start "
+                "opens it again",
+            )
 
     async def reconnect_shared_fresh(
         self,
         upstream: UpstreamDefinition,
         bearer_token: str | None = None,
         auth: httpx.Auth | None = None,
-    ) -> None:
+        *,
+        stale: ClientSession | None = None,
+    ) -> ClientSession:
         """Force a FRESH shared session, never a reused MCP process.
 
         Used to recover from a transport that connected but then went
         silent, and from the wake path that deliberately retires a
         frozen process. Either way the fix is the same: a new MCP
         process and a new ``initialize``.
+
+        ``stale`` is the session the caller saw fail. When the live
+        session is already a different one, someone else healed first;
+        it is returned as is. Reopening it again would replace the
+        process the other callers just moved onto, mid-call. Without
+        ``stale`` the live session is always replaced.
+
+        Heals that arrive while a connect is running join it: whatever
+        started it, that connect produces a new process.
+
+        A heal that fails marks the upstream FAILED (with the error), so
+        the dashboard stops showing a cached upstream as Ready; see
+        ``_record_reopen_failure``.
 
         The sandbox itself is KEPT. It used to be discarded here (the
         persisted ref was deleted so the service fell down its
@@ -1552,52 +1577,32 @@ class UpstreamClientManager:
         bug. If the sandbox is genuinely unusable, ``_try_reconnect``
         fails and the service fresh-creates anyway, so the escape
         hatch is unchanged.
-
-        Single-flight per upstream id (R1): concurrent healers — several
-        gateway dispatches that all stalled on the SAME poisoned shared
-        session and detected it at once — COALESCE onto the first
-        in-flight reconnect instead of each force-creating its own
-        sandbox. Without this, the dispatch-stall recovery would turn N
-        simultaneous stalls into N fresh sandboxes (N-1 orphaned) plus a
-        ref delete/re-persist race. A heal that arrives *after* a prior
-        reconnect already completed starts its own (correct: it reflects
-        a genuinely later stall, and the straggler window is bounded +
-        reaper-cleaned).
         """
-        existing = self._reconnect_fresh_tasks.get(upstream.id)
-        if existing is not None and not existing.done():
-            await existing
-            return
+        async def reopen() -> ClientSession:
+            # The persisted ref is deliberately left in place and
+            # ``_open_shared`` marks the live session preserve-on-close,
+            # so the reopen reuses this sandbox and only replaces the
+            # MCP process inside it.
+            logger.info(
+                "upstream.client.reconnect_shared_fresh",
+                upstream_id=upstream.id,
+            )
+            return await self._open_shared(
+                upstream, bearer_token=bearer_token, auth=auth,
+            )
 
-        async def _do_reconnect_fresh() -> None:
-            # Serialize the connect against a concurrent lazy
-            # ``ensure_shared_connected`` (R1): both call ``connect_shared``
-            # on the shared session. The heal is unconditional (the current
-            # session is poisoned, so force a fresh one even if it still
-            # looks live).
-            async with self._shared_connect_lock(upstream.id):
-                # The persisted ref is deliberately left in place and
-                # ``connect_shared`` marks the live session
-                # preserve-on-close, so the reopen reuses this
-                # sandbox and only replaces the MCP process inside it.
-                logger.info(
-                    "upstream.client.reconnect_shared_fresh",
-                    upstream_id=upstream.id,
-                )
-                await self.connect_shared(
-                    upstream, bearer_token=bearer_token, auth=auth,
-                )
-
-        task = asyncio.create_task(_do_reconnect_fresh())
-        self._reconnect_fresh_tasks[upstream.id] = task
         try:
-            await task
-        finally:
-            # Clear only when the entry still points at our task —
-            # protects against a later healer that overwrote it after
-            # ours completed (mirrors ``ensure_shared_connected``).
-            if self._reconnect_fresh_tasks.get(upstream.id) is task:
-                self._reconnect_fresh_tasks.pop(upstream.id, None)
+            return await self._shared_flights.renew(
+                upstream.id,
+                current=lambda: self._live_shared_session(upstream.id),
+                open_session=reopen,
+                stale=stale,
+            )
+        except Exception as exc:
+            await self._record_reopen_failure(
+                upstream.id, exc, reason="heal_failed",
+            )
+            raise
 
     async def _persist_cached_metadata(self, upstream_id: str) -> None:
         """Write ``server_info`` + ``self_description`` back to the
@@ -1643,105 +1648,107 @@ class UpstreamClientManager:
 
     async def ensure_shared_connected(
         self, upstream: UpstreamDefinition,
-    ) -> None:
-        """Lazily open a shared session if one isn't already live.
+    ) -> ClientSession:
+        """Return a live shared session, opening one lazily if needed.
 
         Called from request-time hot paths (e.g. the tool router)
         after boot deferred ``connect_shared`` for this upstream.
-        Single-flight per upstream id: concurrent callers join the
-        same in-flight task instead of stampeding ``Sandbox.connect``
-        and racing toward the same E2B-side wake.
+        Joins a connect already running for the upstream (a lazy attach,
+        a Start, a boot connect or a heal) instead of starting another
+        ``Sandbox.connect`` toward the same E2B-side wake.
 
-        Idempotent — when a shared session already exists, returns
-        immediately without touching E2B.
+        Idempotent: a live shared session is returned without touching
+        E2B. A session whose transport died is not live (see
+        ``_live_shared_session``) and is replaced.
 
         Crucially, lazy attach does NOT transition to CONNECTING:
         it's a request-scoped, in-band reconnect that the user
         experiences as latency on a single tool call, not a
-        cross-tab "Starting…" event.
+        cross-tab "Starting…" event. A lazy attach that fails marks the
+        upstream FAILED, so the dashboard shows the truth; the next
+        dispatch retries.
         """
-        state = self._state.get(upstream.id)
-        if state is not None and state.shared_session is not None:
-            # Reuse the existing shared session — UNLESS its transport
-            # has fatally died (sandbox expired / unrecoverable
-            # reattach). A dead session is still registered and looks
-            # present, but every send on it raises BrokenResourceError
-            # (and the first post-death request hangs out its timeout).
-            # Fall through to a full reconnect (connect_shared, which
-            # closes the zombie and opens a fresh sandbox) instead of
-            # handing the caller a dead session.
-            task = state.shared_task
-            if task is None or task.is_transport_alive():
-                return
-            logger.info(
-                "upstream.client.shared_session.dead_reconnecting",
-                upstream_id=upstream.id,
-            )
-        existing = self._lazy_connect_tasks.get(upstream.id)
-        if existing is not None and not existing.done():
-            await existing
-            return
-
-        async def _do_connect() -> None:
-            # Total wall-clock for the lazy-attach round-trip. Free
-            # to capture (the timer would exist anyway via ad-hoc
-            # operator stopwatching) and lets operators trend
-            # "is reuse getting slower" without stitching the
-            # three component events (envd_ready + reconnect.ok +
-            # shared_session.created) by hand.
-            started = asyncio.get_running_loop().time()
-            # Serialize against a concurrent heal (R1). After acquiring
-            # the lock, double-check: a ``reconnect_shared_fresh`` that ran
-            # while we waited may already have produced a live shared
-            # session — reuse it instead of opening a second sandbox.
-            async with self._shared_connect_lock(upstream.id):
-                state = self._state.get(upstream.id)
-                if state is not None and state.shared_session is not None:
-                    task = state.shared_task
-                    if task is None or task.is_transport_alive():
-                        logger.info(
-                            "upstream.client.lazy_connect.coalesced",
-                            upstream_id=upstream.id,
-                        )
-                        return
-                try:
-                    await self.connect_shared(upstream)
-                    logger.info(
-                        "upstream.client.lazy_connect.success",
-                        upstream_id=upstream.id,
-                        total_duration_ms=int(
-                            (asyncio.get_running_loop().time() - started) * 1000,
-                        ),
-                    )
-                except Exception as exc:
-                    # Lazy attach failed: the upstream isn't usable. Mark
-                    # FAILED so the dashboard refetch shows the truth. The
-                    # user's tool call will surface the underlying error;
-                    # the next dispatch retries via this same method.
-                    await self.transition_to_failed(
-                        upstream.id,
-                        last_failure=str(exc),
-                        reason="lazy_attach_failed",
-                    )
-                    logger.exception(
-                        "upstream.client.lazy_connect.failed",
-                        upstream_id=upstream.id,
-                        total_duration_ms=int(
-                            (asyncio.get_running_loop().time() - started) * 1000,
-                        ),
-                    )
-                    raise
-
-        task = asyncio.create_task(_do_connect())
-        self._lazy_connect_tasks[upstream.id] = task
         try:
-            await task
-        finally:
-            # Clear the entry only when it still points at our task —
-            # protects against a future caller that overwrote it after
-            # ours completed.
-            if self._lazy_connect_tasks.get(upstream.id) is task:
-                self._lazy_connect_tasks.pop(upstream.id, None)
+            return await self._shared_flights.ensure(
+                upstream.id,
+                current=lambda: self._live_shared_session(upstream.id),
+                open_session=lambda: self._lazy_attach(upstream),
+            )
+        except Exception as exc:
+            await self._record_reopen_failure(
+                upstream.id, exc, reason="lazy_attach_failed",
+            )
+            raise
+
+    async def _record_reopen_failure(
+        self, upstream_id: str, exc: Exception, *, reason: str,
+    ) -> None:
+        """Mark the upstream FAILED after a lazy attach or a heal failed,
+        whichever entry point started the connect it waited on.
+
+        This is the caller's policy, not the connect's: a caller that joins
+        a connect some other entry point started gets that connect's body,
+        and a cached upstream would otherwise stay DEFERRED_ATTACH, which
+        the dashboard shows as Ready. Skipped when Stop aborted the connect
+        (it owns the state), when a live session exists again, and when an
+        earlier waiter already recorded this same failure.
+
+        The admin's Start is left running: it waited on the same connect
+        and records the failure itself.
+        """
+        if isinstance(exc, ConnectAborted):
+            return
+        state = self._state.get(upstream_id)
+        if state is None or state.state == UpstreamConnectionState.DISABLED:
+            return
+        if self._live_shared_session(upstream_id) is not None:
+            return
+        failure = str(exc)
+        if (
+            state.state == UpstreamConnectionState.FAILED
+            and state.last_failure == failure
+        ):
+            return
+        await self.transition_to_failed(
+            upstream_id,
+            last_failure=failure,
+            reason=reason,
+            cancel_background=False,
+        )
+
+    async def _lazy_attach(self, upstream: UpstreamDefinition) -> ClientSession:
+        # Total wall-clock for the lazy-attach round-trip. Free to capture
+        # (the timer would exist anyway via ad-hoc operator stopwatching)
+        # and lets operators trend "is reuse getting slower" without
+        # stitching the three component events (envd_ready + reconnect.ok
+        # + shared_session.created) by hand.
+        started = asyncio.get_running_loop().time()
+        try:
+            session = await self._open_shared(upstream)
+        except ConnectAborted:
+            # A Stop ended this connect, or refused it (``UpstreamStopped``):
+            # expected, not a failure to alert on.
+            raise
+        except Exception:
+            # Marking the upstream FAILED is done by every lazy-attach
+            # caller (``_record_reopen_failure``), including ones that
+            # joined a connect some other entry point started.
+            logger.exception(
+                "upstream.client.lazy_connect.failed",
+                upstream_id=upstream.id,
+                total_duration_ms=int(
+                    (asyncio.get_running_loop().time() - started) * 1000,
+                ),
+            )
+            raise
+        logger.info(
+            "upstream.client.lazy_connect.success",
+            upstream_id=upstream.id,
+            total_duration_ms=int(
+                (asyncio.get_running_loop().time() - started) * 1000,
+            ),
+        )
+        return session
 
     def get_log_output(self, upstream_id: str) -> str | None:
         """Return captured stderr output for a stdio upstream, or None.
@@ -1909,79 +1916,29 @@ class UpstreamClientManager:
                 upstream_id=upstream.id,
             )
 
-    # ── Admin sessions ──────────────────────────────────────────────
-
-    def has_admin_session(self, upstream_id: str) -> bool:
-        state = self._state.get(upstream_id)
-        return state is not None and state.admin_session is not None
-
-    def get_admin_session(self, upstream_id: str) -> ClientSession:
-        """Return the admin session for an upstream, or raise KeyError."""
-        state = self._state.get(upstream_id)
-        if state is None or state.admin_session is None:
-            raise KeyError(
-                f"No active admin session for upstream '{upstream_id}'"
-            )
-        return state.admin_session
-
-    async def connect_admin_session(
-        self,
-        upstream: UpstreamDefinition,
-        auth: httpx.Auth | None = None,
-        bearer_token: str | None = None,
-    ) -> None:
-        """Create (or replace) the admin session for an upstream."""
-        await self._close_admin_inplace(upstream.id)
-
-        session, task = await self._create_task(
-            upstream, user_id=ADMIN_USER_ID,
-            bearer_token=bearer_token, auth=auth,
-        )
-        started_config_hash = await self.compute_runtime_hash(upstream)
-        self.transition_to_live_admin(
-            upstream.id,
-            session=session,
-            task=task,
-            server_info=task.server_info,
-            self_description=task.self_description,
-            started_config_hash=started_config_hash,
-        )
-        await self._persist_started_config_hash(
-            upstream.id, started_config_hash,
-        )
-        logger.info(
-            "upstream.client.admin_session.created",
-            upstream_id=upstream.id,
-        )
-
-    # ── Per-user sessions (non-admin) ───────────────────────────────
+    # ── Per-user sessions ───────────────────────────────────────────
 
     def get_session(
         self, upstream_id: str, user_id: str | None = None
     ) -> ClientSession:
         """Get a session for the given upstream.
 
-        Lookup order when ``user_id`` is provided:
+        With ``user_id``, that user's session first; otherwise, or if the
+        user has none, the shared session. Raises ``KeyError`` when
+        neither exists.
 
-          * ``ADMIN_USER_ID`` → admin session.
-          * real email       → per-user session dict.
-
-        If none is found under the requested ``user_id``, falls
-        through to the shared session. Callers that want the
-        admin-first-then-shared pattern (e.g. tool discovery) pass
-        ``user_id=ADMIN_USER_ID`` and catch the KeyError.
+        A per-user OAuth call must not use this: the fall-through would
+        run it on the shared discovery session, without the user's
+        sign-in. Use ``find_user_session``.
         """
-        state = self._state.get(upstream_id)
-        if user_id == ADMIN_USER_ID:
-            if state is not None and state.admin_session is not None:
-                return state.admin_session
-        elif user_id is not None:
+        if user_id is not None:
             key = (user_id, upstream_id)
             session = self._user_sessions.get(key)
             if session is not None:
                 self._user_session_last_used[key] = time.monotonic()
                 return session
 
+        state = self._state.get(upstream_id)
         if state is not None and state.shared_session is not None:
             return state.shared_session
         raise KeyError(
@@ -1991,86 +1948,186 @@ class UpstreamClientManager:
     def has_user_session(
         self, upstream_id: str, user_id: str
     ) -> bool:
-        """True if the given (user_id, upstream_id) pair has a live
-        session. Accepts ``ADMIN_USER_ID`` for callers that haven't
-        migrated to ``has_admin_session`` yet — routes appropriately."""
-        if user_id == ADMIN_USER_ID:
-            return self.has_admin_session(upstream_id)
+        """True if the given (user_id, upstream_id) pair has a session."""
         return (user_id, upstream_id) in self._user_sessions
 
-    async def connect_upstream_for_user(
+    def find_user_session(
+        self, upstream_id: str, user_id: str,
+    ) -> ClientSession | None:
+        """The user's own live session on ``upstream_id``, or ``None``.
+
+        Never falls back to the shared session (see ``get_session``).
+        Marks the session used, so the idle sweep keeps it.
+        """
+        key = (user_id, upstream_id)
+        session = self._user_sessions.get(key)
+        if session is None:
+            return None
+        task = self._user_tasks.get(key)
+        if task is not None and not task.is_transport_alive():
+            return None
+        self._user_session_last_used[key] = time.monotonic()
+        return session
+
+    async def ensure_user_session(
         self,
         upstream: UpstreamDefinition,
         user_id: str,
+        *,
         auth: httpx.Auth | None = None,
         bearer_token: str | None = None,
-    ) -> None:
-        """Create a per-user session (admin or real user).
+        reconnect: UserReconnect | None = None,
+    ) -> ClientSession:
+        """The user's live session, connecting only if there is none.
+
+        For callers that need a session because there was none: a tool
+        call, a stored-token reconnect. A caller that arrives while a
+        connect for the same user and upstream is running joins it; it
+        must never start a second one, because a connect begins by
+        closing the session there, which would be the one just built for
+        the first caller (Sentry MCPOLIS-BACKEND-W).
+
+        ``reconnect`` replaces the plain connect as the flight's body. It
+        receives the opener and connects through it, so the work around a
+        connect (a token refresh, the bookkeeping after it) runs once per
+        flight, not once per caller. A caller that joins a running connect
+        gets that connect's outcome; its own ``auth``, ``bearer_token`` and
+        ``reconnect`` are not used.
+
+        While a deliberate replacement (a fresh sign-in) is queued or
+        running, this waits for it and then decides again.
+        """
+        key = self._user_key(upstream, user_id)
+
+        async def body() -> ClientSession:
+            # Read as the connect starts, before any token refresh: an
+            # abort from here on discards what it builds.
+            aborts_at_start = self._user_flights.abort_count(key)
+
+            async def open_with(
+                session_auth: httpx.Auth | None,
+            ) -> ClientSession:
+                return await self._open_user_session(
+                    upstream, user_id, auth=session_auth,
+                    bearer_token=bearer_token, aborts_at_start=aborts_at_start,
+                )
+
+            if reconnect is not None:
+                return await reconnect(open_with)
+            return await open_with(auth)
+
+        return await self._user_flights.ensure(
+            key,
+            current=lambda: self.find_user_session(upstream.id, user_id),
+            open_session=body,
+        )
+
+    async def replace_user_session(
+        self,
+        upstream: UpstreamDefinition,
+        user_id: str,
+        *,
+        auth: httpx.Auth | None = None,
+        bearer_token: str | None = None,
+    ) -> ClientSession:
+        """Build the user's session again from THESE credentials, closing
+        the one there now.
+
+        For a fresh sign-in: reusing the existing session would keep
+        serving the old tokens, which may be revoked or belong to another
+        account. A connect already running is waited out, not joined, for
+        the same reason: it started from the old credentials. Callers who
+        arrive while this one runs join it and get the new session.
+        """
+        key = self._user_key(upstream, user_id)
+
+        async def body() -> ClientSession:
+            return await self._open_user_session(
+                upstream, user_id, auth=auth, bearer_token=bearer_token,
+                aborts_at_start=self._user_flights.abort_count(key),
+            )
+
+        return await self._user_flights.replace(key, open_session=body)
+
+    def _user_key(
+        self, upstream: UpstreamDefinition, user_id: str,
+    ) -> tuple[str, str]:
+        if user_id == ADMIN_USER_ID:
+            # The sentinel still keys some stored tokens, but it is not
+            # a person: admin sign-in runs under the slot owner's email.
+            # Fail loudly rather than build a session nobody can reach.
+            raise ValueError(
+                "ADMIN_USER_ID has no per-user session; use the slot "
+                "owner's email",
+            )
+        return (user_id, upstream.id)
+
+    async def _open_user_session(
+        self,
+        upstream: UpstreamDefinition,
+        user_id: str,
+        *,
+        auth: httpx.Auth | None,
+        bearer_token: str | None,
+        aborts_at_start: int,
+    ) -> ClientSession:
+        """Close the user's session if any, open a fresh one, record it.
+
+        ``aborts_at_start`` is the slot's abort count read when the connect
+        began (before any token refresh); an abort since then discards the
+        session instead of recording it.
+
+        Runs only as the body of a per-user flight, so it never overlaps
+        another open for the same user and upstream. Call
+        ``ensure_user_session`` or ``replace_user_session``, never this
+        directly.
 
         For MCP OAuth upstreams, pass ``auth`` (OAuthClientProvider).
         For simple bearer token upstreams, pass ``bearer_token``.
-
-        Routes ``user_id == ADMIN_USER_ID`` to the admin-session
-        slot on the upstream-state record, so admin bookkeeping
-        (always-on, not swept) stays separate from per-user
-        bookkeeping (swept after idle timeout).
         """
-        if user_id == ADMIN_USER_ID:
-            await self.connect_admin_session(
-                upstream, auth=auth, bearer_token=bearer_token,
-            )
-            return
-
         key = (user_id, upstream.id)
-
         if upstream.transport == TransportType.stdio:
             logger.warning(
                 "upstream.client.per_user_stdio.subprocess_per_user",
                 upstream_id=upstream.id,
                 user=user_id,
             )
+        # Not ``disconnect_user_session``: that also stops the connect
+        # running for this slot, which is this one.
+        await self._drop_user_session(key)
 
-        # Per-key lock: serialize concurrent connects for the same
-        # ``(user, upstream)``. Without this, two callers race their
-        # disconnect+create and the first caller's task gets
-        # overwritten in the dicts without anyone awaiting its
-        # ``close()`` — a silent transport leak.
-        lock = self._user_connect_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._user_connect_locks[key] = lock
-        async with lock:
-            # Tear down existing session if any. Under contention,
-            # this observes and closes the prior caller's task —
-            # the disconnect path that the lock makes visible.
-            await self.disconnect_user_session(upstream.id, user_id)
+        session, task = await self._create_task(
+            upstream, user_id=user_id,
+            bearer_token=bearer_token, auth=auth,
+        )
+        if self._user_flights.aborted_since(key, aborts_at_start):
+            # A Disconnect aborted this connect and its cancel was lost on
+            # the way: recording the session now would undo the Disconnect.
+            await self._safe_close_task(task, "user", upstream.id)
+            raise ConnectAborted("the user connect was aborted while it ran")
+        self._user_sessions[key] = session
+        self._user_tasks[key] = task
+        self._user_session_last_used[key] = time.monotonic()
 
-            session, task = await self._create_task(
-                upstream, user_id=user_id,
-                bearer_token=bearer_token, auth=auth,
+        # The per-user session also carries upstream-level metadata
+        # — capture it on the state record so dashboard reads
+        # benefit (server_info / self_description survive sweeps
+        # and dropped per-user sessions).
+        if (
+            task.server_info is not None
+            or task.self_description is not None
+        ):
+            self._merge_metadata_into_state(
+                upstream.id,
+                server_info=task.server_info,
+                self_description=task.self_description,
             )
-            self._user_sessions[key] = session
-            self._user_tasks[key] = task
-            self._user_session_last_used[key] = time.monotonic()
-
-            # The per-user session also carries upstream-level metadata
-            # — capture it on the state record so dashboard reads
-            # benefit (server_info / self_description survive sweeps
-            # and dropped per-user sessions).
-            if (
-                task.server_info is not None
-                or task.self_description is not None
-            ):
-                self._merge_metadata_into_state(
-                    upstream.id,
-                    server_info=task.server_info,
-                    self_description=task.self_description,
-                )
-            logger.info(
-                "upstream.client.user_session.created",
-                upstream_id=upstream.id,
-                user=user_id,
-            )
+        logger.info(
+            "upstream.client.user_session.created",
+            upstream_id=upstream.id,
+            user=user_id,
+        )
+        return session
 
     def _merge_metadata_into_state(
         self,
@@ -2105,19 +2162,56 @@ class UpstreamClientManager:
     async def disconnect_user_session(
         self, upstream_id: str, user_id: str
     ) -> None:
-        """Tear down a per-user session. Routes admin to
-        ``_close_admin_inplace``; everyone else to the user session
-        dict.
+        """Tear down a per-user session, whichever session is there, and
+        stop a connect still running for it.
 
-        Logs ``Closed per-user session`` at INFO when a non-admin
-        session was actually present — the counterpart to ``Created
-        per-user session`` emitted on construction, so every
-        per-user lifetime is bracketed in prod logs.
+        For deliberate teardowns: a user or admin Disconnect. A connect
+        already running read the sign-in before the teardown, so unless
+        it is stopped it lands a session right after it, and the user is
+        connected again without having signed in. Returns once that
+        connect has let go of its transport.
+
+        Code that tears down a session because it saw THAT session fail
+        must use ``evict_user_session_if_current``: by the time it acts,
+        the session may already have been replaced by a fresh one that
+        others are using, and a connect still running is the replacement,
+        which must not be stopped either.
+
+        Logs ``upstream.client.user_session.closed`` when a session was
+        actually present, the counterpart of ``...user_session.created``,
+        so every per-user lifetime is bracketed in prod logs.
         """
-        if user_id == ADMIN_USER_ID:
-            await self._close_admin_inplace(upstream_id)
-            return
         key = (user_id, upstream_id)
+        aborted = self._user_flights.abort(key)
+        await self._drop_user_session(key)
+        if aborted is not None:
+            await _wait_until_unwound([aborted])
+
+    async def evict_user_session_if_current(
+        self, upstream_id: str, user_id: str, session: ClientSession,
+    ) -> bool:
+        """Tear down ``session`` if it is still the user's session.
+
+        For code that saw ``session`` fail (a stalled call, a failed
+        liveness probe, an idle sweep). If the session was replaced in
+        the meantime, the replacement is left alone: it was just built,
+        someone may already be using it, and evicting it would force yet
+        another reconnect. Returns whether ``session`` was torn down.
+        """
+        key = (user_id, upstream_id)
+        if self._user_sessions.get(key) is not session:
+            logger.info(
+                "upstream.client.user_session.eviction_skipped",
+                upstream_id=upstream_id,
+                user=user_id,
+                reason="replaced",
+            )
+            return False
+        await self._drop_user_session(key)
+        return True
+
+    async def _drop_user_session(self, key: tuple[str, str]) -> None:
+        user_id, upstream_id = key
         had_session = key in self._user_sessions
         self._user_sessions.pop(key, None)
         self._user_session_last_used.pop(key, None)
@@ -2139,23 +2233,31 @@ class UpstreamClientManager:
             )
 
     async def disconnect_all_user_sessions(self, user_id: str) -> int:
-        """Tear down all per-user sessions for a given user. Returns count.
+        """Tear down all of a user's sessions (the user left the org),
+        and stop every connect still running for them, including one for
+        an upstream where they have no session yet. Returns the number of
+        sessions closed."""
+        return await self._drop_user_sessions_where(
+            lambda key: key[0] == user_id,
+        )
 
-        Never touches admin sessions — even if called with
-        ``ADMIN_USER_ID`` it returns 0 rather than nuking every
-        admin session, because "all sessions for this user" is a
-        real-user concept and that sentinel indicates the caller has
-        the wrong mental model."""
-        if user_id == ADMIN_USER_ID:
-            return 0
-        keys = [k for k in self._user_sessions if k[0] == user_id]
+    async def _drop_user_sessions_where(
+        self, matches: Callable[[tuple[str, str]], bool],
+    ) -> int:
+        """Deliberate teardown of every per-user slot ``matches`` selects:
+        stop the connects still running for them, drop their sessions, and
+        return once the stopped connects have let go of their transport.
+        Returns the number of sessions dropped."""
+        aborted = self._user_flights.abort_matching(matches)
+        keys = [k for k in self._user_sessions if matches(k)]
         for key in keys:
-            await self.disconnect_user_session(key[1], user_id)
+            await self._drop_user_session(key)
+        await _wait_until_unwound(aborted)
         return len(keys)
 
     @property
     def connected_upstream_ids(self) -> list[str]:
-        """Upstream IDs with a LIVE session (shared or admin).
+        """Upstream IDs with a LIVE shared session.
 
         Deferred-attach upstreams are deliberately excluded — this
         accessor backs ``ToolRegistry.refresh_all``, which calls
@@ -2178,7 +2280,6 @@ class UpstreamClientManager:
 
         Includes:
         - upstreams with a live shared session,
-        - upstreams with a live admin session,
         - deferred-attach upstreams (cache populated, lazy reattach
           on first tool call).
 
@@ -2209,10 +2310,19 @@ class UpstreamClientManager:
             )
 
     async def unregister_upstream(self, upstream_id: str) -> None:
-        """Remove an upstream definition and close its sessions."""
+        """Remove an upstream definition and close its sessions: the
+        shared one and every user's, including connects still running.
+
+        Users' sessions used to outlive the upstream until the idle sweep,
+        and one added again under the same id was handed the old session,
+        built from the old configuration.
+        """
         self._upstreams.pop(upstream_id, None)
         await self.transition_to_disabled(
             upstream_id, reason="unregister_upstream",
+        )
+        await self._drop_user_sessions_where(
+            lambda key: key[1] == upstream_id,
         )
         # Drop the state record entirely — the upstream no longer
         # exists, so reads should not return a stale DISABLED entry.
@@ -2223,9 +2333,10 @@ class UpstreamClientManager:
         upstream: UpstreamDefinition,
         bearer_token: str | None = None,
         auth: httpx.Auth | None = None,
-    ) -> None:
-        """Connect to a single upstream and store the shared session."""
-        await self.connect_shared(
+    ) -> ClientSession:
+        """Connect to a single upstream and store the shared session (the
+        dashboard's Start). Same rules as ``connect_shared``."""
+        return await self.connect_shared(
             upstream, bearer_token=bearer_token, auth=auth
         )
 
@@ -2312,7 +2423,7 @@ class UpstreamClientManager:
     async def disconnect_upstream(
         self, upstream_id: str, *, reset_state: bool = True,
     ) -> None:
-        """Disconnect every upstream-scoped session (shared + admin).
+        """Disconnect the upstream's shared session and mark it stopped.
 
         Does NOT touch real per-user sessions — those belong to
         individual users and survive an admin-initiated upstream
@@ -2332,62 +2443,13 @@ class UpstreamClientManager:
         )
         _ = reset_state
 
-    async def kill_all_for_upstream(self, upstream_id: str) -> int:
-        """Close every live session for an upstream — shared, admin,
-        AND per-user. Used by the Phase H kill-switch enforcement
-        path: when an admin flips a switch, "no sandbox" must mean
-        no sandbox, including ones already running for individual
-        users.
-
-        Returns the number of sessions closed (for the audit trail).
-        """
-        closed = 0
-        state = self._state.get(upstream_id)
-        if state is not None:
-            if state.shared_task is not None:
-                closed += 1
-            if state.admin_task is not None:
-                closed += 1
-        # Mark the upstream DISABLED — drops shared + admin and
-        # cancels any in-flight reconnect.
-        await self.transition_to_disabled(
-            upstream_id, reason="kill_switch",
-        )
-        # Per-user: walk both maps, reaping any keyed by this upstream.
-        per_user_keys = [
-            k for k in self._user_tasks
-            if k[1] == upstream_id
-        ]
-        for key in per_user_keys:
-            task = self._user_tasks.pop(key, None)
-            self._user_sessions.pop(key, None)
-            self._user_session_last_used.pop(key, None)
-            if task is not None:
-                try:
-                    await task.close()
-                except Exception:
-                    logger.warning(
-                        "upstream.client.kill.close_failed",
-                        upstream_id=upstream_id,
-                        user_id=key[0],
-                        exc_info=True,
-                    )
-                closed += 1
-        if closed:
-            logger.info(
-                "upstream.client.kill.completed",
-                upstream_id=upstream_id,
-                closed_sessions=closed,
-            )
-        return closed
-
     def is_connected(self, upstream_id: str) -> bool:
         """True iff the upstream is reachable for tool calls.
 
         Backs the UI's "is this MCP reachable?" gate. Two states
         return True:
 
-        - LIVE: a shared and/or admin session is live.
+        - LIVE: the shared session is live.
         - DEFERRED_ATTACH: cached metadata satisfies dashboard reads
           while ``ensure_shared_connected`` will reattach lazily on
           the first tool call.
@@ -2412,8 +2474,8 @@ class UpstreamClientManager:
         Read-only escape hatch — used by tests pinning transition
         side effects and by debug introspection. Production readers
         should prefer the typed accessors (``is_connected``,
-        ``ready_upstream_ids``, ``is_starting``, ``has_admin_session``,
-        ``get_admin_session``, ``get_session``, ``get_server_info``,
+        ``ready_upstream_ids``, ``is_starting``, ``get_session``,
+        ``get_server_info``,
         ``get_self_description``) so the storage shape can evolve
         without churning callers.
         """
@@ -2422,10 +2484,8 @@ class UpstreamClientManager:
     def iter_live_oauth_sessions(
         self, oauth_upstream_ids: set[str],
     ) -> list[tuple[str, str, ClientSession]]:
-        """Snapshot every live OAuth session as ``(upstream_id,
-        user_id, session)`` triples. Admin sessions surface under
-        ``ADMIN_USER_ID``; per-user sessions surface under the real
-        user_id.
+        """Snapshot every live per-user session on an OAuth upstream as
+        ``(upstream_id, user_id, session)`` triples.
 
         Read-only: the caller must not mutate manager state via the
         returned session objects. The ``oauth_upstream_ids`` filter
@@ -2434,18 +2494,15 @@ class UpstreamClientManager:
         be pure noise.
 
         Returns a snapshot (new list) so iteration is safe against
-        concurrent connect/disconnect; callers that want to act on a
-        stale entry should go through ``disconnect_user_session`` /
-        ``_close_admin_inplace`` with appropriate locking.
+        concurrent connect/disconnect. A caller that acts on an entry
+        later must go through ``evict_user_session_if_current``: the
+        session may have been replaced in the meantime.
         """
-        result: list[tuple[str, str, ClientSession]] = []
-        for upstream_id, state in self._state.items():
-            if upstream_id in oauth_upstream_ids and state.admin_session is not None:
-                result.append((upstream_id, ADMIN_USER_ID, state.admin_session))
-        for (user_id, upstream_id), session in self._user_sessions.items():
-            if upstream_id in oauth_upstream_ids:
-                result.append((upstream_id, user_id, session))
-        return result
+        return [
+            (upstream_id, user_id, session)
+            for (user_id, upstream_id), session in self._user_sessions.items()
+            if upstream_id in oauth_upstream_ids
+        ]
 
     def any_user_session_for_upstream(
         self, upstream_id: str,
@@ -2456,9 +2513,7 @@ class UpstreamClientManager:
         caller does not yet know which user's session to consult.
         Picks a session deterministically (sorted by user_id) so test
         runs are stable; production callers should not rely on the
-        exact user the session belongs to. Skips admin sessions on
-        purpose — admin_oauth sessions live under their owner's
-        email after Phase 2.
+        exact user the session belongs to.
         """
         candidates: list[tuple[str, ClientSession]] = []
         for (user_id, uid), session in self._user_sessions.items():
@@ -2505,7 +2560,7 @@ class UpstreamClientManager:
     ) -> UpstreamSelfDescription | None:
         """Return the upstream's captured ``initialize`` self-description.
 
-        Recorded by every connect path (shared / admin / per-user) right
+        Recorded by every connect path (shared / per-user) right
         after a successful ``session.initialize()``. Returns ``None``
         until a connection has succeeded at least once for this upstream.
         """
@@ -2532,21 +2587,28 @@ class UpstreamClientManager:
             pass
 
     async def _sweep_idle_sessions(self) -> None:
-        # Only iterates user sessions. Admin sessions live in the
-        # state record and are exempt from idle cleanup by
-        # construction — no string check needed here.
         now = time.monotonic()
-        to_disconnect: list[tuple[str, str]] = []
-        for (user_id, upstream_id), last_used in (
-            self._user_session_last_used.items()
-        ):
-            if now - last_used > USER_SESSION_IDLE_TIMEOUT:
-                to_disconnect.append((user_id, upstream_id))
+        idle: list[tuple[tuple[str, str], ClientSession]] = []
+        for key, last_used in self._user_session_last_used.items():
+            session = self._user_sessions.get(key)
+            if session is not None and now - last_used > USER_SESSION_IDLE_TIMEOUT:
+                idle.append((key, session))
 
-        for user_id, upstream_id in to_disconnect:
+        for (user_id, upstream_id), session in idle:
+            # Closing the previous one awaited. Meanwhile this session may
+            # have been used, or replaced by a fresh one: check again, and
+            # evict only the session that was listed as idle.
+            last_used = self._user_session_last_used.get((user_id, upstream_id))
+            if (
+                last_used is None
+                or time.monotonic() - last_used <= USER_SESSION_IDLE_TIMEOUT
+            ):
+                continue
             logger.info(
                 "upstream.client.user_session.idle_disconnect",
                 upstream_id=upstream_id,
                 user=user_id,
             )
-            await self.disconnect_user_session(upstream_id, user_id)
+            await self.evict_user_session_if_current(
+                upstream_id, user_id, session,
+            )

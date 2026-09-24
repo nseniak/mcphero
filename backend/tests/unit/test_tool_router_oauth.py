@@ -437,16 +437,16 @@ async def test_per_user_oauth_reconnects_from_stored_tokens(
 
     mock_session = make_mock_session()
 
-    async def fake_reconnect(**kwargs: object) -> DisconnectReason | None:
+    async def fake_reconnect(**kwargs: object) -> Any:
         # Simulate a successful reconnect: populate the per-user
         # session the way the real implementation does.
         key = ("alice@co.com", "slack")
         client_manager._user_sessions[key] = mock_session
         client_manager._user_session_last_used[key] = 0.0
-        return None
+        return mock_session
 
     monkeypatch.setattr(
-        ucs_module, "reconnect_with_stored_tokens", fake_reconnect
+        ucs_module, "_reconnect_from_stored_tokens", fake_reconnect
     )
 
     result = await router.route_call(
@@ -470,11 +470,11 @@ async def test_per_user_oauth_no_stored_tokens_returns_signin_error(
         tmp_path, auth_mode=AuthMode.per_user_oauth
     )
 
-    async def fake_reconnect(**kwargs: object) -> DisconnectReason | None:
+    async def fake_reconnect(**kwargs: object) -> DisconnectReason:
         return DisconnectReason.no_tokens
 
     monkeypatch.setattr(
-        ucs_module, "reconnect_with_stored_tokens", fake_reconnect
+        ucs_module, "_reconnect_from_stored_tokens", fake_reconnect
     )
 
     result = await router.route_call(
@@ -535,19 +535,18 @@ async def test_admin_oauth_passes_pool_admin_email_regardless_of_caller(
 
     seen: dict[str, object] = {}
 
-    async def capture_reconnect(**kwargs: object) -> DisconnectReason | None:
+    async def capture_reconnect(**kwargs: object) -> Any:
         seen.update(kwargs)
         # Populate the admin's per-user session so the router reaches
         # its happy-path return branch.
-        client_manager._user_sessions[("admin@co.com", "slack")] = (
-            make_mock_session()
-        )
+        session = make_mock_session()
+        client_manager._user_sessions[("admin@co.com", "slack")] = session
         client_manager._user_session_last_used[("admin@co.com", "slack")] = 0.0
-        return None
+        return session
 
     monkeypatch.setattr(
         ucs_module,
-        "reconnect_with_stored_tokens",
+        "_reconnect_from_stored_tokens",
         capture_reconnect,
     )
 
@@ -580,16 +579,17 @@ async def test_per_user_oauth_passes_callers_user_id(
 
     seen: dict[str, object] = {}
 
-    async def capture_reconnect(**kwargs: object) -> DisconnectReason | None:
+    async def capture_reconnect(**kwargs: object) -> Any:
         seen.update(kwargs)
         key = ("alice@co.com", "slack")
-        client_manager._user_sessions[key] = make_mock_session()
+        session = make_mock_session()
+        client_manager._user_sessions[key] = session
         client_manager._user_session_last_used[key] = 0.0
-        return None
+        return session
 
     monkeypatch.setattr(
         ucs_module,
-        "reconnect_with_stored_tokens",
+        "_reconnect_from_stored_tokens",
         capture_reconnect,
     )
 
@@ -702,21 +702,22 @@ def install_fake_reconnect(
     upstream_id: str,
     session_factory: Callable[[], Any],
 ) -> list[str]:
-    """Patch ``reconnect_with_stored_tokens`` to act like a successful
-    stored-token reconnect: install a fresh session for the effective
-    user. Returns the list of effective users it was called with."""
+    """Stand in for one stored-token reconnect (the token dance and the
+    connect): install a fresh session for the effective user. The real
+    shared-reconnect logic around it still runs, so a live session is
+    reused and only a missing one reconnects. Returns the list of
+    effective users a reconnect ran for."""
     reconnects: list[str] = []
 
-    async def fake_reconnect(**kwargs: Any) -> DisconnectReason | None:
+    async def fake_reconnect(**kwargs: Any) -> Any:
         effective_user = kwargs["effective_user"]
         reconnects.append(effective_user)
-        install_session(
-            client_manager, effective_user, upstream_id, session_factory(),
-        )
-        return None
+        session = session_factory()
+        install_session(client_manager, effective_user, upstream_id, session)
+        return session
 
     monkeypatch.setattr(
-        ucs_module, "reconnect_with_stored_tokens", fake_reconnect
+        ucs_module, "_reconnect_from_stored_tokens", fake_reconnect
     )
     return reconnects
 

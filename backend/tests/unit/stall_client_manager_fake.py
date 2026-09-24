@@ -1,9 +1,10 @@
 """Shared fake for the ``UpstreamClientManager`` slice the router's
 stall-recovery loop touches.
 
-Three test modules grew their own near-identical copy of this
+Five test modules grew their own near-identical copy of this
 (``test_tool_router``, ``test_resource_prompt_router``,
-``test_read_prompt_retry_double_execute``). Every time
+``test_read_prompt_retry_double_execute``, ``test_policy_notifier``,
+``test_acquire_and_refresh_with_recovery``). Every time
 ``_dispatch_with_recovery`` reached for one more manager method, all
 three broke the same way with an ``AttributeError`` that says nothing
 about the behaviour under test. One fake means the next such addition
@@ -30,24 +31,31 @@ class StallClientManagerFake:
         *,
         heal_error: Exception | None = None,
     ) -> None:
-        self._session = session
+        self.session = session
         self._heal_error = heal_error
         self.ensure_calls = 0
         self.fresh_calls = 0
+        # The ``stale`` session each heal was told had stalled, in order.
+        self.stale_seen: list[Any] = []
 
-    async def ensure_shared_connected(self, upstream: Any) -> None:
+    async def ensure_shared_connected(self, upstream: Any) -> Any:
         del upstream
         self.ensure_calls += 1
+        return self.session
 
     def get_session(self, upstream_id: str, user_id: str | None = None) -> Any:
         del upstream_id, user_id
-        return self._session
+        return self.session
 
-    async def reconnect_shared_fresh(self, upstream: Any) -> None:
+    async def reconnect_shared_fresh(
+        self, upstream: Any, *, stale: Any = None,
+    ) -> Any:
         del upstream
+        self.stale_seen.append(stale)
         self.fresh_calls += 1
         if self._heal_error is not None:
             raise self._heal_error
+        return self.session
 
 
 def make_stall_client_manager(

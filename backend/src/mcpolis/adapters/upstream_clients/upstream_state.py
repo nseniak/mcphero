@@ -44,8 +44,8 @@ class UpstreamConnectionState(StrEnum):
     Mutually exclusive — every upstream in ``_state`` is in exactly
     one of these:
 
-    - ``DISABLED``: admin Stopped or auto-disabled after a connect
-      failure. ``last_failure`` may be set when auto-disabled.
+    - ``DISABLED``: an admin stopped it (or just added it, stopped).
+      Only their Start opens a service_account upstream again.
     - ``DEFERRED_ATTACH``: persistence carries cached metadata; no
       live session. ``ensure_shared_connected`` reattaches lazily on
       the first tool dispatch. From the user's POV the upstream is
@@ -53,10 +53,9 @@ class UpstreamConnectionState(StrEnum):
     - ``CONNECTING``: an admin clicked Start/Reconnect and the
       fire-and-forget reconnect task is in flight. Drives the
       dashboard's "Starting…" disabled-button state.
-    - ``LIVE``: at least one usable upstream-level session exists
-      (shared discovery and/or admin OAuth). End users can dispatch
-      tool calls (directly for service_account / shared OAuth, or
-      after personal authentication for per_user_oauth).
+    - ``LIVE``: the shared session is live. End users can dispatch
+      tool calls (directly for service_account, or after their own
+      sign-in for the OAuth modes, whose sessions are per user).
     - ``FAILED``: no working connection. Either a connect attempt
       failed (``last_failure`` set) or the upstream was registered
       but never connected (``last_failure`` is ``None``).
@@ -79,29 +78,19 @@ class UpstreamState:
 
     Slot semantics (invariants enforced by ``_transition_to_*``):
 
-    - ``state == LIVE`` ⇒ at least one of ``shared_session`` /
-      ``admin_session`` is set.
+    - ``state == LIVE`` ⇒ ``shared_session`` is set.
     - ``state == DEFERRED_ATTACH`` ⇒ ``server_info`` AND
       ``self_description`` are set; no live sessions.
     - ``state == CONNECTING`` ⇒ ``background_task`` is set and not
       done. Cached metadata (if any) is preserved so dashboard
       reads still resolve while reconnecting.
-    - ``state == DISABLED`` ⇒ no live sessions. ``last_failure`` is
-      set when DISABLED came from auto-disable-on-failure, ``None``
-      when DISABLED is from an explicit admin Stop.
+    - ``state == DISABLED`` ⇒ no live sessions.
     - ``state == FAILED`` ⇒ no live sessions.
-
-    Both ``shared_session`` and ``admin_session`` slots can be live
-    simultaneously for OAuth upstreams: discovery shared connect
-    populates shared_session; admin OAuth populates admin_session.
-    Closing one doesn't drop the other.
     """
 
     state: UpstreamConnectionState
     shared_session: ClientSession | None = None
     shared_task: ConnectionTask | None = None
-    admin_session: ClientSession | None = None
-    admin_task: ConnectionTask | None = None
     server_info: ServerInfo | None = None
     self_description: UpstreamSelfDescription | None = None
     background_task: asyncio.Task[None] | None = None
@@ -117,4 +106,4 @@ class UpstreamState:
 
     @property
     def has_any_session(self) -> bool:
-        return self.shared_session is not None or self.admin_session is not None
+        return self.shared_session is not None

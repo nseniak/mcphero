@@ -2,16 +2,16 @@
 
 Every transition method (``transition_to_disabled``,
 ``transition_to_failed``, ``transition_to_deferred_attach``,
-``transition_to_connecting``, ``transition_to_live_shared``,
-``transition_to_live_admin``) is exercised here for:
+``transition_to_connecting``, ``transition_to_live_shared``) is
+exercised here for:
 
 - the resulting ``state.state`` enum,
 - which slots (sessions, tasks, metadata, background_task,
   last_failure) are preserved vs cleared,
 - side effects on the OLD state record (close awaits + cancellation).
 
-Plus the close-inplace helpers (``_close_shared_inplace`` /
-``_close_admin_inplace``) — they're not transitions in the strict
+Plus the close-inplace helper (``_close_shared_inplace``) — it is
+not a transition in the strict
 sense (they recompute the resulting phase from what's left) but
 they're load-bearing for ``connect_shared`` / ``disconnect_upstream``
 correctness, so the recompute rule needs explicit tests.
@@ -87,7 +87,6 @@ def test_constructor_initializes_each_upstream_to_failed_none() -> None:
         assert state.state == UpstreamConnectionState.FAILED
         assert state.last_failure is None
         assert state.shared_session is None
-        assert state.admin_session is None
         assert state.background_task is None
 
 
@@ -108,13 +107,8 @@ def test_register_upstream_creates_state_record_lazily() -> None:
 async def test_disabled_drops_sessions_and_metadata() -> None:
     mgr = _mgr()
     shared_task = _stub_task("shared")
-    admin_task = _stub_task("admin")
     mgr.transition_to_live_shared(
         "u", session=_stub_session(), task=shared_task,
-        server_info=_server_info(), self_description=_self_description(),
-    )
-    mgr.transition_to_live_admin(
-        "u", session=_stub_session(), task=admin_task,
         server_info=_server_info(), self_description=_self_description(),
     )
     assert mgr.get_state("u").state == UpstreamConnectionState.LIVE  # type: ignore[union-attr]
@@ -128,28 +122,11 @@ async def test_disabled_drops_sessions_and_metadata() -> None:
     # metadata is lost (admin Stop = "this upstream is not ready").
     assert state.shared_session is None
     assert state.shared_task is None
-    assert state.admin_session is None
-    assert state.admin_task is None
     assert state.server_info is None
     assert state.self_description is None
     assert state.background_task is None
     # The sessions' tasks were closed.
     shared_task.close.assert_awaited_once()
-    admin_task.close.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_disabled_with_last_failure_records_context() -> None:
-    """Auto-disable-on-failure carries the failure reason on the
-    DISABLED record so the dashboard can surface it."""
-    mgr = _mgr()
-    await mgr.transition_to_disabled(
-        "u", last_failure="boom", reason="auto_disable_on_failure",
-    )
-    state = mgr.get_state("u")
-    assert state is not None
-    assert state.state == UpstreamConnectionState.DISABLED
-    assert state.last_failure == "boom"
 
 
 @pytest.mark.asyncio
@@ -196,7 +173,6 @@ async def test_failed_preserves_metadata_for_retry_visibility() -> None:
     assert state.last_failure == "oops"
     # Sessions dropped.
     assert state.shared_session is None
-    assert state.admin_session is None
     # Metadata preserved.
     assert state.server_info is not None
     assert state.self_description is not None
@@ -365,31 +341,6 @@ def test_live_shared_sets_session_and_task_marks_live() -> None:
     assert state.self_description is not None
 
 
-def test_live_shared_preserves_existing_admin_session() -> None:
-    """OAuth upstreams can have BOTH a shared discovery session AND
-    an admin OAuth session simultaneously. Adding a shared MUST
-    preserve the admin slot."""
-    mgr = _mgr()
-    admin_sess = _stub_session("admin")
-    admin_task = _stub_task("admin")
-    mgr.transition_to_live_admin(
-        "u", session=admin_sess, task=admin_task,
-        server_info=None, self_description=None,
-    )
-    mgr.transition_to_live_shared(
-        "u",
-        session=_stub_session("shared"),
-        task=_stub_task("shared"),
-        server_info=None, self_description=None,
-    )
-    state = mgr.get_state("u")
-    assert state is not None
-    assert state.state == UpstreamConnectionState.LIVE
-    assert state.shared_session is not None
-    assert state.admin_session is admin_sess
-    assert state.admin_task is admin_task
-
-
 def test_live_shared_clears_background_task_and_last_failure() -> None:
     """Successful connect → drop stale CONNECTING/FAILED context."""
     mgr = _mgr()
@@ -480,74 +431,12 @@ def test_live_shared_preserves_metadata_when_new_task_lacks_it() -> None:
     assert state.self_description is not None
 
 
-# ── transition_to_live_admin ──────────────────────────────────────────
-
-
-def test_live_admin_sets_session_and_task_marks_live() -> None:
-    mgr = _mgr()
-    sess = _stub_session("admin")
-    task = _stub_task("admin")
-    mgr.transition_to_live_admin(
-        "u", session=sess, task=task,
-        server_info=None, self_description=None,
-    )
-    state = mgr.get_state("u")
-    assert state is not None
-    assert state.state == UpstreamConnectionState.LIVE
-    assert state.admin_session is sess
-    assert state.admin_task is task
-    assert state.shared_session is None  # admin-only LIVE
-
-
-def test_live_admin_preserves_existing_shared_session() -> None:
-    """Symmetric to ``test_live_shared_preserves_existing_admin_session``."""
-    mgr = _mgr()
-    shared_sess = _stub_session("shared")
-    shared_task = _stub_task("shared")
-    mgr.transition_to_live_shared(
-        "u", session=shared_sess, task=shared_task,
-        server_info=None, self_description=None,
-    )
-    mgr.transition_to_live_admin(
-        "u",
-        session=_stub_session("admin"),
-        task=_stub_task("admin"),
-        server_info=None, self_description=None,
-    )
-    state = mgr.get_state("u")
-    assert state is not None
-    assert state.state == UpstreamConnectionState.LIVE
-    assert state.shared_session is shared_sess
-    assert state.shared_task is shared_task
-    assert state.admin_session is not None
-
-
 # ── _close_shared_inplace recompute ───────────────────────────────────
 #
 # After dropping the shared session, the resulting state depends on
 # what's left:
-#   - admin still present → LIVE (admin satisfies "usable")
 #   - cached metadata present → DEFERRED_ATTACH (cache satisfies UI)
 #   - nothing left → FAILED (or DISABLED if it already was)
-
-
-@pytest.mark.asyncio
-async def test_close_shared_inplace_keeps_live_when_admin_present() -> None:
-    mgr = _mgr()
-    mgr.transition_to_live_shared(
-        "u", session=_stub_session(), task=_stub_task(),
-        server_info=None, self_description=None,
-    )
-    mgr.transition_to_live_admin(
-        "u", session=_stub_session(), task=_stub_task(),
-        server_info=None, self_description=None,
-    )
-    await mgr._close_shared_inplace("u")  # pyright: ignore[reportPrivateUsage]
-    state = mgr.get_state("u")
-    assert state is not None
-    assert state.state == UpstreamConnectionState.LIVE
-    assert state.shared_session is None
-    assert state.admin_session is not None
 
 
 @pytest.mark.asyncio
@@ -569,7 +458,7 @@ async def test_close_shared_inplace_falls_back_to_deferred_when_metadata_present
 
 @pytest.mark.asyncio
 async def test_close_shared_inplace_falls_back_to_failed_when_nothing_left() -> None:
-    """No admin, no metadata → FAILED. last_failure stays None
+    """No metadata → FAILED. last_failure stays None
     (this isn't a connect failure, it's an explicit close)."""
     mgr = _mgr()
     mgr.transition_to_live_shared(
@@ -629,29 +518,6 @@ async def test_close_shared_inplace_keeps_connecting_when_bg_task_in_flight() ->
         bg.cancel()
 
 
-# ── _close_admin_inplace recompute ────────────────────────────────────
-# Symmetric to the shared variants above; one canonical case here.
-
-
-@pytest.mark.asyncio
-async def test_close_admin_inplace_keeps_live_when_shared_present() -> None:
-    mgr = _mgr()
-    mgr.transition_to_live_shared(
-        "u", session=_stub_session(), task=_stub_task(),
-        server_info=None, self_description=None,
-    )
-    mgr.transition_to_live_admin(
-        "u", session=_stub_session(), task=_stub_task(),
-        server_info=None, self_description=None,
-    )
-    await mgr._close_admin_inplace("u")  # pyright: ignore[reportPrivateUsage]
-    state = mgr.get_state("u")
-    assert state is not None
-    assert state.state == UpstreamConnectionState.LIVE
-    assert state.admin_session is None
-    assert state.shared_session is not None
-
-
 # ── Error tolerance: close raising must not break state ───────────────
 
 
@@ -699,19 +565,15 @@ async def test_each_transition_advances_last_transition_at() -> None:
 # ── UpstreamState.has_any_session ─────────────────────────────────────
 
 
-def test_has_any_session_reflects_either_slot() -> None:
+def test_has_any_session_reflects_the_shared_slot() -> None:
     """Quick sanity: the ``has_any_session`` derived predicate is
     used by ``connected_upstream_ids`` to decide what to refresh.
-    If it disagrees with the underlying slots, refresh_all could
+    If it disagrees with the underlying slot, refresh_all could
     skip live upstreams."""
     s = UpstreamState(state=UpstreamConnectionState.FAILED)
     assert s.has_any_session is False
 
     s.shared_session = _stub_session()
-    assert s.has_any_session is True
-
-    s.shared_session = None
-    s.admin_session = _stub_session()
     assert s.has_any_session is True
 
 

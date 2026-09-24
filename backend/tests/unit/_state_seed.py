@@ -1,7 +1,7 @@
 """Test seed helpers that drive the state-machine API.
 
 Tests previously poked the manager's private dicts (``_sessions``,
-``_admin_sessions``, ``_self_descriptions``, ...) to set up the
+``_self_descriptions``, ...) to set up the
 state they wanted to assert on. Those dicts have been folded into
 ``UpstreamState``; the seeds here go through the public
 ``transition_to_*`` surface so tests stay one step removed from the
@@ -18,7 +18,6 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from mcpolis.adapters.upstream_clients.client_manager import (
-    ADMIN_USER_ID,
     UpstreamClientManager,
 )
 from mcpolis.domain.model.upstream import (
@@ -70,30 +69,6 @@ def seed_shared_session(
     return session, task
 
 
-def seed_admin_session(
-    mgr: UpstreamClientManager,
-    upstream_id: str,
-    *,
-    session: Any = None,
-    task: MagicMock | None = None,
-    server_info: ServerInfo | None = None,
-    self_description: UpstreamSelfDescription | None = None,
-) -> tuple[Any, MagicMock]:
-    """Seed a live admin OAuth session via ``transition_to_live_admin``."""
-    if session is None:
-        session = stub_client_session()
-    if task is None:
-        task = stub_connection_task()
-    mgr.transition_to_live_admin(
-        upstream_id,
-        session=session,
-        task=task,
-        server_info=server_info,
-        self_description=self_description,
-    )
-    return session, task
-
-
 def seed_user_session(
     mgr: UpstreamClientManager,
     upstream_id: str,
@@ -102,21 +77,12 @@ def seed_user_session(
     session: Any = None,
     task: MagicMock | None = None,
 ) -> tuple[Any, MagicMock]:
-    """Seed a per-user session.
-
-    For ``ADMIN_USER_ID`` routes to the admin slot on the upstream
-    state record (matching production's
-    ``connect_upstream_for_user(ADMIN_USER_ID)`` shape). For real
-    users populates the orthogonal per-user dicts directly.
-    """
+    """Seed a per-user session by populating the orthogonal per-user
+    dicts directly (there is no public mutation surface for them)."""
     if session is None:
         session = stub_client_session()
     if task is None:
         task = stub_connection_task()
-    if user_id == ADMIN_USER_ID:
-        return seed_admin_session(
-            mgr, upstream_id, session=session, task=task,
-        )
     key = (user_id, upstream_id)
     mgr._user_sessions[key] = session  # pyright: ignore[reportPrivateUsage]
     mgr._user_tasks[key] = task  # pyright: ignore[reportPrivateUsage]

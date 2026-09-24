@@ -35,7 +35,11 @@ from mcp.shared.auth import (
 from mcp.types import LATEST_PROTOCOL_VERSION
 from pydantic import AnyUrl
 
-from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
+from mcpolis.adapters.auth.mcp_token_storage import (
+    NO_ROW,
+    LoadedRevision,
+    McpTokenStorage,
+)
 from mcpolis.adapters.auth.pending_auth import (
     PendingAuth,
     PendingAuthCoordinator,
@@ -43,10 +47,15 @@ from mcpolis.adapters.auth.pending_auth import (
 )
 from mcpolis.adapters.repositories.connection_store import ConnectionStore
 from mcpolis.adapters.upstream_clients.client_manager import (
+    OpenUserSession,
     UpstreamClientManager,
+    UpstreamStopped,
 )
 from mcpolis.adapters.upstream_clients.safe_http_transport import (
     SafeAsyncHTTPTransport,
+)
+from mcpolis.adapters.upstream_clients.session_single_flight import (
+    ConnectAborted,
 )
 from mcpolis.domain.model.upstream import DiscoveredTool, UpstreamDefinition
 from mcpolis.domain.services.tool_registry import (
@@ -290,6 +299,10 @@ class _InitializingOAuthClientProvider(OAuthClientProvider):
     """
 
     last_refresh_failure: RefreshFailureSignature | None = None
+    # The stored sign-in (its revision) whose refresh was rejected. The
+    # failure is about that sign-in only: by the time it is acted on, the
+    # user may have signed in again.
+    last_refresh_failure_sign_in: LoadedRevision = NO_ROW
 
     async def _initialize(self) -> None:
         await super()._initialize()  # pyright: ignore[reportPrivateUsage]
@@ -313,6 +326,9 @@ class _InitializingOAuthClientProvider(OAuthClientProvider):
                 error_code=_parse_oauth_error_code(excerpt),
                 timestamp=datetime.now(UTC),
             )
+            storage = self.context.storage
+            if isinstance(storage, McpTokenStorage):
+                self.last_refresh_failure_sign_in = storage.loaded_revision
         return await super()._handle_refresh_response(response)  # pyright: ignore[reportPrivateUsage]
 
 
@@ -328,6 +344,42 @@ def _extract_refresh_failure(
     if isinstance(provider, _InitializingOAuthClientProvider):
         return provider.last_refresh_failure
     return None
+
+
+def failure_sign_in(
+    provider: OAuthClientProvider, storage: McpTokenStorage,
+) -> LoadedRevision:
+    """Which stored sign-in a failed refresh or reconnect is about: the
+    one whose refresh was rejected, if one was; else the one the connect
+    used.
+
+    They differ when the user signed in again meanwhile. The rejected
+    refresh (of the OLD sign-in) is remembered on the provider, while the
+    connect afterwards reloads the NEW one: blaming the new sign-in for
+    the old one's rejection deleted it.
+    """
+    if (
+        isinstance(provider, _InitializingOAuthClientProvider)
+        and provider.last_refresh_failure is not None
+        and provider.last_refresh_failure_sign_in is not NO_ROW
+    ):
+        return provider.last_refresh_failure_sign_in
+    return storage.loaded_revision
+
+
+async def sign_in_is_still_stored(
+    connection_store: ConnectionStore,
+    org_id: str,
+    upstream_id: str,
+    user_id: str,
+    sign_in: LoadedRevision,
+) -> bool:
+    """Whether the stored sign-in is still ``sign_in``: nobody signed in
+    again or disconnected since it was read."""
+    if sign_in is NO_ROW:
+        return False
+    stored = await connection_store.get_user_token(org_id, user_id, upstream_id)
+    return stored is not None and stored.revision == sign_in
 
 
 # §5.1 delete-vs-retry tuning knobs. Picked conservatively: five
@@ -363,7 +415,9 @@ async def purge_user_oauth_state(
     org_id: str,
     upstream_id: str,
     user_id: str,
-) -> None:
+    *,
+    sign_in: LoadedRevision,
+) -> bool:
     """Tear down ALL per-user OAuth state for one (upstream, user) after a
     terminal auth rejection: the token, the DCR ``client_info``, the
     cached authorization-server ``oauth_metadata``, and the
@@ -378,11 +432,27 @@ async def purge_user_oauth_state(
     ``client_id``; that is the only escape from an ``invalid_client``
     brick the backend can trigger on its own (the upstream's 400 at the
     browser ``/oauth/authorize`` step is never observable here).
+
+    Only while the stored sign-in is still ``sign_in``, the one the
+    rejection was about. A reconnect that started before the user signed
+    in again must not delete the new sign-in, nor the app registration
+    that sign-in uses. Returns whether anything was purged.
     """
-    await connection_store.delete_user_token(org_id, user_id, upstream_id)
+    if sign_in is NO_ROW or not await connection_store.delete_user_token_if_current(
+        org_id, user_id, upstream_id, expected_revision=sign_in,
+    ):
+        logger.info(
+            "upstream.oauth.purge_skipped",
+            upstream_id=upstream_id,
+            user=user_id,
+            org_id=org_id,
+            reason="sign_in_replaced",
+        )
+        return False
     await connection_store.delete_client_info(org_id, upstream_id, user_id)
     await connection_store.delete_oauth_metadata(org_id, upstream_id, user_id)
     await connection_store.reset_refresh_failures(org_id, upstream_id, user_id)
+    return True
 
 
 def _should_delete_on_refresh_failure(
@@ -564,7 +634,7 @@ async def try_connect_with_stored_tokens(
         connection_store, org_id, upstream.id, effective_user,
         refresh_margin_seconds=TOKEN_REFRESH_MARGIN,
     )
-    existing_tokens = await storage.get_tokens()
+    existing_tokens = await storage.peek_tokens()
     if existing_tokens is None:
         return None
 
@@ -587,8 +657,11 @@ async def try_connect_with_stored_tokens(
         server_url,
     )
     try:
-        await client_manager.connect_upstream_for_user(
-            upstream, effective_user, auth=oauth_auth
+        # A deliberate Connect: rebuild on the stored tokens (after a
+        # fresh sign-in, the NEW ones) rather than keep a session that may
+        # carry the old sign-in.
+        await client_manager.replace_user_session(
+            upstream, effective_user, auth=oauth_auth,
         )
         logger.info(
             "upstream.connect.stored_tokens.success",
@@ -636,7 +709,7 @@ async def _finalize_silent_refresh(
     state.
     """
     try:
-        await client_manager.connect_upstream_for_user(
+        await client_manager.replace_user_session(
             upstream, effective_user, auth=oauth_auth,
         )
         auth_coordinator.cleanup(org_id, upstream.id, effective_user)
@@ -814,7 +887,7 @@ async def _drop_client_info_on_dead_client_failure(
     )
     drop = invalid_client
     if not drop and _exception_chain_contains(exc, TimeoutError):
-        tokens = await storage.get_tokens()
+        tokens = await storage.peek_tokens()
         drop = tokens is None or not tokens.refresh_token
     if not drop:
         return
@@ -888,10 +961,17 @@ async def initiate_oauth_connection(
             storage, upstream, server_url, connection_store,
         )
 
+    async def callback_then_fresh_sign_in() -> tuple[str, str | None]:
+        # The code returned here is exchanged for tokens next: a fresh
+        # sign-in, which replaces whatever is stored.
+        result = await pending.callback_handler()
+        storage.mark_fresh_sign_in()
+        return result
+
     oauth_auth = await _build_oauth_provider(
         upstream, storage,
         pending.redirect_handler,
-        pending.callback_handler,
+        callback_then_fresh_sign_in,
         server_url,
     )
 
@@ -1024,13 +1104,13 @@ def _start_background_token_acquisition(
         # If the redirect_handler was never called, tokens were
         # refreshed silently — signal this to the caller.
         if not pending.redirect_url:
-            tokens = await storage.get_tokens()
+            tokens = await storage.peek_tokens()
             if tokens is not None:
                 pending.mark_tokens_refreshed()
 
         # Notify that tokens have been acquired (for SSE push),
         # or that the flow failed.
-        tokens = await storage.get_tokens()
+        tokens = await storage.peek_tokens()
         if tokens is not None:
             # Capture the metadata the SDK discovered during this flow
             # (initial consent or 401 recovery) so the next process
@@ -1039,6 +1119,8 @@ def _start_background_token_acquisition(
             # branch hits the upstream's real ``token_endpoint``
             # instead of ``<base>/token``. See §3.8 / §5.4.
             await _persist_discovered_oauth_metadata(auth, storage)
+            if storage.fresh_sign_in_saved:
+                await _settle_fresh_sign_in(auth, storage)
             if on_tokens_acquired is not None:
                 on_tokens_acquired()
         else:
@@ -1220,19 +1302,51 @@ async def _persist_post_reconnect_state(
         user=effective_user,
         org_id=org_id,
     )
-    await connection_store.clear_connection_error(org_id, upstream.id)
-    await connection_store.reset_refresh_failures(
-        org_id, upstream.id, effective_user,
-    )
-    await connection_store.clear_notified(
-        org_id, upstream.id, effective_user,
+    await _mark_sign_in_working(
+        connection_store, org_id, upstream.id, effective_user,
     )
     await _persist_discovered_oauth_metadata(oauth_auth, storage)
+
+
+async def _mark_sign_in_working(
+    connection_store: ConnectionStore,
+    org_id: str,
+    upstream_id: str,
+    user_id: str,
+) -> None:
+    """The user's sign-in just proved good: clear the upstream's error,
+    the user's failed-refresh count (so earlier failures cannot add up to
+    deleting it), and the "already emailed" marker (so a later failure
+    notifies again)."""
+    await connection_store.clear_connection_error(org_id, upstream_id)
+    await connection_store.reset_refresh_failures(org_id, upstream_id, user_id)
+    await connection_store.clear_notified(org_id, upstream_id, user_id)
+
+
+async def _settle_fresh_sign_in(
+    provider: OAuthClientProvider, storage: McpTokenStorage,
+) -> None:
+    """Bookkeeping after a fresh sign-in's tokens were saved.
+
+    Its app registration is saved again: a reconnect of the old sign-in
+    that failed while the user was on the consent page deletes it (the
+    token it deleted was still the old one), and without it the new
+    sign-in's first refresh fails. The failed-refresh count restarts,
+    so the old sign-in's failures cannot add up to deleting this one.
+    """
+    client_info = provider.context.client_info
+    if isinstance(client_info, OAuthClientInformationFull):
+        await storage.set_client_info(client_info)
+    await _mark_sign_in_working(
+        storage.connection_store, storage.org_id,
+        storage.upstream_id, storage.user_id,
+    )
 
 
 async def _classify_reconnect_failure(
     exc: BaseException,
     oauth_auth: OAuthClientProvider,
+    storage: McpTokenStorage,
     connection_store: ConnectionStore,
     org_id: str,
     upstream: UpstreamDefinition,
@@ -1240,7 +1354,7 @@ async def _classify_reconnect_failure(
 ) -> DisconnectReason:
     """Classify a Step-3 connect failure during silent reconnect.
 
-    The Step-3 ``connect_upstream_for_user`` may fail for many
+    The Step-3 connect may fail for many
     reasons: a refresh-rejected ``invalid_grant`` from the upstream
     (the user revoked / the token rotated), a transient 5xx, an SDK
     fall-through into authorization_code grant after a 401 (zombie
@@ -1271,8 +1385,14 @@ async def _classify_reconnect_failure(
     is shared by every Step-3 failure path; the discriminator lives
     in the structured logs and the persisted signature, not in the
     return value.
+
+    Steps 3 and 4 apply to the sign-in the failure is about only while
+    it is still the stored one. If the user signed in again (or
+    disconnected) while this reconnect ran, the failure says nothing
+    about what is stored now: nothing is recorded, nothing deleted.
     """
     signature = _extract_refresh_failure(oauth_auth)
+    about = failure_sign_in(oauth_auth, storage)
 
     # If the SDK's 401 handler fell into authorization_code grant
     # (our ``_noop_callback`` raised), the bearer is dead AND the
@@ -1309,6 +1429,17 @@ async def _classify_reconnect_failure(
             body_excerpt=signature.body_excerpt,
         )
 
+    if not await sign_in_is_still_stored(
+        connection_store, org_id, upstream.id, effective_user, about,
+    ):
+        logger.info(
+            "upstream.reconnect.failure_of_replaced_sign_in",
+            upstream_id=upstream.id,
+            user=effective_user,
+            org_id=org_id,
+        )
+        return DisconnectReason.token_refresh_failed
+
     failure_count, first_at = await connection_store.record_refresh_failure(
         org_id, upstream.id, effective_user,
         signature=signature.to_dict() if signature else None,
@@ -1341,6 +1472,7 @@ async def _classify_reconnect_failure(
         # too, and leaving it would re-brick the next consent.
         await purge_user_oauth_state(
             connection_store, org_id, upstream.id, effective_user,
+            sign_in=about,
         )
     else:
         elapsed = int((datetime.now(UTC) - first_at).total_seconds())
@@ -1415,6 +1547,65 @@ async def _handle_token_read_failure(
     return DisconnectReason.token_refresh_failed
 
 
+class _ReconnectRefused(Exception):
+    """A stored-token reconnect ended without a session; ``reason`` says
+    why. Raised inside the shared reconnect, so every caller waiting on
+    that reconnect gets the same answer."""
+
+    def __init__(self, reason: DisconnectReason) -> None:
+        super().__init__(reason.value)
+        self.reason = reason
+
+
+async def reconnect_session_with_stored_tokens(
+    org_id: str,
+    upstream: UpstreamDefinition,
+    effective_user: str,
+    connection_store: ConnectionStore,
+    client_manager: UpstreamClientManager,
+    server_url: str,
+    timeout: float = 15,
+) -> ClientSession | DisconnectReason:
+    """The user's live session, reconnected from stored tokens if there is
+    none (no browser interaction). Returns the session, or why not.
+
+    Requests that need the same user's session at the same moment share
+    ONE reconnect: the token refresh, the connect and the bookkeeping after
+    it run once, and every caller gets that reconnect's session or its
+    reason. Two overlapping reconnects used to each refresh the token and
+    each connect, and the second connect closed the session the first had
+    just built (Sentry MCPOLIS-BACKEND-W). Two refreshes of one rotating
+    refresh token also make the loser look revoked, and the failure
+    handling below then deletes the user's sign-in.
+
+    ``timeout`` bounds the connect of the reconnect this call starts; a
+    caller that joins a running reconnect waits on that one's budget.
+    """
+    if upstream.http is None:
+        return DisconnectReason.no_tokens
+
+    async def reconnect(open_session: OpenUserSession) -> ClientSession:
+        outcome = await _reconnect_from_stored_tokens(
+            org_id=org_id,
+            upstream=upstream,
+            effective_user=effective_user,
+            connection_store=connection_store,
+            server_url=server_url,
+            timeout=timeout,
+            open_session=open_session,
+        )
+        if isinstance(outcome, DisconnectReason):
+            raise _ReconnectRefused(outcome)
+        return outcome
+
+    try:
+        return await client_manager.ensure_user_session(
+            upstream, effective_user, reconnect=reconnect,
+        )
+    except _ReconnectRefused as refused:
+        return refused.reason
+
+
 async def reconnect_with_stored_tokens(
     org_id: str,
     upstream: UpstreamDefinition,
@@ -1424,20 +1615,46 @@ async def reconnect_with_stored_tokens(
     server_url: str,
     timeout: float = 15,
 ) -> DisconnectReason | None:
-    """Try to reconnect using stored tokens (no browser interaction).
-
-    First triggers a lightweight HTTP request to refresh expired tokens,
-    then creates the real MCP session.
-    Returns None if connected, or a DisconnectReason if not.
+    """``reconnect_session_with_stored_tokens`` for callers that only need
+    the outcome: ``None`` once the user has a live session, else why not.
     """
-    if upstream.http is None:
-        return DisconnectReason.no_tokens
+    outcome = await reconnect_session_with_stored_tokens(
+        org_id, upstream, effective_user, connection_store,
+        client_manager, server_url, timeout,
+    )
+    if isinstance(outcome, DisconnectReason):
+        return outcome
+    return None
+
+
+async def _reconnect_from_stored_tokens(
+    *,
+    org_id: str,
+    upstream: UpstreamDefinition,
+    effective_user: str,
+    connection_store: ConnectionStore,
+    server_url: str,
+    timeout: float,
+    open_session: OpenUserSession,
+) -> ClientSession | DisconnectReason:
+    """One reconnect: refresh the token if due, then connect.
+
+    Runs once per shared reconnect (see
+    ``reconnect_session_with_stored_tokens``). First triggers a lightweight
+    HTTP request to refresh expired tokens, then creates the real MCP
+    session through ``open_session``.
+    """
+    assert upstream.http is not None
 
     storage = McpTokenStorage(
         connection_store, org_id, upstream.id, effective_user,
         refresh_margin_seconds=TOKEN_REFRESH_MARGIN,
     )
     try:
+        # ``get_tokens``, not ``peek_tokens``: this reconnect starts from
+        # the row read here. The sign-in library loads again on its first
+        # request, and whichever row it holds then is what its writes and
+        # this reconnect's failure handling apply to.
         tokens = await storage.get_tokens()
     except Exception:
         return await _handle_token_read_failure(
@@ -1467,7 +1684,7 @@ async def reconnect_with_stored_tokens(
     await _trigger_silent_refresh(oauth_auth, upstream.http.url)
 
     # Step 2: Check if we still have tokens
-    refreshed_tokens = await storage.get_tokens()
+    refreshed_tokens = await storage.peek_tokens()
     if refreshed_tokens is None:
         logger.info(
             "upstream.token.refresh.no_tokens",
@@ -1482,17 +1699,14 @@ async def reconnect_with_stored_tokens(
 
     # Step 3: Connect the real MCP session
     try:
-        await asyncio.wait_for(
-            client_manager.connect_upstream_for_user(
-                upstream, effective_user, auth=oauth_auth
-            ),
-            timeout=timeout,
+        session = await asyncio.wait_for(
+            open_session(oauth_auth), timeout=timeout,
         )
         await _persist_post_reconnect_state(
             connection_store, oauth_auth, storage,
             org_id, upstream, effective_user,
         )
-        return None  # Success
+        return session
     except TimeoutError:
         logger.info(
             "upstream.reconnect.timeout",
@@ -1505,11 +1719,20 @@ async def reconnect_with_stored_tokens(
             org_id, upstream.id, DisconnectReason.connection_timeout
         )
         return DisconnectReason.connection_timeout
+    except ConnectAborted:
+        # A Disconnect, a removal or a shutdown ended this reconnect: not a
+        # refresh failure to count, show on the dashboard, or act on.
+        raise
     except Exception as exc:
         return await _classify_reconnect_failure(
-            exc, oauth_auth, connection_store,
+            exc, oauth_auth, storage, connection_store,
             org_id, upstream, effective_user,
         )
+
+
+# ``SessionUnavailable.reason`` when an admin stopped the upstream: the
+# refusal is expected, so callers log it quietly.
+UPSTREAM_STOPPED = "upstream_stopped"
 
 
 class SessionUnavailable(Exception):
@@ -1546,7 +1769,8 @@ async def acquire_upstream_session(
     - ``service_account``: lazily (re)open the shared session
       (DEFERRED_ATTACH → LIVE); idempotent when already LIVE.
     - OAuth: reuse ``effective_user``'s live session, else reconnect it
-      from stored tokens (transparent token refresh). ``effective_user``
+      from stored tokens (transparent token refresh), joining a reconnect
+      already running for that user. ``effective_user``
       is the calling user for ``per_user_oauth`` and the slot owner for
       ``admin_oauth``; the caller resolves it. Ignored for
       ``service_account``.
@@ -1558,38 +1782,51 @@ async def acquire_upstream_session(
     # (reconnect_all_oauth_upstreams) to avoid a policy↔service cycle.
     from mcpolis.domain.model.policy import AuthMode
 
+    # Both branches hand back the session the connect produced (or the
+    # live one it found). They never connect and then look the session up
+    # again: in between, another request could replace it, and the lookup
+    # then finds nothing (the KeyError of Sentry MCPOLIS-BACKEND-W) or,
+    # worse, falls through to the shared discovery session and runs a
+    # per-user call without the user's sign-in.
     if upstream.auth.mode == AuthMode.service_account:
         try:
-            await client_manager.ensure_shared_connected(upstream)
+            return await client_manager.ensure_shared_connected(upstream)
+        except UpstreamStopped as exc:
+            raise SessionUnavailable(UPSTREAM_STOPPED) from exc
         except Exception as exc:
             raise SessionUnavailable("connect_failed") from exc
-        try:
-            return client_manager.get_session(upstream.id)
-        except KeyError as exc:
-            raise SessionUnavailable("no_session") from exc
 
     if connection_store is None:
         raise SessionUnavailable("oauth_not_configured")
 
-    if client_manager.has_user_session(upstream.id, effective_user):
-        return client_manager.get_session(
-            upstream.id, user_id=effective_user,
+    try:
+        outcome = await reconnect_session_with_stored_tokens(
+            org_id=org_id,
+            upstream=upstream,
+            effective_user=effective_user,
+            connection_store=connection_store,
+            client_manager=client_manager,
+            server_url=server_url,
+            timeout=timeout,
         )
-
-    reason = await reconnect_with_stored_tokens(
-        org_id=org_id,
-        upstream=upstream,
-        effective_user=effective_user,
-        connection_store=connection_store,
-        client_manager=client_manager,
-        server_url=server_url,
-        timeout=timeout,
-    )
-    if reason is None:
-        return client_manager.get_session(
-            upstream.id, user_id=effective_user,
+    except ConnectAborted as exc:
+        # A Stop or a shutdown cancelled the connect this call waited on.
+        raise SessionUnavailable("connect_aborted") from exc
+    except Exception as exc:
+        # Anything the reconnect did not classify itself. Reaching the
+        # caller raw would send its text to the MCP client, which may carry
+        # upstream URLs or internal addresses; log it (ERROR, so it alerts)
+        # and hand back a clean "no session".
+        logger.exception(
+            "upstream.acquire.reconnect_failed",
+            org_id=org_id,
+            upstream_id=upstream.id,
+            user=effective_user,
         )
-    raise SessionUnavailable(reason)
+        raise SessionUnavailable("connect_failed") from exc
+    if isinstance(outcome, DisconnectReason):
+        raise SessionUnavailable(outcome)
+    return outcome
 
 
 async def heal_stalled_session(
@@ -1598,9 +1835,17 @@ async def heal_stalled_session(
     upstream: UpstreamDefinition,
     effective_user: str,
     client_manager: UpstreamClientManager,
+    stalled_session: ClientSession,
 ) -> None:
     """Drop the session whose transport just stalled, so the next
     acquisition runs on a fresh transport.
+
+    ``stalled_session`` is the session the caller saw stall. Only that
+    session is dropped: by the time this runs, another request that hit
+    the same stall may already have replaced it, and dropping "whatever is
+    there now" would kill that fresh session under whoever moved onto it.
+    For the same reason a heal never stops a connect that is running: that
+    connect is the replacement.
 
     - ``service_account``: drop the shared session and reconnect fresh
       (the sandbox service fresh-creates rather than reattaching to the
@@ -1621,10 +1866,12 @@ async def heal_stalled_session(
     from mcpolis.domain.model.policy import AuthMode
 
     if upstream.auth.mode == AuthMode.service_account:
-        await client_manager.reconnect_shared_fresh(upstream)
+        await client_manager.reconnect_shared_fresh(
+            upstream, stale=stalled_session,
+        )
         return
-    await client_manager.disconnect_user_session(
-        upstream.id, effective_user,
+    evicted = await client_manager.evict_user_session_if_current(
+        upstream.id, effective_user, stalled_session,
     )
     logger.info(
         "upstream.session.stall_evicted",
@@ -1632,6 +1879,7 @@ async def heal_stalled_session(
         upstream_id=upstream.id,
         user=effective_user,
         auth_mode=upstream.auth.mode.value,
+        evicted=evicted,
     )
 
 
@@ -1731,7 +1979,7 @@ async def acquire_and_refresh_with_recovery(
     """
     last_exc: BaseException | None = None
     for attempt in range(max_attempts):
-        await acquire_upstream_session(
+        session = await acquire_upstream_session(
             org_id=org_id,
             upstream=upstream,
             effective_user=effective_user,
@@ -1740,7 +1988,11 @@ async def acquire_and_refresh_with_recovery(
             server_url=server_url,
         )
         try:
-            return await tool_registry.refresh_upstream(upstream.id)
+            # Discover on the session just acquired. Looking one up again
+            # would race anything that replaces or drops it in between.
+            return await tool_registry.refresh_upstream(
+                upstream.id, session=session,
+            )
         except Exception as exc:
             last_exc = exc
             is_last = attempt + 1 >= max_attempts
@@ -1758,12 +2010,18 @@ async def acquire_and_refresh_with_recovery(
             # ``acquire_upstream_session`` above short-circuits to the
             # cached per-user session, dead or not, so without eviction
             # the retry would refresh over the same closed transport.
-            await heal_stalled_session(
-                org_id=org_id,
-                upstream=upstream,
-                effective_user=effective_user,
-                client_manager=client_manager,
-            )
+            try:
+                await heal_stalled_session(
+                    org_id=org_id,
+                    upstream=upstream,
+                    effective_user=effective_user,
+                    client_manager=client_manager,
+                    stalled_session=session,
+                )
+            except UpstreamStopped as stopped:
+                # Stopped while this refresh ran: nothing to heal, and a
+                # refusal the admin asked for, not a failure.
+                raise SessionUnavailable(UPSTREAM_STOPPED) from stopped
     # Loop always returns or raises; this satisfies the type checker.
     assert last_exc is not None
     raise last_exc
@@ -2173,6 +2431,7 @@ __all__ = [
     "try_connect_with_stored_tokens",
     "initiate_oauth_connection",
     "reconnect_with_stored_tokens",
+    "reconnect_session_with_stored_tokens",
     "connect_and_refresh_tools",
     "reconnect_all_oauth_upstreams",
     "refresh_token_for_user",

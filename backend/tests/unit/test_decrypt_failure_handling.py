@@ -43,7 +43,10 @@ from mcpolis.domain.services.upstream_connection_service import (
 )
 
 UPSTREAM_ID = "notion"
-USER_ID = "__admin__"
+# A real email: sessions (and the stored-token reconnect that builds
+# them) are keyed by the signed-in user. The old ``__admin__`` slot
+# is gone, and the manager now refuses that sentinel.
+USER_ID = "admin@example.com"
 UPSTREAM_URL = "https://mcp.example.invalid/mcp"
 SERVER_URL = "https://gateway.example.invalid"
 

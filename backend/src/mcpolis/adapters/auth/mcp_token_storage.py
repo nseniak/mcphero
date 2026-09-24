@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from enum import Enum
+from typing import Literal
 
 import structlog
 from mcp.shared.auth import (
@@ -18,6 +20,17 @@ from mcpolis.adapters.repositories.connection_store import (
 )
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
+
+
+class _NoRow(Enum):
+    """``McpTokenStorage.loaded_revision`` when the sign-in library holds
+    no stored row: nothing loaded yet, or nothing was stored."""
+
+    NO_ROW = "no_row"
+
+
+NO_ROW = _NoRow.NO_ROW
+LoadedRevision = str | None | Literal[_NoRow.NO_ROW]
 
 
 class McpTokenStorage:
@@ -49,6 +62,16 @@ class McpTokenStorage:
     silently skips the refresh branch — a 2026-04-25 dev-env bug
     where the seatbelt fired 77 times in 13 hours without producing a
     single rotation. Defaults to ``None`` (no max-age clamp).
+
+    Writes never clobber a newer sign-in. The instance remembers which
+    stored row the sign-in library loaded (``get_tokens``); a token
+    refresh it writes back lands only while that row is still stored.
+    Otherwise the user signed in again meanwhile (a new row) or
+    disconnected (no row), and writing the refreshed OLD tokens would
+    silently put them back on the old sign-in or undo the Disconnect.
+    Only a fresh sign-in (``mark_fresh_sign_in``) writes regardless.
+    Code outside the library reads with ``peek_tokens``, which leaves
+    that record alone.
     """
 
     def __init__(
@@ -67,6 +90,13 @@ class McpTokenStorage:
         self._user_id = user_id
         self._refresh_margin_s = refresh_margin_seconds
         self._max_age_s = max_age_seconds
+        self._loaded_revision: LoadedRevision = NO_ROW
+        self._fresh_sign_in = False
+        self._fresh_sign_in_saved = False
+
+    @property
+    def connection_store(self) -> ConnectionStore:
+        return self._store
 
     @property
     def org_id(self) -> str:
@@ -80,11 +110,51 @@ class McpTokenStorage:
     def user_id(self) -> str:
         return self._user_id
 
+    @property
+    def loaded_revision(self) -> LoadedRevision:
+        """The revision of the stored row the sign-in library holds, or
+        ``NO_ROW``. A cleanup acting on this sign-in's failure passes it,
+        so it cannot delete a newer sign-in."""
+        return self._loaded_revision
+
+    @property
+    def fresh_sign_in_saved(self) -> bool:
+        """Whether a fresh sign-in's tokens were saved through this
+        instance."""
+        return self._fresh_sign_in_saved
+
+    def start_from(self, stored: InternalOAuthToken) -> None:
+        """Take ``stored``, already read by the caller, as the row this
+        instance works from, as ``get_tokens`` would have."""
+        self._loaded_revision = stored.revision
+
+    def mark_fresh_sign_in(self) -> None:
+        """The next write is a fresh sign-in (the authorization code is in
+        hand): it replaces whatever is stored."""
+        self._fresh_sign_in = True
+
     async def get_tokens(self) -> OAuthToken | None:
-        """Get stored tokens (MCP SDK TokenStorage protocol)."""
+        """Get stored tokens (MCP SDK TokenStorage protocol).
+
+        For the sign-in library only: it records which row the library
+        now holds. Code outside it uses ``peek_tokens``."""
         internal = await self._store.get_user_token(
             self._org_id, self._user_id, self._upstream_id
         )
+        self._loaded_revision = (
+            internal.revision if internal is not None else NO_ROW
+        )
+        return self._to_sdk(internal)
+
+    async def peek_tokens(self) -> OAuthToken | None:
+        """The stored tokens, as ``get_tokens`` would return them, without
+        changing which row the sign-in library is taken to hold."""
+        internal = await self._store.get_user_token(
+            self._org_id, self._user_id, self._upstream_id
+        )
+        return self._to_sdk(internal)
+
+    def _to_sdk(self, internal: InternalOAuthToken | None) -> OAuthToken | None:
         if internal is None:
             return None
         return _internal_to_sdk_token(
@@ -113,9 +183,33 @@ class McpTokenStorage:
         previous = await self._store.get_user_token(
             self._org_id, self._user_id, self._upstream_id,
         )
-        await self._store.put_user_token(
-            self._org_id, self._user_id, self._upstream_id, internal,
-        )
+        if self._fresh_sign_in:
+            revision: str | None = await self._store.put_user_token(
+                self._org_id, self._user_id, self._upstream_id, internal,
+            )
+            self._fresh_sign_in = False
+            self._fresh_sign_in_saved = True
+        elif self._loaded_revision is NO_ROW:
+            revision = None
+        else:
+            revision = await self._store.put_user_token_if_current(
+                self._org_id, self._user_id, self._upstream_id, internal,
+                expected_revision=self._loaded_revision,
+            )
+        if revision is None:
+            # The sign-in these tokens were refreshed from is no longer
+            # the stored one: the user signed in again or disconnected.
+            logger.info(
+                "oauth.token.storage.write_skipped",
+                upstream_id=self._upstream_id,
+                user=self._user_id,
+                org_id=self._org_id,
+                reason=(
+                    "disconnected" if previous is None else "newer_sign_in"
+                ),
+            )
+            return
+        self._loaded_revision = revision
         # Last 6 chars of the access token — enough to visually confirm
         # the value actually changed (not just a re-write of the same
         # row) without logging the full credential.

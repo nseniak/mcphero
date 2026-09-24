@@ -101,8 +101,8 @@ async def probe_upstream_liveness(
       restores the session transparently; a genuine ``invalid_grant``
       there hits §5.1's delete path.
 
-    Keeps log output consistent with the ``Created/Closed admin session``
-    bracket so operators can correlate: a probe-triggered teardown
+    Keeps log output consistent with the per-user session's
+    created / closed bracket so operators can correlate: a probe-triggered teardown
     emits ``Liveness probe torn down upstream=… user=… reason=…``
     immediately before the standard ``Closed`` line.
     """
@@ -155,8 +155,23 @@ async def probe_upstream_liveness(
         )
 
     # Session is compromised. Tear down; then let the standard
-    # reconnect path handle delete-vs-retry via §5.1.
-    await client_manager.disconnect_user_session(upstream.id, user_id)
+    # reconnect path handle delete-vs-retry via §5.1. Tear down THIS
+    # session only: while the probe waited on it, another request may
+    # have replaced it with a fresh one, which must survive. The
+    # reconnect below then finds that fresh session and does nothing.
+    evicted = await client_manager.evict_user_session_if_current(
+        upstream.id, user_id, session,
+    )
+    if not evicted:
+        # Someone else already dropped or replaced the session this probe
+        # found dead; whoever did owns the reconnect.
+        logger.info(
+            "upstream.health.probe.already_evicted",
+            upstream_id=upstream.id,
+            user=user_id,
+            org_id=org_id,
+        )
+        return ProbeOutcome.torn_down
 
     reason = await reconnect_with_stored_tokens(
         org_id, upstream, user_id,

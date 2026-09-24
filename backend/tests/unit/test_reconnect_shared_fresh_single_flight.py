@@ -4,11 +4,10 @@ COALESCE onto one fresh reconnect (R1, BLOCKER).
 The dispatch stall-recovery's new ping-gated detection clusters concurrent
 stalls on the SAME poisoned shared session into a near-simultaneous burst
 of ``heal_stalled_session`` → ``reconnect_shared_fresh``. That path
-bypasses ``ensure_shared_connected``'s ``_lazy_connect_tasks``
-single-flight (it deletes the persisted sandbox ref and calls
-``connect_shared`` directly), so without its own single-flight, N
+reopens the shared session itself, so without a single-flight, N
 simultaneous healers would force N fresh E2B sandboxes — N-1 immediately
-orphaned — and race the ref delete/re-persist.
+orphaned — and race the persisted-ref writes. ``_open_shared`` (the one
+reopen body every shared flight runs) is stubbed here to count reopens.
 
 These are real-asyncio concurrency tests (racing tasks), not code-reads —
 the spec requires it; the real-E2B integration test pins the same
@@ -35,15 +34,16 @@ async def test_concurrent_healers_coalesce_to_one_reconnect() -> None:
     started = 0
     release = asyncio.Event()
 
-    async def slow_connect(up: Any, *a: Any, **k: Any) -> None:
+    async def slow_connect(up: Any, *a: Any, **k: Any) -> Any:
         nonlocal started
         started += 1
         # Hold the first reconnect in-flight while the siblings pile up on
         # the single-flight gate, so a missing single-flight would show as
         # started > 1.
         await release.wait()
+        return object()
 
-    mgr.connect_shared = slow_connect  # type: ignore[method-assign]
+    mgr._open_shared = slow_connect  # type: ignore[method-assign]
 
     healers = [
         asyncio.create_task(mgr.reconnect_shared_fresh(upstream))
@@ -55,7 +55,7 @@ async def test_concurrent_healers_coalesce_to_one_reconnect() -> None:
     await asyncio.gather(*healers)
 
     assert started == 1, (
-        "8 concurrent healers must coalesce onto ONE connect_shared, "
+        "8 concurrent healers must coalesce onto ONE reopen, "
         "not create 8 sandboxes (7 orphaned)"
     )
 
@@ -70,11 +70,12 @@ async def test_sequential_healers_each_reconnect() -> None:
 
     started = 0
 
-    async def fast_connect(up: Any, *a: Any, **k: Any) -> None:
+    async def fast_connect(up: Any, *a: Any, **k: Any) -> Any:
         nonlocal started
         started += 1
+        return object()
 
-    mgr.connect_shared = fast_connect  # type: ignore[method-assign]
+    mgr._open_shared = fast_connect  # type: ignore[method-assign]
 
     await mgr.reconnect_shared_fresh(upstream)
     await mgr.reconnect_shared_fresh(upstream)

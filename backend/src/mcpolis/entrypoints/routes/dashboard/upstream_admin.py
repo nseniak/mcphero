@@ -22,6 +22,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from mcpolis.adapters.observability.analytics_client import get_analytics
+from mcpolis.adapters.upstream_clients.session_single_flight import (
+    ConnectAborted,
+)
 from mcpolis.adapters.repositories.upstream_config_loader import (
     build_upstream,
     extract_import_entries,
@@ -37,6 +40,7 @@ from mcpolis.domain.model.upstream import (
     UpstreamDefinition,
     validate_stdio_uses_service_account,
 )
+from mcpolis.domain.services.org_runtime import OrgRuntime
 from mcpolis.domain.services.plan_gates import (
     assert_http_upstream_capacity,
     assert_sandbox_combo_allowed,
@@ -88,6 +92,23 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 # keys, so a confirmed import id must stay within the dashboard IdInput
 # charset even when a scripted caller bypasses the UI.
 _VALID_UPSTREAM_ID = re.compile(r"[a-z0-9._-]+")
+
+
+async def _mark_added_stopped(
+    deps: DashboardDeps, runtime: OrgRuntime, org_id: str, upstream_id: str,
+) -> None:
+    """A new upstream starts stopped until the admin clicks Start, both
+    in storage (so a restart does not connect it) and in memory (so a
+    tool call does not start it before then).
+
+    ``set_disabled`` writes an explicit ``enabled: False``; clearing the
+    marker instead would fall back to default-enabled.
+    """
+    if deps.connection_store is not None:
+        await deps.connection_store.set_disabled(org_id, upstream_id)
+    await runtime.client_manager.transition_to_disabled(
+        upstream_id, reason="added_stopped",
+    )
 
 
 async def _build_upstream_summaries(
@@ -723,14 +744,8 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
             org_id, upstream.id,
         )
         runtime.policy_engine.reload(new_config)
-        # Mark as disabled so it won't auto-connect on restart.
-        # ``set_disabled`` writes an explicit ``enabled: False`` —
-        # ``clear_enabled`` would only remove the marker, which
-        # falls back to default-enabled and (until the boot gate
-        # was tightened) silently auto-connected new upstreams
-        # against the comment's intent.
-        if deps.connection_store is not None:
-            await deps.connection_store.set_disabled(org_id, upstream.id)
+        # A new upstream starts stopped: the admin clicks Start.
+        await _mark_added_stopped(deps, runtime, org_id, upstream.id)
         get_analytics().track_async(
             admin_email,
             "upstream_added",
@@ -1305,10 +1320,8 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
                     org_id, tid,
                 )
                 runtime.policy_engine.reload(new_config)
-                if deps.connection_store is not None:
-                    # Same off-by-default intent as ``add_upstream``;
-                    # explicit False survives restart.
-                    await deps.connection_store.set_disabled(org_id, tid)
+                # Same off-by-default intent as ``add_upstream``.
+                await _mark_added_stopped(deps, runtime, org_id, tid)
                 added.append(tid)
                 existing.add(tid)
             except Exception as e:
@@ -1664,6 +1677,13 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
                     # owns the post-cancellation state (Stop has
                     # already called mark_disconnected).
                     raise
+                except ConnectAborted:
+                    # Stop aborted the connect this Start was waiting on
+                    # (it can land just after the connect went live, when
+                    # Start is no longer the tracked background task).
+                    # Same as being cancelled: Stop owns the state, so
+                    # record nothing.
+                    return
                 except Exception as e:
                     connection_error = str(e) or e.__class__.__name__
                 if deps.connection_store is not None:

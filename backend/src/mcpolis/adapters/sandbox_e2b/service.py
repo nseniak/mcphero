@@ -926,11 +926,13 @@ class E2BSandboxService:
             prior_ref = await self._persist_creating_marker(
                 org_id=org_id, upstream=upstream,
             )
+        created: E2BSandboxHandle | None = None
         try:
             sandbox = await self._open_sandbox(
                 org_id=org_id, upstream=upstream, resources=resources,
                 resume_from=None,
             )
+            created = sandbox
             await self._materialize_files(
                 sandbox=sandbox,
                 upstream_id=upstream.id,
@@ -958,12 +960,47 @@ class E2BSandboxService:
                 on_stdout=on_stdout, on_stderr=on_stderr,
             )
         except BaseException:
-            if write_marker:
-                await self._restore_or_clear_creating_marker(
-                    org_id=org_id, upstream=upstream, prior=prior_ref,
-                )
+            try:
+                # The sandbox exists but the MCP never started in it (a
+                # file failed to copy, the docker daemon or the command
+                # failed to start). Nothing else knows its id, so kill it
+                # here, or it runs, then sits paused, until the next
+                # boot's reconcile.
+                if created is not None:
+                    await self._kill_stranded_sandbox(
+                        created, upstream_id=upstream.id,
+                    )
+            finally:
+                # Even if the kill is cut short (a shutdown cancels
+                # everything): a leftover "creating" marker would hide the
+                # sandbox from the reconcile and lose the ref it replaced.
+                if write_marker:
+                    await self._restore_or_clear_creating_marker(
+                        org_id=org_id, upstream=upstream, prior=prior_ref,
+                    )
             raise
         return sandbox, process
+
+    async def _kill_stranded_sandbox(
+        self, sandbox: E2BSandboxHandle, *, upstream_id: str,
+    ) -> None:
+        """Best effort: the caller is already failing, and a kill that
+        fails too must not replace its error."""
+        try:
+            await sandbox.kill()
+        except (E2BSDKError, OSError):
+            logger.warning(
+                "sandbox.e2b.stranded_kill_failed",
+                upstream_id=upstream_id,
+                sandbox_id=sandbox.sandbox_id,
+                exc_info=True,
+            )
+        else:
+            logger.info(
+                "sandbox.e2b.stranded_killed",
+                upstream_id=upstream_id,
+                sandbox_id=sandbox.sandbox_id,
+            )
 
     def _resolve_template(
         self,

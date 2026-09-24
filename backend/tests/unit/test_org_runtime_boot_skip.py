@@ -16,17 +16,24 @@ maturity, ``connect_runtime`` MUST funnel through
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog
 
 from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (
     InMemorySandboxPersistenceRepository,
 )
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
+from mcpolis.adapters.upstream_clients.upstream_state import (
+    UpstreamConnectionState,
+)
 from mcpolis.domain.model.upstream import (
     ServerInfo,
+    TransportType,
     UpstreamSelfDescription,
 )
 from mcpolis.domain.ports.sandbox_persistence_repository import (
@@ -225,16 +232,15 @@ async def test_connect_runtime_skips_stdio_when_no_cache() -> None:
 
 
 @pytest.mark.asyncio
-async def test_connect_runtime_disables_http_upstream_on_connect_failure() -> None:
-    """Auto-disable circuit breaker: service-account HTTP eagerly
-    retries every boot (cheap — no sandbox), so a permanently
-    broken HTTP MCP would keep failing forever. After the first
-    failure, ``set_disabled`` writes an explicit ``enabled: False``
-    so the next boot's ``disabled_ids`` includes the upstream and
-    the reconciler skips it. Admin can click Reconnect to retry.
+async def test_a_remote_server_that_fails_at_boot_is_not_saved_as_stopped() -> None:
+    """A service-account HTTP MCP that fails its boot connect is FAILED,
+    not stopped. Stopped means an admin chose it: a stopped upstream
+    refuses tool calls until someone clicks Start, so saving a boot
+    failure as stopped would keep a server that was down for a minute
+    at deploy time off until someone noticed.
 
-    (Stdio takes the upfront-skip path via the cache gate; only
-    HTTP exercises the auto-disable branch now.)
+    (Stdio takes the upfront-skip path via the cache gate; only HTTP
+    connects eagerly at boot.)
     """
     from mcpolis.domain.model.upstream import TransportType
     org_id = "acme"
@@ -260,20 +266,13 @@ async def test_connect_runtime_disables_http_upstream_on_connect_failure() -> No
     set_disabled_mock: AsyncMock = (
         org_manager._connection_repo.set_disabled  # pyright: ignore[reportPrivateUsage]
     )  # type: ignore[assignment]
-    set_disabled_mock.assert_awaited_once_with(org_id, upstream.id)
+    set_disabled_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_connect_runtime_disable_on_failure_transitions_in_memory_state() -> None:
-    """Sibling assertion to ``test_connect_runtime_disables_http_upstream_on_connect_failure``:
-    the auto-disable path is a *compound* state mutation — explicit
-    ``enabled: False`` to persistence (asserted by the sibling test)
-    AND ``transition_to_disabled`` on the in-memory state machine
-    (asserted here). Without the in-memory transition the dashboard
-    renders the broken upstream as FAILED instead of DISABLED, which
-    the user reads as "still being retried" rather than "stopped
-    until you click Reconnect."
-    """
+async def test_a_remote_server_that_fails_at_boot_is_failed_with_the_reason() -> None:
+    """Sibling of the test above, in memory: the upstream is FAILED
+    (retryable by the next tool call), carrying the boot error."""
     from mcpolis.adapters.upstream_clients.upstream_state import (
         UpstreamConnectionState,
     )
@@ -297,21 +296,16 @@ async def test_connect_runtime_disable_on_failure_transitions_in_memory_state() 
 
     state = client_manager.get_state(upstream.id)
     assert state is not None
-    assert state.state == UpstreamConnectionState.DISABLED, (
-        f"expected DISABLED after auto-disable; got {state.state!r}"
+    assert state.state == UpstreamConnectionState.FAILED, (
+        f"expected FAILED after a boot failure; got {state.state!r}"
     )
-    assert state.last_failure == "connect timed out", (
-        "the original exception message must reach the dashboard so "
-        "the operator sees WHY the upstream auto-disabled — without "
-        "this they only see the binary Stopped pill"
-    )
+    assert state.last_failure == "connect timed out"
 
 
 @pytest.mark.asyncio
 async def test_connect_runtime_does_not_disable_on_deferred_success() -> None:
     """Negative assertion: a successful deferred-attach must NOT
-    call ``set_disabled``. The auto-disable-on-failure path is for
-    real failures only — a regression that disabled cached
+    call ``set_disabled`` — a regression that disabled cached
     upstreams on the success path would silently strand them as
     "Stopped" in the UI.
     """
@@ -335,17 +329,13 @@ async def test_connect_runtime_does_not_disable_on_deferred_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_connect_runtime_skips_http_after_prior_failure_set_disabled() -> None:
-    """Migration sequence (HTTP path): simulate a permanently
-    broken HTTP service-account upstream across two boots. First
-    boot fails → ``set_disabled`` fires → next boot's
-    ``get_disabled_ids`` includes the upstream → reconciler skips
-    it without calling ``connect_shared``.
+async def test_a_remote_server_that_failed_at_boot_is_retried_at_the_next_boot() -> None:
+    """Across two boots: the first boot's failure is not saved as
+    stopped, so the second boot tries again (cheap for HTTP: no
+    sandbox), and a server that has recovered comes back on its own.
 
     Stdio takes the upfront-skip path via the cache gate (see
-    ``test_connect_runtime_skips_stdio_when_no_cache``); HTTP is
-    the only path that exercises the auto-disable circuit breaker,
-    because HTTP has no per-upstream cache to gate on.
+    ``test_connect_runtime_skips_stdio_when_no_cache``).
     """
     from mcpolis.domain.model.upstream import TransportType
     org_id = "acme"
@@ -389,20 +379,17 @@ async def test_connect_runtime_skips_http_after_prior_failure_set_disabled() -> 
     )
     org_manager._runtimes[org_id] = runtime  # pyright: ignore[reportPrivateUsage]
 
-    # Boot 1: connect fails → set_disabled fires.
+    # Boot 1: connect fails; nothing is saved as stopped.
     await org_manager.connect_runtime(runtime)
-    assert upstream.id in disabled_state, (
-        f"boot 1 should have called set_disabled; "
-        f"disabled_state={disabled_state!r}"
+    assert disabled_state == set(), (
+        f"boot 1 saved a boot failure as stopped: {disabled_state!r}"
     )
     connect_shared_after_boot_1 = client_manager.connect_shared.await_count
 
-    # Boot 2: get_disabled_ids now returns the upstream → skipped.
+    # Boot 2: the upstream is tried again.
     await org_manager.connect_runtime(runtime)
-    assert client_manager.connect_shared.await_count == connect_shared_after_boot_1, (
-        "boot 2 should have skipped the disabled upstream entirely; "
-        f"connect_shared was called {client_manager.connect_shared.await_count} "
-        f"times total (was {connect_shared_after_boot_1} after boot 1)"
+    assert client_manager.connect_shared.await_count == connect_shared_after_boot_1 + 1, (
+        "boot 2 should have retried the upstream that failed at boot 1"
     )
 
 
@@ -438,3 +425,65 @@ async def test_connect_runtime_marks_deferred_upstream_as_connected() -> None:
         f"got connected={status.connected!r}, failed={status.failed!r}"
     )
     assert upstream.id not in status.failed
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_the_boot_connect_is_not_a_boot_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An admin clicks Stop while a service-account HTTP upstream's boot
+    connect is still running (seconds after a deploy). The Stop aborts the
+    connect. Boot must treat that as the Stop it is: no ERROR log (a
+    Sentry alert) and no "the connect was cancelled" failure reason shown
+    on the dashboard. (Third review pass.)"""
+    org_id = "acme"
+    upstream = make_upstream_definition(
+        id="http-sa", transport=TransportType.streamable_http,
+    )
+    mgr = UpstreamClientManager(upstreams=[upstream], org_id=org_id)
+    entered = asyncio.Event()
+
+    async def parked_connect(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(mgr, "_create_task", parked_connect)
+    tool_registry = MagicMock()
+    tool_registry.hydrate = AsyncMock()
+    tool_registry.refresh_all = AsyncMock()
+    runtime = OrgRuntime(
+        org_id=org_id,
+        policy_engine=MagicMock(get_admin_emails=MagicMock(return_value=[])),
+        tool_registry=tool_registry,
+        client_manager=mgr,
+        tool_router=MagicMock(),
+        config_service=MagicMock(),
+        upstreams=[upstream],
+    )
+    connection_repo = MagicMock()
+    connection_repo.get_disabled_ids = AsyncMock(return_value=set())
+    connection_repo.set_disabled = AsyncMock()
+    org_manager = OrgRuntimeManager(
+        config_repo=MagicMock(), upstream_config_repo=MagicMock(),
+        connection_repo=connection_repo, audit_repo=MagicMock(),
+        tool_catalog_repo=MagicMock(), server_url="http://localhost:8080",
+    )
+    org_manager._runtimes[org_id] = runtime  # pyright: ignore[reportPrivateUsage]
+
+    with structlog.testing.capture_logs() as logs:
+        boot = asyncio.create_task(org_manager.connect_runtime(runtime))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await mgr.disconnect_upstream(upstream.id)  # the admin's Stop
+        await asyncio.wait_for(boot, timeout=10)
+
+    state = mgr.get_state(upstream.id)
+    assert state is not None
+    assert state.state == UpstreamConnectionState.DISABLED
+    assert state.last_failure is None, (
+        f"a Stop during boot reads as a boot failure: {state.last_failure!r}"
+    )
+    assert not [
+        entry for entry in logs if entry.get("event") == "upstream.connect.failed"
+    ], "a Stop during boot raised an ERROR (Sentry) event"
+    connection_repo.set_disabled.assert_not_awaited()
+    await mgr.stop_all()

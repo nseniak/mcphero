@@ -14,6 +14,8 @@ decrypts on read.
 """
 from __future__ import annotations
 
+import dataclasses
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -154,22 +156,53 @@ class MongoConnectionRepository(ConnectionStore, ConnectionRepository):
         )
         if doc is None or "token" not in doc:
             return None
-        return _deserialize_token(doc["token"])
+        # The revision sits beside the token, in plain text, so a
+        # conditional write can filter on it; the token's secrets are
+        # encrypted with a random nonce and cannot be.
+        return dataclasses.replace(
+            _deserialize_token(doc["token"]), revision=doc.get("revision"),
+        )
+
+    @staticmethod
+    def _user_token_doc(
+        user_id: str, upstream_id: str, token: OAuthToken, revision: str,
+    ) -> dict[str, Any]:
+        return {
+            "key": _user_key(user_id, upstream_id),
+            "token": _serialize_token(token),
+            "revision": revision,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
 
     async def put_user_token(
         self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken
-    ) -> None:
-        now = datetime.now(UTC).isoformat()
+    ) -> str:
+        revision = uuid.uuid4().hex
         await self._coll.replace_one(
             org_id,
             {"key": _user_key(user_id, upstream_id)},
-            {
-                "key": _user_key(user_id, upstream_id),
-                "token": _serialize_token(token),
-                "updated_at": now,
-            },
+            self._user_token_doc(user_id, upstream_id, token, revision),
             upsert=True,
         )
+        return revision
+
+    async def put_user_token_if_current(
+        self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken,
+        *, expected_revision: str | None,
+    ) -> str | None:
+        # ``revision: None`` also matches a row saved before revisions
+        # existed (no such field), which is what ``None`` stands for.
+        revision = uuid.uuid4().hex
+        matched = await self._coll.replace_one(
+            org_id,
+            {
+                "key": _user_key(user_id, upstream_id),
+                "revision": expected_revision,
+            },
+            self._user_token_doc(user_id, upstream_id, token, revision),
+            upsert=False,
+        )
+        return revision if matched else None
 
     async def delete_user_token(
         self, org_id: str, user_id: str, upstream_id: str
@@ -177,6 +210,19 @@ class MongoConnectionRepository(ConnectionStore, ConnectionRepository):
         await self._coll.delete_one(
             org_id, {"key": _user_key(user_id, upstream_id)}
         )
+
+    async def delete_user_token_if_current(
+        self, org_id: str, user_id: str, upstream_id: str,
+        *, expected_revision: str | None,
+    ) -> bool:
+        deleted = await self._coll.delete_one(
+            org_id,
+            {
+                "key": _user_key(user_id, upstream_id),
+                "revision": expected_revision,
+            },
+        )
+        return deleted > 0
 
     async def delete_all_user_tokens(self, org_id: str, user_id: str) -> int:
         # Find every user-token doc for this user and delete individually

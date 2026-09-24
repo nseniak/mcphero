@@ -12,6 +12,8 @@ from mcp.shared.message import SessionMessage
 from mcpolis.adapters.gateway_session_registry import GatewaySessionRegistry
 from mcpolis.domain.model.policy import AuthMode
 from mcpolis.domain.services.upstream_connection_service import (
+    UPSTREAM_STOPPED,
+    SessionUnavailable,
     acquire_and_refresh_with_recovery,
 )
 
@@ -297,18 +299,34 @@ class PolicyNotifier:
                 "tool.registry.refresh_after_change.session_gone",
                 upstream_id=upstream_id, org_id=org_id,
             )
+        except SessionUnavailable as exc:
+            if exc.reason == UPSTREAM_STOPPED:
+                # Stopped during the debounce: nothing to refresh, and the
+                # refresh must not start it again.
+                logger.info(
+                    "tool.registry.refresh_after_change.upstream_stopped",
+                    upstream_id=upstream_id, org_id=org_id,
+                )
+            else:
+                self._log_refresh_failure(org_id, upstream_id, exc)
         except Exception as exc:
-            logger.exception(
-                "tool.registry.refresh_after_change.failed",
-                upstream_id=upstream_id,
-                org_id=org_id,
-                error=str(exc),
-                error_class=type(exc).__name__,
-            )
+            self._log_refresh_failure(org_id, upstream_id, exc)
         session_ids = self._registry.get_session_ids_for_org(
             org_id, user_ids_in_org=self._user_ids_for_org(org_id),
         )
         self._send_to_sessions(session_ids)
+
+    @staticmethod
+    def _log_refresh_failure(
+        org_id: str, upstream_id: str, exc: Exception,
+    ) -> None:
+        logger.exception(
+            "tool.registry.refresh_after_change.failed",
+            upstream_id=upstream_id,
+            org_id=org_id,
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
 
     async def _refresh_upstream_resources_and_notify(
         self,

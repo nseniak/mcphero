@@ -211,16 +211,17 @@ async def test_concurrent_heal_coalesces_to_one_fresh_sandbox() -> None:
     upstream = _make_everything_upstream("r1")
     manager = make_e2b_manager(upstream, org_id)
 
-    # Count real fresh-sandbox creates (connect_shared), which is what a
-    # missing single-flight would multiply.
+    # Count real reopens of the shared session. ``_open_shared`` is the one
+    # reopen every shared connect runs (Start, boot, lazy attach, heal), so
+    # it is what a missing single-flight would multiply.
     connect_calls = [0]
-    orig_connect = manager.connect_shared
+    orig_open = manager._open_shared  # pyright: ignore[reportPrivateUsage]
 
-    async def _counting_connect(up: Any, *a: Any, **k: Any) -> None:
+    async def _counting_open(up: Any, *a: Any, **k: Any) -> Any:
         connect_calls[0] += 1
-        await orig_connect(up, *a, **k)
+        return await orig_open(up, *a, **k)
 
-    manager.connect_shared = _counting_connect  # type: ignore[method-assign]
+    manager._open_shared = _counting_open  # type: ignore[method-assign]
 
     try:
         await manager.connect_shared(upstream)  # initial create
@@ -236,10 +237,9 @@ async def test_concurrent_heal_coalesces_to_one_fresh_sandbox() -> None:
         ]
         await asyncio.gather(*healers)
         created = connect_calls[0] - baseline
-        print(f"R1: 6 concurrent healers → {created} fresh sandbox create(s)")
+        print(f"R1: 6 concurrent healers → {created} reopen(s)")
         assert created == 1, (
-            f"6 concurrent healers must coalesce to ONE fresh sandbox, "
-            f"got {created}"
+            f"6 concurrent healers must coalesce to ONE reopen, got {created}"
         )
 
         # The healed shared session must be usable.

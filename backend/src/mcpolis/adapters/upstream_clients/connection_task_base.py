@@ -7,10 +7,12 @@ which owns the shared ``__init__`` + all three lifecycle methods.
 Per-transport differences ride three small hooks:
 
 - ``_run`` — the per-transport background lifecycle (acquire streams,
-  build a ClientSession, set ``self._session_future``, run until
+  build a ClientSession, hand it over with ``_hand_over``, run until
   ``self._shutdown_event`` fires, tear down). The ``except Exception
-  → set_exception`` safety net for the future stays inside each
-  subclass's ``_run``.
+  → _fail_start`` safety net stays inside each subclass's ``_run``.
+  ``_run`` must also let go at once when the caller of ``start`` gives
+  up: it races its handshake through ``_unless_abandoned`` and returns
+  when ``_hand_over`` refuses (see ``start``).
 - ``_log_extras() -> dict[str, str]`` — per-transport structlog fields
   attached to spawn-event AND close-timeout log lines. Must include
   ``transport=``; sandbox additionally returns ``provider=``.
@@ -31,6 +33,8 @@ import asyncio
 import contextvars
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable
+from typing import TypeVar
 
 import structlog
 from mcp.client.session import ClientSession
@@ -52,6 +56,17 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 # ``_close_timeout_seconds()`` to return their per-module
 # ``CLOSE_TIMEOUT`` constant.
 DEFAULT_CLOSE_TIMEOUT = 10.0
+
+# How long a connect whose caller gave up may take to let go of its
+# transport. A sandbox that is still being created finishes that first
+# (a few seconds), then the session's own cleanup kills it.
+ABANDON_TIMEOUT = 30.0
+
+T = TypeVar("T")
+
+
+class ConnectAbandoned(Exception):
+    """Whoever waited for this connect gave up while it was starting."""
 
 
 class ConnectionTaskBase(ABC):
@@ -85,6 +100,9 @@ class ConnectionTaskBase(ABC):
         )
         self._task: asyncio.Task[None] | None = None
         self._closed = False
+        # Set when whoever waited on ``start`` gave up; ``_run`` then lets
+        # go of whatever it holds at its next step (see ``start``).
+        self._abandoned = asyncio.Event()
         self.server_info: ServerInfo | None = None
         self.self_description: UpstreamSelfDescription | None = None
         # Set by the transport backend (via the yielded session) when
@@ -150,31 +168,126 @@ class ConnectionTaskBase(ABC):
         """Spawn the background task and wait for the session to be
         ready. The task runs in a fresh ``contextvars.Context`` so
         request-scoped contextvars never leak in (see §3.10); inside
-        that context, durable identifiers get bound."""
+        that context, durable identifiers get bound.
+
+        If the caller gives up while waiting (a Stop, a shutdown, the
+        last request hanging up), the background task is told to let go
+        and this returns only once it has: nobody will ever hold or close
+        it, and it used to finish starting for nobody, with a sandbox
+        running, until the MCP answered or the init timeout (up to
+        120 s). That also covers a session that became ready in the very
+        step the caller gave up, whose result the cancel threw away.
+
+        The background task is told, never cancelled. Cancelled while it
+        creates a sandbox, it would leave one running that only it knows
+        about; cancelled while it cleans up, it would skip the kill. So it
+        finishes acquiring its transport, then stops at the handshake
+        (``_unless_abandoned``) or at the hand-over (``_hand_over``), and
+        its context managers release everything on the way out.
+        """
         fresh_ctx = contextvars.Context()
         self._task = asyncio.create_task(
             self._run_in_session_context(), context=fresh_ctx,
         )
-        return await self._session_future
+        try:
+            return await self._session_future
+        except asyncio.CancelledError:
+            await self._abandon_despite_cancels()
+            raise
+
+    async def _abandon_despite_cancels(self) -> None:
+        """``_abandon``, carried to its end even if this task is cancelled
+        again meanwhile (a shutdown, a Stop right after the caller hung
+        up). Stopping early would let whoever waits for this connect to
+        wind down go on while its transport is still held. Bounded by
+        ``ABANDON_TIMEOUT``."""
+        abandoning = asyncio.ensure_future(self._abandon())
+        while not abandoning.done():
+            try:
+                await asyncio.shield(abandoning)
+            except asyncio.CancelledError:
+                continue
+
+    async def _abandon(self) -> None:
+        task = self._task
+        if task is None or task.done():
+            return
+        self._closed = True
+        self._abandoned.set()
+        # A session handed over in the same step is already serving;
+        # this ends it the way ``close`` would.
+        self._shutdown_event.set()
+        done, _ = await asyncio.wait({task}, timeout=ABANDON_TIMEOUT)
+        if not done:
+            logger.warning(
+                "upstream.session.task.abandon_slow",
+                upstream_id=self._upstream.id,
+                timeout_seconds=ABANDON_TIMEOUT,
+                **self._log_extras(),
+            )
+
+    def _hand_over(self, session: "ClientSession") -> bool:
+        """Give the ready session to ``start``. Returns ``False`` when
+        nobody waits for it any more: ``_run`` must then return, so its
+        context managers close the session and release the transport."""
+        if self._session_future.done():
+            return False
+        self._session_future.set_result(session)
+        return True
+
+    def _fail_start(self, exc: BaseException) -> None:
+        """Report a failed start to ``start``, if it still waits."""
+        if not self._session_future.done():
+            self._session_future.set_exception(exc)
+
+    async def _unless_abandoned(self, work: Awaitable[T]) -> T:
+        """Await ``work`` unless the caller of ``start`` gives up first,
+        in which case ``work`` is cancelled and ``ConnectAbandoned`` is
+        raised. For the handshake, which is where a start spends its
+        time (a package download, a slow server)."""
+        work_task = asyncio.ensure_future(work)
+        gave_up = asyncio.ensure_future(self._abandoned.wait())
+        try:
+            await asyncio.wait(
+                {work_task, gave_up}, return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for pending in (work_task, gave_up):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.wait({work_task, gave_up})
+        if work_task.cancelled() and self._abandoned.is_set():
+            raise ConnectAbandoned()
+        return work_task.result()
 
     async def close(self) -> None:
-        """Signal the background task to shut down and wait for cleanup."""
+        """Signal the background task to shut down and wait for cleanup.
+
+        Waits with ``asyncio.wait``, never ``wait_for`` or a bare await:
+        those pass a cancel of the CALLER on into the task, whose teardown
+        may swallow it (the E2B teardown does, to finish its cleanup), and
+        the caller's cancel is then lost. A Stop aimed at a heal that was
+        closing the old session went unnoticed that way, and the heal
+        brought the upstream back after the Stop. If the caller is
+        cancelled here, its cancel propagates and the task goes on
+        shutting down by itself.
+        """
         if self._closed or self._task is None:
             return
         self._closed = True
         self._shutdown_event.set()
+        task = self._task
         timeout_seconds = self._close_timeout_seconds()
-        try:
-            await asyncio.wait_for(self._task, timeout=timeout_seconds)
-        except asyncio.TimeoutError:
+        done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
+        if not done:
             logger.warning(
                 self._close_timeout_event_name(),
                 upstream_id=self._upstream.id,
                 timeout_seconds=timeout_seconds,
                 **{k: v for k, v in self._log_extras().items() if k != "transport"},
             )
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
+            task.cancel()
+            await asyncio.wait({task})
+            return
+        if not task.cancelled() and (failure := task.exception()) is not None:
+            raise failure

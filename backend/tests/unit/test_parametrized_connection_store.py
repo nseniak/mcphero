@@ -7,6 +7,7 @@ not change observable behavior. When Mongo is not reachable the
 """
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -26,6 +27,9 @@ from mcpolis.adapters.repositories.mongo_client import (
 )
 from mcpolis.adapters.repositories.mongo_connection_repository import (
     MongoConnectionRepository,
+)
+from mcpolis.adapters.repositories.mongo_connection_repository import (
+    _serialize_token as _mongo_serialize_token,  # pyright: ignore[reportPrivateUsage]
 )
 from mcpolis.domain.ports import DEFAULT_ORG_ID
 from tests.unit.mongo_fixture import mongo_available, temp_mongo_database
@@ -842,3 +846,123 @@ async def test_delete_all_for_org_is_org_scoped() -> None:
         assert await store.get_user_token(
             "org-alive", "alice@co.com", "github",
         ) is not None
+
+
+# ── Sign-in revisions: a write or delete derived from one saved sign-in
+#    never lands on a newer one ──────────────────────────────────────────
+
+
+async def _stored(store: ConnectionStore) -> OAuthToken | None:
+    return await store.get_user_token(DEFAULT_ORG_ID, "alice", "notion")
+
+
+async def _save_legacy_row(store: ConnectionStore, token: OAuthToken) -> None:
+    """A row as saved before revisions existed: no revision field."""
+    if isinstance(store, FileConnectionStore):
+        await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", token)
+        path = store._path  # pyright: ignore[reportPrivateUsage]
+        data = json.loads(path.read_text())
+        for row in data.values():
+            row.pop("revision", None)
+        path.write_text(json.dumps(data))
+        return
+    assert isinstance(store, MongoConnectionRepository)
+    await store._coll.replace_one(  # pyright: ignore[reportPrivateUsage]
+        DEFAULT_ORG_ID,
+        {"key": "user:notion:alice"},
+        {
+            "key": "user:notion:alice",
+            "token": _mongo_serialize_token(token),
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        upsert=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_each_save_is_a_new_revision(backend: str, tmp_path: Path) -> None:
+    async with _make_store(backend, tmp_path) as store:
+        first = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("a"))
+        second = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("b"))
+        stored = await _stored(store)
+        assert first != second
+        assert stored is not None and stored.revision == second
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_a_conditional_save_lands_only_on_the_row_it_read(
+    backend: str, tmp_path: Path,
+) -> None:
+    async with _make_store(backend, tmp_path) as store:
+        read = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("old"))
+        refreshed = await store.put_user_token_if_current(
+            DEFAULT_ORG_ID, "alice", "notion", _token("refreshed"),
+            expected_revision=read,
+        )
+        stale = await store.put_user_token_if_current(
+            DEFAULT_ORG_ID, "alice", "notion", _token("stale"),
+            expected_revision=read,
+        )
+        stored = await _stored(store)
+        assert refreshed is not None and refreshed != read
+        assert stale is None
+        assert stored is not None
+        assert (stored.access_token, stored.revision) == ("refreshed", refreshed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_a_conditional_save_never_recreates_a_deleted_row(
+    backend: str, tmp_path: Path,
+) -> None:
+    async with _make_store(backend, tmp_path) as store:
+        read = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("old"))
+        await store.delete_user_token(DEFAULT_ORG_ID, "alice", "notion")
+        saved = await store.put_user_token_if_current(
+            DEFAULT_ORG_ID, "alice", "notion", _token("refreshed"),
+            expected_revision=read,
+        )
+        assert saved is None
+        assert await _stored(store) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_a_conditional_delete_leaves_a_newer_sign_in(
+    backend: str, tmp_path: Path,
+) -> None:
+    async with _make_store(backend, tmp_path) as store:
+        old = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("old"))
+        new = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("new"))
+        assert await store.delete_user_token_if_current(
+            DEFAULT_ORG_ID, "alice", "notion", expected_revision=old,
+        ) is False
+        stored = await _stored(store)
+        assert stored is not None and stored.access_token == "new"
+        assert await store.delete_user_token_if_current(
+            DEFAULT_ORG_ID, "alice", "notion", expected_revision=new,
+        ) is True
+        assert await _stored(store) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_a_row_saved_before_revisions_existed_matches_none(
+    backend: str, tmp_path: Path,
+) -> None:
+    """Sign-ins saved before this change keep working: their revision
+    reads as ``None``, and ``None`` matches them."""
+    async with _make_store(backend, tmp_path) as store:
+        await _save_legacy_row(store, _token("legacy"))
+        stored = await _stored(store)
+        assert stored is not None and stored.revision is None
+
+        refreshed = await store.put_user_token_if_current(
+            DEFAULT_ORG_ID, "alice", "notion", _token("refreshed"),
+            expected_revision=None,
+        )
+        assert refreshed is not None
+        again = await _stored(store)
+        assert again is not None and again.access_token == "refreshed"

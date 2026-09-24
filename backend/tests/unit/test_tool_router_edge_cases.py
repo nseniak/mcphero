@@ -34,6 +34,10 @@ from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.services.tool_router import ToolRouter
 from tests.unit._state_seed import seed_shared_session, seed_user_session
+from tests.unit.stall_client_manager_fake import (
+    StallClientManagerFake,
+    make_stall_client_manager,
+)
 from tests.unit.factories import (
     make_discovered_tool,
     make_upstream_definition,
@@ -97,32 +101,13 @@ async def test_route_call_upstream_missing_from_router_returns_error(
 #     fresh reconnect) and be audited as an error. ---------------------
 
 
-class _NonStallHealManager:
-    """service_account manager slice the router touches: a fixed session
-    plus a ``reconnect_shared_fresh`` heal counter. A non-stall McpError
-    must leave ``fresh_calls == 0``."""
-
-    def __init__(self, session: Any) -> None:
-        self._session = session
-        self.fresh_calls = 0
-
-    async def ensure_shared_connected(self, upstream: Any) -> None:
-        pass
-
-    def get_session(self, upstream_id: str, user_id: str | None = None) -> Any:
-        return self._session
-
-    async def reconnect_shared_fresh(self, upstream: Any) -> None:
-        self.fresh_calls += 1
-
-
 def _make_mcp_error_router(
     tmp_path: Path, error: McpError, *, upstream_id: str = "gh",
-) -> tuple[ToolRouter, _NonStallHealManager, FileAuditRepository]:
+) -> tuple[ToolRouter, StallClientManagerFake, FileAuditRepository]:
     upstream = make_upstream_definition(id=upstream_id)  # service_account
     session = MagicMock()
     session.call_tool = AsyncMock(side_effect=error)
-    cm = _NonStallHealManager(session)
+    cm = make_stall_client_manager(session)
     registry = ToolRegistry([upstream], cast(Any, cm))
     registry._tools = [
         # readonly → retry_safe, to prove that even a retry-eligible tool
@@ -282,7 +267,7 @@ async def test_oauth_stall_heal_tolerates_close_failure_and_evicts(
     seed_user_session(cm, "gh", "alice", session=session, task=failing_task)
 
     # The reconnect after eviction must NOT find a live session (we evicted
-    # it), so it falls through to reconnect_with_stored_tokens. Stub that to
+    # it), so it falls through to a stored-token reconnect. Stub that to
     # report "couldn't reconnect" so the call surfaces an opaque error
     # rather than needing a real OAuth dance — the point under test is the
     # eviction surviving the close failure, not the reconnect succeeding.
@@ -297,7 +282,7 @@ async def test_oauth_stall_heal_tolerates_close_failure_and_evicts(
         return DisconnectReason.no_tokens
 
     monkeypatch.setattr(
-        ucs_module, "reconnect_with_stored_tokens", fake_reconnect,
+        ucs_module, "_reconnect_from_stored_tokens", fake_reconnect,
     )
 
     audit = FileAuditRepository(tmp_path / "audit.jsonl")

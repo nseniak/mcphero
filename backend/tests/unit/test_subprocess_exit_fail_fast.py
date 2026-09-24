@@ -347,3 +347,24 @@ async def test_local_subprocess_init_race_fast_fails_on_bogus_command() -> None:
 
 # Pyright: ``Any`` import preserved for future tests; suppress unused.
 _ = Any
+
+
+@pytest.mark.asyncio
+async def test_a_handshake_that_fails_as_the_process_exits_reports_the_exit() -> None:
+    """The process dies, so the handshake fails too ("Connection closed"),
+    and both finish in the same step. The exit code and stderr say far
+    more than the handshake error, so the exit wins. (Review pass 2, N3.)"""
+    session = _FakeSession()
+    exit_signal = ExitSignalImpl()
+    exit_signal.append_stderr(b"boom: not a python script\n")
+
+    async def die_at_once() -> None:
+        await asyncio.sleep(0.05)
+        session.fail_init(RuntimeError("Connection closed"))
+        exit_signal.mark_exited(2)
+
+    asyncio.create_task(die_at_once())
+
+    with pytest.raises(SubprocessExitedDuringInit) as exc_info:
+        await init_with_exit_race(_as_session(session), exit_signal)
+    assert exc_info.value.exit_code == 2

@@ -75,7 +75,7 @@ def make_oauth_token(
 
 def make_client_manager() -> MagicMock:
     cm = MagicMock()
-    cm.connect_upstream_for_user = AsyncMock()
+    cm.replace_user_session = AsyncMock()
     return cm
 
 
@@ -93,7 +93,7 @@ async def test_try_connect_no_tokens(tmp_path: Path) -> None:
         DEFAULT_ORG_ID, upstream, "__admin__", store, cm, SERVER_URL,
     )
     assert result is None
-    cm.connect_upstream_for_user.assert_not_called()
+    cm.replace_user_session.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -111,7 +111,7 @@ async def test_try_connect_with_valid_tokens(tmp_path: Path) -> None:
     )
     assert result is not None
     assert result.connected is True
-    cm.connect_upstream_for_user.assert_awaited_once()
+    cm.replace_user_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -129,7 +129,7 @@ async def test_try_connect_with_no_expiry_tokens(tmp_path: Path) -> None:
     )
     assert result is not None
     assert result.connected is True
-    cm.connect_upstream_for_user.assert_awaited_once()
+    cm.replace_user_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -146,7 +146,7 @@ async def test_try_connect_with_expired_tokens(tmp_path: Path) -> None:
         DEFAULT_ORG_ID, upstream, "__admin__", store, cm, SERVER_URL,
     )
     assert result is None
-    cm.connect_upstream_for_user.assert_not_called()
+    cm.replace_user_session.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -155,7 +155,7 @@ async def test_try_connect_connection_failure(tmp_path: Path) -> None:
     store = FileConnectionStore(tmp_path)
     upstream = make_http_upstream()
     cm = make_client_manager()
-    cm.connect_upstream_for_user.side_effect = RuntimeError("connection refused")
+    cm.replace_user_session.side_effect = RuntimeError("connection refused")
 
     token = make_oauth_token(expires_at=datetime.now(UTC) + timedelta(hours=1))
     await store.put_user_token(DEFAULT_ORG_ID,"__admin__", "mixpanel", token)
@@ -280,7 +280,7 @@ async def test_initiate_with_stored_code_from_restart(tmp_path: Path) -> None:
         )
 
     # Token refresh path → should try to connect
-    # (connect_upstream_for_user is called, which is our mock)
+    # (replace_user_session is called, which is our mock)
     assert result.connected is True or result.error is not None
 
     # Verify the pending code was consumed
@@ -340,7 +340,10 @@ async def test_on_tokens_acquired_called_after_background_acquisition(
         callback_called = True
 
     # Pre-store tokens so the check at the end of _acquire_tokens finds them
+    # (as a completed sign-in leaves them: the code exchange replaces
+    # whatever is stored).
     from mcp.shared.auth import OAuthToken as SdkToken
+    storage.mark_fresh_sign_in()
     await storage.set_tokens(SdkToken(
         access_token="new-access",
         token_type="Bearer",
@@ -461,8 +464,9 @@ async def test_on_error_not_called_when_tokens_acquired(
     def on_error(msg: str, reason: OAuthFailureReason) -> None:
         error_calls.append((msg, reason))
 
-    # Pre-store tokens
+    # Pre-store tokens, as a completed sign-in leaves them.
     from mcp.shared.auth import OAuthToken as SdkToken
+    storage.mark_fresh_sign_in()
     await storage.set_tokens(SdkToken(
         access_token="new-access",
         token_type="Bearer",
@@ -1038,7 +1042,7 @@ async def test_initiate_finalize_silent_refresh_failure_surfaces_post_refresh_er
 ) -> None:
     """When the background task signals a silent token refresh
     (``auth_url is None``) but the subsequent
-    ``connect_upstream_for_user`` raises, the error message must
+    ``replace_user_session`` raises, the error message must
     distinguish "auth itself failed" from "auth succeeded but the
     post-auth connect failed". Operators triage these differently:
     the former is a user-credential issue, the latter is an upstream
@@ -1048,7 +1052,7 @@ async def test_initiate_finalize_silent_refresh_failure_surfaces_post_refresh_er
     store = FileConnectionStore(tmp_path)
     upstream = make_http_upstream()
     cm = make_client_manager()
-    cm.connect_upstream_for_user = AsyncMock(
+    cm.replace_user_session = AsyncMock(
         side_effect=RuntimeError("transport blew up after refresh"),
     )
     coordinator = PendingAuthCoordinator(make_signing_key())
@@ -1262,7 +1266,7 @@ async def test_background_terminal_failure_marks_pending_failed(
         DEFAULT_ORG_ID, "mixpanel", "__admin__",
     )
     storage = MagicMock()
-    storage.get_tokens = AsyncMock(return_value=None)
+    storage.peek_tokens = AsyncMock(return_value=None)
     errors: list[tuple[str, OAuthFailureReason]] = []
 
     async def _probe(*_a: Any, **_k: Any) -> None: ...
@@ -1416,3 +1420,51 @@ def test_coerce_failure_reason_never_raises() -> None:
     assert _coerce_failure_reason("not-a-member") is (
         OAuthFailureReason.unknown
     )
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_sign_in_saves_its_app_registration_again(
+    tmp_path: Path,
+) -> None:
+    """A reconnect of the OLD sign-in failed while the user was on the
+    consent page; its cleanup deleted the app registration the new
+    sign-in had just made (the token it deleted was still the old one).
+    Once the new sign-in's tokens are saved, the registration is saved
+    again, and the old sign-in's failed refreshes stop counting."""
+    from mcp.shared.auth import OAuthClientInformationFull
+    from mcp.shared.auth import OAuthToken as SdkToken
+    from pydantic import AnyUrl
+
+    from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
+    from mcpolis.domain.services.upstream_connection_service import (
+        _start_background_token_acquisition,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    store = FileConnectionStore(tmp_path)
+    upstream = make_http_upstream()
+    coordinator = PendingAuthCoordinator(make_signing_key())
+    user = "alice@co.com"
+    pending = coordinator.create_pending(DEFAULT_ORG_ID, "mixpanel", user)
+    storage = McpTokenStorage(store, DEFAULT_ORG_ID, "mixpanel", user)
+    await store.record_refresh_failure(DEFAULT_ORG_ID, "mixpanel", user)
+
+    # The code exchange saved the new sign-in's tokens.
+    storage.mark_fresh_sign_in()
+    await storage.set_tokens(SdkToken(access_token="new-access", token_type="Bearer"))
+    provider = MagicMock()
+    provider.context.oauth_metadata = None
+    provider.context.client_info = OAuthClientInformationFull(
+        client_id="cid-new",
+        redirect_uris=[AnyUrl("http://localhost:8000/api/oauth/upstream/callback")],
+    )
+
+    with patch("mcpolis.domain.services.upstream_connection_service.httpx") as mock_httpx:
+        mock_client = AsyncMock()
+        mock_httpx.AsyncClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_httpx.AsyncClient.return_value.__aexit__ = AsyncMock(return_value=False)
+        task = _start_background_token_acquisition(upstream, provider, storage, pending)
+        await asyncio.wait_for(task, timeout=5.0)
+
+    client_info = await store.get_client_info(DEFAULT_ORG_ID, "mixpanel", user)
+    assert client_info is not None and client_info["client_id"] == "cid-new"
+    assert await store.get_refresh_failures(DEFAULT_ORG_ID, "mixpanel", user) is None

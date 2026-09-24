@@ -21,11 +21,21 @@ class ConnectionRepository(Protocol):
 
     async def put_user_token(
         self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken
-    ) -> None: ...
+    ) -> str: ...
+
+    async def put_user_token_if_current(
+        self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken,
+        *, expected_revision: str | None,
+    ) -> str | None: ...
 
     async def delete_user_token(
         self, org_id: str, user_id: str, upstream_id: str
     ) -> None: ...
+
+    async def delete_user_token_if_current(
+        self, org_id: str, user_id: str, upstream_id: str,
+        *, expected_revision: str | None,
+    ) -> bool: ...
 
     async def delete_all_user_tokens(self, org_id: str, user_id: str) -> int: ...
 

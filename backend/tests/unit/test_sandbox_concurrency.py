@@ -326,3 +326,49 @@ async def test_reconciler_does_not_kill_in_flight_create() -> None:
         f"sandbox; kills={mock.kills}"
     )
     assert mock.kills == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_create_whose_kill_is_cut_short_still_clears_its_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP command fails to start in a freshly created sandbox, and a
+    shutdown cancels the cleanup while it kills that sandbox. The
+    "creating" marker must still be cleared: left behind, it hides the
+    sandbox from the boot reconcile. (Review of the follow-up fixes, F4.)"""
+    from tests.unit.sandbox_e2b_mock import MockE2BSandboxHandle
+    from mcpolis.adapters.sandbox_e2b import E2BSDKError
+
+    persistence = InMemorySandboxPersistenceRepository()
+    service, _ = make_reuse_e2b_service(persistence=persistence)
+    upstream = make_upstream_definition(id="ups-failed", command="npx")
+    killing = asyncio.Event()
+
+    async def refuse_to_start(_self: object, *_a: object, **_k: object) -> object:
+        raise E2BSDKError("E2BSDKError", "command failed to start")
+
+    async def slow_kill(_self: object) -> None:
+        killing.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(MockE2BSandboxHandle, "run_command", refuse_to_start)
+    monkeypatch.setattr(MockE2BSandboxHandle, "kill", slow_kill)
+
+    async def open_session() -> None:
+        async with service.session(
+            session_id="failed",
+            org_id="acme",
+            upstream=upstream,
+            resources=make_default_resources(),
+            denylist=(),
+        ):
+            pass
+
+    opening = asyncio.create_task(open_session())
+    await asyncio.wait_for(killing.wait(), timeout=5)
+    opening.cancel()  # the shutdown cuts the kill short
+    await asyncio.gather(opening, return_exceptions=True)
+
+    assert await persistence.get(org_id="acme", upstream_id="ups-failed") is None, (
+        "a failed create left its creating marker behind"
+    )

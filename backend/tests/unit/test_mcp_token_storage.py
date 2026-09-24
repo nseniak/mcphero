@@ -1,6 +1,7 @@
 """Tests for McpTokenStorage adapter."""
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from pydantic import AnyUrl
 from mcpolis.adapters.auth.mcp_token_storage import (  # pyright: ignore[reportPrivateUsage]
     McpTokenStorage,
     _internal_to_sdk_token,
+    _sdk_to_internal_token,
 )
 from mcpolis.adapters.repositories.connection_store import (
     OAuthToken as InternalOAuthToken,
@@ -46,6 +48,7 @@ async def test_set_and_get_tokens(tmp_path: Path) -> None:
         refresh_token="refresh-456",
     )
 
+    storage.mark_fresh_sign_in()
     await storage.set_tokens(sdk_token)
     result = await storage.get_tokens()
 
@@ -85,6 +88,7 @@ async def test_set_tokens_emits_rotation_event(
         refresh_token="refresh-NEW456",
     )
 
+    storage.mark_fresh_sign_in()
     with structlog.testing.capture_logs() as logs:
         await storage.set_tokens(sdk_token)
 
@@ -116,12 +120,14 @@ async def test_set_tokens_records_previous_access_suffix_on_replacement(
     store = FileConnectionStore(tmp_path)
     storage = McpTokenStorage(store, DEFAULT_ORG_ID, "notion", "alice@co.com")
 
+    storage.mark_fresh_sign_in()
     await storage.set_tokens(OAuthToken(
         access_token="access-OLDxyz",
         token_type="Bearer",
         expires_in=3600,
         refresh_token="refresh-OLD",
     ))
+    await storage.get_tokens()  # the library loads, then refreshes
 
     with structlog.testing.capture_logs() as logs:
         await storage.set_tokens(OAuthToken(
@@ -179,10 +185,12 @@ async def test_separate_users_have_separate_storage(
     storage_alice = McpTokenStorage(store, DEFAULT_ORG_ID, "github", "alice")
     storage_bob = McpTokenStorage(store, DEFAULT_ORG_ID, "github", "bob")
 
+    storage_alice.mark_fresh_sign_in()
     await storage_alice.set_tokens(OAuthToken(
         access_token="alice-token",
         token_type="Bearer",
     ))
+    storage_bob.mark_fresh_sign_in()
     await storage_bob.set_tokens(OAuthToken(
         access_token="bob-token",
         token_type="Bearer",
@@ -195,6 +203,132 @@ async def test_separate_users_have_separate_storage(
     assert alice_result.access_token == "alice-token"
     assert bob_result is not None
     assert bob_result.access_token == "bob-token"
+
+
+# ── a write never clobbers a newer sign-in ─────────────────────────
+
+
+def make_sdk_token(access_token: str) -> OAuthToken:
+    return OAuthToken(
+        access_token=access_token,
+        token_type="Bearer",
+        expires_in=3600,
+        refresh_token=f"refresh-{access_token}",
+    )
+
+
+async def make_signed_in_storage(
+    tmp_path: Path, access_token: str = "old",
+) -> tuple[FileConnectionStore, McpTokenStorage]:
+    """A stored sign-in, loaded by a storage the way the sign-in
+    library loads it before refreshing."""
+    store = FileConnectionStore(tmp_path)
+    signing_in = McpTokenStorage(store, DEFAULT_ORG_ID, "notion", "alice@co.com")
+    signing_in.mark_fresh_sign_in()
+    await signing_in.set_tokens(make_sdk_token(access_token))
+    storage = McpTokenStorage(store, DEFAULT_ORG_ID, "notion", "alice@co.com")
+    await storage.get_tokens()
+    return store, storage
+
+
+async def stored_access_token(store: FileConnectionStore) -> str | None:
+    stored = await store.get_user_token(DEFAULT_ORG_ID, "alice@co.com", "notion")
+    return stored.access_token if stored is not None else None
+
+
+async def sign_in_again(store: FileConnectionStore, access_token: str) -> None:
+    other = McpTokenStorage(store, DEFAULT_ORG_ID, "notion", "alice@co.com")
+    other.mark_fresh_sign_in()
+    await other.set_tokens(make_sdk_token(access_token))
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_is_not_saved_over_a_newer_sign_in(tmp_path: Path) -> None:
+    store, storage = await make_signed_in_storage(tmp_path)
+    await sign_in_again(store, "new")
+
+    with structlog.testing.capture_logs() as logs:
+        await storage.set_tokens(make_sdk_token("old-refreshed"))
+
+    assert await stored_access_token(store) == "new"
+    skipped = [e for e in logs if e["event"] == "oauth.token.storage.write_skipped"]
+    assert [e["reason"] for e in skipped] == ["newer_sign_in"]
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_does_not_bring_back_a_disconnected_sign_in(
+    tmp_path: Path,
+) -> None:
+    store, storage = await make_signed_in_storage(tmp_path)
+    await store.delete_user_token(DEFAULT_ORG_ID, "alice@co.com", "notion")
+
+    await storage.set_tokens(make_sdk_token("old-refreshed"))
+
+    assert await stored_access_token(store) is None
+
+
+@pytest.mark.asyncio
+async def test_successive_refreshes_of_the_same_sign_in_are_all_saved(
+    tmp_path: Path,
+) -> None:
+    """Each saved refresh becomes the row the next one is checked
+    against."""
+    store, storage = await make_signed_in_storage(tmp_path)
+
+    await storage.set_tokens(make_sdk_token("refreshed-1"))
+    await storage.set_tokens(make_sdk_token("refreshed-2"))
+
+    assert await stored_access_token(store) == "refreshed-2"
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_sign_in_replaces_whatever_is_stored(tmp_path: Path) -> None:
+    store, storage = await make_signed_in_storage(tmp_path)
+    await sign_in_again(store, "someone-else")
+
+    storage.mark_fresh_sign_in()
+    await storage.set_tokens(make_sdk_token("latest"))
+
+    assert await stored_access_token(store) == "latest"
+
+
+@pytest.mark.asyncio
+async def test_peeking_does_not_change_which_sign_in_a_refresh_came_from(
+    tmp_path: Path,
+) -> None:
+    """Our own reads (``peek_tokens``) see the new sign-in, but the
+    library still holds the old one, so its refresh must not land."""
+    store, storage = await make_signed_in_storage(tmp_path)
+    await sign_in_again(store, "new")
+
+    peeked = await storage.peek_tokens()
+    await storage.set_tokens(make_sdk_token("old-refreshed"))
+
+    assert peeked is not None and peeked.access_token == "new"
+    assert await stored_access_token(store) == "new"
+
+
+@pytest.mark.asyncio
+async def test_a_sign_in_saved_before_revisions_existed_still_refreshes(
+    tmp_path: Path,
+) -> None:
+    """Rows saved before this change carry no revision. They keep
+    working: a refresh of one is saved."""
+    store = FileConnectionStore(tmp_path)
+    await store.put_user_token(
+        DEFAULT_ORG_ID, "alice@co.com", "notion",
+        _sdk_to_internal_token(make_sdk_token("legacy")),
+    )
+    data = json.loads((tmp_path / "connections.json").read_text())
+    for row in data.values():
+        row.pop("revision", None)
+    (tmp_path / "connections.json").write_text(json.dumps(data))
+    storage = McpTokenStorage(store, DEFAULT_ORG_ID, "notion", "alice@co.com")
+    await storage.get_tokens()
+
+    await storage.set_tokens(make_sdk_token("legacy-refreshed"))
+
+    assert await stored_access_token(store) == "legacy-refreshed"
 
 
 # ── expires_in round-trip ─────────────────────────────────────────

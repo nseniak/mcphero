@@ -42,6 +42,9 @@ from mcpolis.adapters.observability.analytics_client import (
 from mcpolis.adapters.observability.sentry_setup import init_sentry
 from mcpolis.adapters.observability.structlog_setup import configure_structlog
 from mcpolis.adapters.gateway_session_registry import GatewaySessionRegistry
+from mcpolis.adapters.upstream_clients.session_single_flight import (
+    ConnectAborted,
+)
 from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.adapters.repositories.audit_repository import (
     AuditRepository as LegacyAuditRepository,
@@ -1187,6 +1190,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await runtime.client_manager.connect_shared(upstream_def)
             await runtime.tool_registry.refresh_upstream(
                 settings.demo_upstream_id,
+            )
+        except ConnectAborted:
+            # A Stop or a shutdown aborted the seed's connect; expected.
+            logger.info(
+                "demo_upstream.seed.connect_aborted",
+                org_id=target_org_id,
+                upstream_id=settings.demo_upstream_id,
             )
         except Exception:  # noqa: BLE001 — log + continue startup
             logger.exception(

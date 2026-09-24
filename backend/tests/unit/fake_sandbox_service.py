@@ -122,6 +122,11 @@ class SessionHandle:
         self._to_client_send: (
             MemoryObjectSendStream[SessionMessage | Exception] | None
         ) = None
+        # True once the session's context has exited: the manager closed
+        # it. The point after which a real backend has already deleted
+        # the persisted ref and killed the sandbox, unless asked to
+        # preserve it first.
+        self.closed = False
 
     def bind_runtime(
         self,
@@ -220,9 +225,22 @@ class FakeSandboxService:
         *,
         server_factory: ServerFactory | None = None,
         supports_pause_resume: bool = True,
+        hold_entry: asyncio.Event | None = None,
+        hold_close: asyncio.Event | None = None,
     ) -> None:
         self._server_factory = server_factory or _default_server_factory
         self._supports_pause_resume = supports_pause_resume
+        # When set, every ``session()`` entry waits on it first: the
+        # stand-in for a sandbox still being created at the provider.
+        self._hold_entry = hold_entry
+        # Entries begun, including ones still held by ``hold_entry``.
+        self.entries_started = 0
+        # When set, every session's teardown waits on it first and
+        # swallows cancels meanwhile, as the E2B teardown does while it
+        # waits for its stdin sender, so it can finish its cleanup.
+        self._hold_close = hold_close
+        self.closes_started = 0
+        self.cancels_swallowed = 0
         # Number of times ``session()``'s context manager has been
         # ENTERED. Single-flight / coalescing tests assert this is
         # exactly 1 after N concurrent reconnect attempts.
@@ -234,6 +252,13 @@ class FakeSandboxService:
         # is useless, and review showed an occurrence-only assertion
         # passes with the call in the wrong place.
         self.opens_at_preserve: list[int] = []
+        # Sessions not yet closed, sampled INSIDE each preserve call.
+        # ``opens_at_preserve`` only proves "before the new open"; this
+        # proves "before the close", which is the one that matters: the
+        # close is what deletes the ref and kills the sandbox. A second
+        # review found a preserve moved after the close still passed the
+        # open-count check.
+        self.unclosed_at_preserve: list[int] = []
         # Every handle ever opened, newest last. ``last_session`` is the
         # common accessor; ``sessions`` is for tests that open several.
         self.sessions: list[SessionHandle] = []
@@ -311,6 +336,9 @@ class FakeSandboxService:
     async def _session_cm(
         self, *, session_id: str,
     ) -> AsyncIterator[SandboxSession]:
+        self.entries_started += 1
+        if self._hold_entry is not None:
+            await self._hold_entry.wait()
         # THREE memory-stream pairs. The client-facing pair matches
         # ``mcp.client.stdio.stdio_client``'s output shape; a relay sits
         # on the client→server direction so ``stall()`` can stop
@@ -400,6 +428,13 @@ class FakeSandboxService:
                 transport_failed=transport_failed,
             )
         finally:
+            self.closes_started += 1
+            while self._hold_close is not None and not self._hold_close.is_set():
+                try:
+                    await self._hold_close.wait()
+                except asyncio.CancelledError:
+                    self.cancels_swallowed += 1
+            handle.closed = True
             # Release a stalled relay so its cancel isn't parked on the
             # gate, then tear down both tasks + every stream end.
             stall_gate.set()
@@ -432,13 +467,14 @@ class FakeSandboxService:
         """
         self.preserve_calls.append((org_id, upstream_id))
         self.opens_at_preserve.append(self.session_open_count)
+        unclosed = [h for h in self.sessions if not h.closed]
+        self.unclosed_at_preserve.append(len(unclosed))
         # Model the real contract: the COUNT MARKED, which is 0 when
         # nothing is live. Returning the call count instead made
         # ``connect_shared`` log "1 sandbox preserved" on a first-ever
         # connect, and left the "harmless on Start/boot" claim
         # unguarded.
-        live = [h for h in self.sessions if h.is_alive]
-        return len(live)
+        return len([h for h in unclosed if h.is_alive])
 
     async def pause(self, session_id: str) -> SnapshotRef | None:
         # The fake never registers a live session for pause, so the
@@ -474,6 +510,8 @@ def make_fake_sandbox_service(
     *,
     server_factory: ServerFactory | None = None,
     supports_pause_resume: bool = True,
+    hold_entry: asyncio.Event | None = None,
+    hold_close: asyncio.Event | None = None,
 ) -> FakeSandboxService:
     """Build a :class:`FakeSandboxService`.
 
@@ -481,10 +519,15 @@ def make_fake_sandbox_service(
     one-tool ``echo`` server). It's called once per ``session()`` open,
     so each session gets a fresh server instance. ``supports_pause_resume``
     flips the declared capability for tests that need the no-pause shape.
+    ``hold_entry`` parks every session open before it yields, like a
+    sandbox still being created. ``hold_close`` parks every teardown,
+    swallowing cancels, like the E2B teardown.
     """
     return FakeSandboxService(
         server_factory=server_factory,
         supports_pause_resume=supports_pause_resume,
+        hold_entry=hold_entry,
+        hold_close=hold_close,
     )
 
 

@@ -23,7 +23,6 @@ from mcpolis.adapters.repositories.file_connection_store import (
     FileConnectionStore,
 )
 from mcpolis.adapters.upstream_clients.client_manager import (
-    ADMIN_USER_ID,
     UpstreamClientManager,
 )
 from mcpolis.domain.model.policy import AuthMode, UpstreamAuthConfig
@@ -202,9 +201,7 @@ async def test_read_resource_admin_oauth_uses_admin_pool_session(
     router, session, _, cm = await make_router(
         tmp_path, auth_mode=AuthMode.admin_oauth,
     )
-    # Sanity: the session lives under the chosen admin's per-user
-    # slot — Phase 2 retired the dedicated admin_sessions dict for
-    # admin_oauth in favor of the admin pool.
+    # Sanity: the session lives under the chosen admin's per-user slot.
     assert cm._user_sessions[("admin@co.com", "notion")] is session  # pyright: ignore[reportPrivateUsage]
     state = cm.get_state("notion")
     assert state is not None
@@ -218,9 +215,6 @@ async def test_read_resource_admin_oauth_uses_admin_pool_session(
         session_id=None,
     )
     session.read_resource.assert_awaited_once()
-    # ADMIN_USER_ID still exists as a sentinel for the legacy
-    # fall-through path; assert it is reachable.
-    assert ADMIN_USER_ID == ADMIN_USER_ID
 
 
 @pytest.mark.asyncio
@@ -395,7 +389,7 @@ async def test_get_prompt_service_account_uses_shared_session(
 
 
 @pytest.mark.asyncio
-async def test_get_prompt_admin_oauth_uses_admin_session(tmp_path: Path) -> None:
+async def test_get_prompt_admin_oauth_uses_the_slot_owners_session(tmp_path: Path) -> None:
     router, session, _, _ = await make_router(
         tmp_path, auth_mode=AuthMode.admin_oauth,
     )

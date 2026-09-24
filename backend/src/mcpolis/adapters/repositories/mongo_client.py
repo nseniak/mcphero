@@ -224,12 +224,15 @@ class OrgScopedCollection:
         doc: dict[str, Any],
         *,
         upsert: bool = True,
-    ) -> None:
+    ) -> int:
+        """Returns how many documents matched ``filter_`` (0 or 1), so a
+        caller whose filter is a precondition can tell it did not hold."""
         scoped_filter = self._scope(org_id, filter_)
         prepared = dict(doc)
         prepared["org_id"] = org_id
         prepared = self._encrypt(prepared)
-        await self._raw.replace_one(scoped_filter, prepared, upsert=upsert)
+        result = await self._raw.replace_one(scoped_filter, prepared, upsert=upsert)
+        return int(result.matched_count)
 
     async def update_one(
         self,

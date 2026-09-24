@@ -254,8 +254,11 @@ Consequences to keep in mind when touching this area:
   start is downloading the MCP's package (7-22s per server in
   production, against ~3s for one already on disk), and that cache
   lives on the sandbox filesystem. Keeping it takes TWO things:
-  `reconnect_shared_fresh` leaves the persisted ref in place AND
-  calls `preserve_sessions_for_upstream` first. Leaving the ref
+  the reopen leaves the persisted ref in place AND calls
+  `preserve_sessions_for_upstream` first. That call lives in
+  `_open_shared`, which every shared reopen funnels through (wake,
+  heal, Start, boot); a copy at a call site was orphaned once
+  already. Leaving the ref
   alone is not enough on its own, because the heal's close-then-open
   tears the old session down with `preserve=False`, which deletes
   the ref and kills the sandbox before the reopen can read it. An

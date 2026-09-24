@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
@@ -9,6 +10,12 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from mcpolis.adapters.upstream_clients.client_manager import (
+    UpstreamClientManager,
+)
+from mcpolis.adapters.upstream_clients.session_single_flight import (
+    ConnectAborted,
+)
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
 from tests.unit._dev_stub_login import login_as
@@ -271,18 +278,41 @@ def _read_connections(tmp_path: Path) -> dict[str, object]:
     return cast(dict[str, object], json.loads(data_path.read_text()))
 
 
+def record_stops() -> tuple[list[tuple[str, str]], Any]:
+    """Patch the manager's Stop transition to record ``(upstream_id,
+    reason)`` for every upstream marked stopped in memory, then run it."""
+    stops: list[tuple[str, str]] = []
+    real = UpstreamClientManager.transition_to_disabled
+
+    async def recording(
+        self: UpstreamClientManager, upstream_id: str, *,
+        reason: str = "admin_disconnect",
+    ) -> None:
+        stops.append((upstream_id, reason))
+        await real(self, upstream_id, reason=reason)
+
+    return stops, patch.object(
+        UpstreamClientManager, "transition_to_disabled", new=recording,
+    )
+
+
 def test_admin_add_upstream(tmp_path: Path) -> None:
     client = make_test_client(tmp_path)
 
-    resp = client.post(
-        "/api/admin/upstreams",
-        json={
-            "id": "new-mcp",
-            "display_name": "New MCP",
-            "url": "http://localhost:9999/mcp",
-            "auth_mode": "service_account",
-        })
+    stops, recording = record_stops()
+    with recording:
+        resp = client.post(
+            "/api/admin/upstreams",
+            json={
+                "id": "new-mcp",
+                "display_name": "New MCP",
+                "url": "http://localhost:9999/mcp",
+                "auth_mode": "service_account",
+            })
     assert resp.status_code == 201
+    # It starts stopped in memory too, so a tool call cannot start it
+    # before the admin clicks Start.
+    assert stops == [("new-mcp", "added_stopped")]
     data = resp.json()
     assert data["id"] == "new-mcp"
 
@@ -456,6 +486,61 @@ def test_admin_reconnect_service_account_clears_disabled_marker(
     )
 
 
+def wait_until_start_finished(client: TestClient, upstream_id: str) -> None:
+    """Poll the detail endpoint until the dashboard's Start is no longer
+    in flight (its background task ended and stopped being tracked)."""
+    for _ in range(250):
+        resp = client.get(f"/api/admin/upstreams/{upstream_id}")
+        assert resp.status_code == 200, resp.text
+        if resp.json()["starting"] is False:
+            return
+        time.sleep(0.02)
+    raise AssertionError("the Start never finished")
+
+
+def test_admin_reconnect_that_stop_aborted_records_no_error(
+    tmp_path: Path,
+) -> None:
+    """Stop aborted the connect this Start waited on (for example just
+    after it went live). That reads as a Stop, like a cancel: the Start
+    must not write "the connect was cancelled" as a connection error on
+    the dashboard, nor audit a failed reconnect."""
+    client = make_test_client(tmp_path)
+    with patch(
+        "mcpolis.adapters.upstream_clients.client_manager"
+        ".UpstreamClientManager.connect_upstream",
+        new=AsyncMock(side_effect=ConnectAborted("the shared connect was cancelled")),
+    ):
+        resp = client.post("/api/admin/upstreams/github/reconnect")
+        assert resp.status_code == 200, resp.text
+        wait_until_start_finished(client, "github")
+
+    assert "error:github" not in _read_connections(tmp_path)
+    audit = client.get("/api/admin/audit").json()["entries"]
+    assert not [
+        e for e in audit
+        if e.get("action") == "reconnect" and e.get("outcome") == "error"
+    ]
+
+
+def test_admin_reconnect_that_failed_records_the_error(tmp_path: Path) -> None:
+    """Control for the test above: a connect that genuinely failed is
+    recorded, so the absence there is not the check going blind."""
+    client = make_test_client(tmp_path)
+    with patch(
+        "mcpolis.adapters.upstream_clients.client_manager"
+        ".UpstreamClientManager.connect_upstream",
+        new=AsyncMock(side_effect=RuntimeError("sandbox create failed")),
+    ):
+        resp = client.post("/api/admin/upstreams/github/reconnect")
+        assert resp.status_code == 200, resp.text
+        wait_until_start_finished(client, "github")
+
+    error_entry = _read_connections(tmp_path).get("error:github")
+    assert isinstance(error_entry, dict)
+    assert "sandbox create failed" in error_entry["error"]
+
+
 # Boundaries the refresh-endpoint tests mock. The refresh itself is
 # kicked off via ``refresh_tools_in_background`` (``_REFRESH_BG`` below).
 _IS_CONNECTED = (
@@ -601,12 +686,14 @@ def test_admin_import_confirm_persists_disabled_for_added(
     enabled; this test pins the corrected behavior."""
     client = make_test_client(tmp_path)
 
-    resp = client.post(
-        "/api/admin/upstreams/import/confirm",
-        json=make_import_confirm_body({
-            "imp-a": {"url": "http://localhost:9001/mcp"},
-            "imp-b": {"url": "http://localhost:9002/mcp"},
-        }))
+    stops, recording = record_stops()
+    with recording:
+        resp = client.post(
+            "/api/admin/upstreams/import/confirm",
+            json=make_import_confirm_body({
+                "imp-a": {"url": "http://localhost:9001/mcp"},
+                "imp-b": {"url": "http://localhost:9002/mcp"},
+            }))
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert sorted(body["added"]) == ["imp-a", "imp-b"]
@@ -616,6 +703,9 @@ def test_admin_import_confirm_persists_disabled_for_added(
     connections = _read_connections(tmp_path)
     assert connections.get("enabled:imp-a") is False
     assert connections.get("enabled:imp-b") is False
+    assert sorted(stops) == [
+        ("imp-a", "added_stopped"), ("imp-b", "added_stopped"),
+    ]
 
 
 def test_admin_import_confirm_errors_on_existing_id(tmp_path: Path) -> None:

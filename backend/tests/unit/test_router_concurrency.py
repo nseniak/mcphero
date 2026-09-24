@@ -152,7 +152,7 @@ async def test_idle_sweep_during_inflight_dispatch_surfaces_clean_stall() -> Non
     mgr = make_manager(upstream, fake)
 
     # A per-user session is the idle-swept kind (shared/admin are exempt).
-    await mgr.connect_upstream_for_user(upstream, user_id="alice@co.com")
+    await mgr.ensure_user_session(upstream, "alice@co.com")
     session = mgr.get_session("everything2", user_id="alice@co.com")
 
     dispatch = asyncio.create_task(

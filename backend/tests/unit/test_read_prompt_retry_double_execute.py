@@ -233,7 +233,7 @@ def make_verb(
         failure_log_event="x.failed",
         failure_log_fields={},
         on_session_error=lambda _e: None,
-        on_dispatch_error=lambda _c: None,
+        on_dispatch_error=lambda _c, _status: None,
         result_is_error=lambda _r: False,
     )
 

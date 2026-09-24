@@ -164,7 +164,13 @@ async def init_with_exit_race(
 
     if not done:
         raise StdioInitTimeout(timeout)
-    if exit_task in done and init_task not in done:
+    init_failed = init_task in done and (
+        init_task.cancelled() or init_task.exception() is not None
+    )
+    if exit_task in done and (init_task not in done or init_failed):
+        # Also when the handshake failed in the same step: a process that
+        # died makes the handshake fail too ("Connection closed"), and the
+        # exit code and stderr tell the operator far more.
         snap = exit_signal.snapshot()
         raise SubprocessExitedDuringInit(snap.exit_code, snap.stderr_tail)
     # init_task is in ``done``: surface its result, which also
@@ -403,11 +409,13 @@ class SandboxConnectionTask(ConnectionTaskBase):
                 )
                 async with session:
                     try:
-                        init_result = await init_with_exit_race(
-                            session, sandbox_session.exit_signal,
+                        init_result = await self._unless_abandoned(
+                            init_with_exit_race(
+                                session, sandbox_session.exit_signal,
+                            ),
                         )
                     except Exception as exc:
-                        self._session_future.set_exception(exc)
+                        self._fail_start(exc)
                         return
 
                     si = init_result.serverInfo
@@ -435,9 +443,9 @@ class SandboxConnectionTask(ConnectionTaskBase):
                         upstream_id=self._upstream.id,
                         provider=self._service.name,
                     )
-                    self._session_future.set_result(session)
+                    if not self._hand_over(session):
+                        return
 
                     await self._shutdown_event.wait()
         except Exception as exc:
-            if not self._session_future.done():
-                self._session_future.set_exception(exc)
+            self._fail_start(exc)

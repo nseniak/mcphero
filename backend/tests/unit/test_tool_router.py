@@ -399,7 +399,9 @@ async def test_route_call_heal_failure_returns_opaque_error_not_raw(
     session.call_tool = AsyncMock(side_effect=asyncio.TimeoutError())
 
     class _HealFailsManager(_FakeStallManager):
-        async def reconnect_shared_fresh(self, upstream: Any) -> None:
+        async def reconnect_shared_fresh(
+            self, upstream: Any, *, stale: Any = None,
+        ) -> Any:
             raise RuntimeError("E2B unreachable at secret-host:5432")
 
     cm = _HealFailsManager(session)

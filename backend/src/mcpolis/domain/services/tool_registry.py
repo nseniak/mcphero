@@ -7,6 +7,7 @@ from typing import Any
 import anyio
 import mcp.types as mcp_types
 import structlog
+from mcp.client.session import ClientSession
 from mcp.shared.exceptions import McpError
 
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
@@ -264,9 +265,12 @@ class ToolRegistry:
             return any_user
         return self._client_manager.get_session(upstream_id)
 
-    async def _discover_upstream(self, upstream_id: str) -> list[DiscoveredTool]:
+    async def _discover_upstream(
+        self, upstream_id: str, session: ClientSession | None = None,
+    ) -> list[DiscoveredTool]:
         # For OAuth upstreams, try the admin's per-user session first
-        session = self._resolve_discovery_session(upstream_id)
+        if session is None:
+            session = self._resolve_discovery_session(upstream_id)
         result = await asyncio.wait_for(
             session.list_tools(), timeout=LIST_TOOLS_TIMEOUT
         )
@@ -298,7 +302,7 @@ class ToolRegistry:
         return tools
 
     async def _discover_resources(
-        self, upstream_id: str,
+        self, upstream_id: str, session: ClientSession | None = None,
     ) -> tuple[list[DiscoveredResource], list[DiscoveredResourceTemplate]]:
         """List resources + resource templates for one upstream.
 
@@ -309,7 +313,8 @@ class ToolRegistry:
         logged at INFO and swallowed — same shape as the tool path
         logs ``tool.registry.refresh.failed`` for any other error.
         """
-        session = self._resolve_discovery_session(upstream_id)
+        if session is None:
+            session = self._resolve_discovery_session(upstream_id)
 
         resources: list[DiscoveredResource] = []
         try:
@@ -406,11 +411,12 @@ class ToolRegistry:
         return resources, templates
 
     async def _discover_prompts(
-        self, upstream_id: str,
+        self, upstream_id: str, session: ClientSession | None = None,
     ) -> list[DiscoveredPrompt]:
         """List prompts for one upstream. Pagination + ``MethodNotFound``
         handling mirrors ``_discover_resources``."""
-        session = self._resolve_discovery_session(upstream_id)
+        if session is None:
+            session = self._resolve_discovery_session(upstream_id)
         prompts: list[DiscoveredPrompt] = []
         try:
             cursor: str | None = None
@@ -578,8 +584,14 @@ class ToolRegistry:
         ]
         await self._delete_persisted(upstream_id)
 
-    async def refresh_upstream(self, upstream_id: str) -> list[DiscoveredTool]:
+    async def refresh_upstream(
+        self, upstream_id: str, *, session: ClientSession | None = None,
+    ) -> list[DiscoveredTool]:
         """Re-discover tools / resources / prompts for one upstream.
+
+        ``session`` is the session to discover on, when the caller just
+        acquired one. Without it the discovery session is looked up here,
+        and a session acquired a moment earlier may already be gone.
 
         Tools are returned for parity with the previous signature (the
         notifier path uses the count). Resources, templates, and prompts
@@ -602,7 +614,7 @@ class ToolRegistry:
 
         async def _timed_tools() -> list[DiscoveredTool]:
             phase_start = time.monotonic()
-            tools = await self._discover_upstream(upstream_id)
+            tools = await self._discover_upstream(upstream_id, session)
             logger.info(
                 "tool.registry.refresh_upstream.phase",
                 upstream_id=upstream_id,
@@ -616,7 +628,9 @@ class ToolRegistry:
             list[DiscoveredResource], list[DiscoveredResourceTemplate],
         ]:
             phase_start = time.monotonic()
-            res, templates = await self._discover_resources(upstream_id)
+            res, templates = await self._discover_resources(
+                upstream_id, session,
+            )
             logger.info(
                 "tool.registry.refresh_upstream.phase",
                 upstream_id=upstream_id,
@@ -629,7 +643,7 @@ class ToolRegistry:
 
         async def _timed_prompts() -> list[DiscoveredPrompt]:
             phase_start = time.monotonic()
-            prompts = await self._discover_prompts(upstream_id)
+            prompts = await self._discover_prompts(upstream_id, session)
             logger.info(
                 "tool.registry.refresh_upstream.phase",
                 upstream_id=upstream_id,

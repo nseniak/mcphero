@@ -5,8 +5,10 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog
 
 from mcpolis.adapters.gateway_session_registry import GatewaySessionRegistry
+from mcpolis.adapters.upstream_clients.client_manager import UpstreamStopped
 from mcpolis.domain.model.settings import (
     RoleDefinition,
     RoleSettings,
@@ -17,6 +19,10 @@ from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.policy_notifier import PolicyNotifier
 from mcpolis.domain.ports import DEFAULT_ORG_ID
 from tests.unit.factories import make_runtime_manager, make_upstream_definition
+from tests.unit.stall_client_manager_fake import (
+    StallClientManagerFake,
+    make_stall_client_manager,
+)
 
 
 def make_config(
@@ -419,31 +425,12 @@ async def test_terminate_user_sessions_reaches_multi_org_cloud_session() -> None
     assert "s-admin" not in sm._server_instances
 
 
-class _FakeRecoveryManager:
-    """The slice of ``UpstreamClientManager`` that the recovery wrapper +
-    ``acquire_upstream_session`` touch for a service_account upstream — lets
-    the notifier-recovery test count fresh reconnects without a real sandbox."""
-
-    def __init__(self) -> None:
-        self.ensure_calls = 0
-        self.fresh_calls = 0
-
-    async def ensure_shared_connected(self, upstream: Any) -> None:
-        self.ensure_calls += 1
-
-    def get_session(self, upstream_id: str, user_id: str | None = None) -> Any:
-        return object()
-
-    async def reconnect_shared_fresh(self, upstream: Any) -> None:
-        self.fresh_calls += 1
-
-
 def make_recovery_notifier(
     refresh_behaviours: list[Any],
     debounce_seconds: float = 0.05,
 ) -> tuple[
     PolicyNotifier, GatewaySessionRegistry, MagicMock, AsyncMock,
-    _FakeRecoveryManager,
+    StallClientManagerFake,
 ]:
     """A notifier whose service_account upstream ``mee6`` refreshes by walking
     *refresh_behaviours* (an exception is raised; anything else is returned).
@@ -458,7 +445,7 @@ def make_recovery_notifier(
     tool_registry = MagicMock()
     refresh_mock = AsyncMock(side_effect=refresh_behaviours)
     tool_registry.refresh_upstream = refresh_mock
-    client_manager = _FakeRecoveryManager()
+    client_manager = make_stall_client_manager(session=object())
     upstream = make_upstream_definition(id="mee6")  # default: service_account
     rm = make_runtime_manager(
         policy_engine,
@@ -493,3 +480,28 @@ async def test_notify_upstream_tools_recovers_from_transport_stall() -> None:
     assert client_manager.fresh_calls == 1, "must force a fresh reconnect on stall"
     assert refresh_mock.await_count == 2, "must retry the refresh after the stall"
     t._write_stream.send_nowait.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_on_a_server_stopped_meanwhile_is_skipped_quietly() -> None:
+    # The server's tools/list_changed arrived, then an admin stopped it
+    # during the debounce. The delayed refresh must not start it again,
+    # and a refusal the admin asked for is not an error (no Sentry alert).
+    notifier, registry, sm, refresh_mock, client_manager = make_recovery_notifier(
+        [[]],
+    )
+    client_manager.ensure_shared_connected = AsyncMock(  # type: ignore[method-assign]
+        side_effect=UpstreamStopped("upstream 'mee6' is stopped"),
+    )
+    t = make_mock_transport()
+    sm._server_instances["s1"] = t
+    registry.register("s1", DEFAULT_ORG_ID, "alice@test.com")
+
+    with structlog.testing.capture_logs() as logs:
+        notifier.notify_upstream_tools_changed(DEFAULT_ORG_ID, "mee6")
+        await asyncio.sleep(0.2)
+
+    assert refresh_mock.await_count == 0
+    events = [e["event"] for e in logs]
+    assert "tool.registry.refresh_after_change.failed" not in events
+    assert "tool.registry.refresh_after_change.upstream_stopped" in events

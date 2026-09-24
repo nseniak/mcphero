@@ -1033,3 +1033,84 @@ async def test_t4_reconciler_kills_orphan_keeps_recognized() -> None:
                     await client.kill_sandbox(sandbox_id)
                 except E2BSDKError:
                     pass
+
+
+# ---------------------------------------------------------------------------
+# E2B-T8 — the dashboard's Start racing a lazy attach opens ONE sandbox
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+async def test_t8_start_and_lazy_attach_share_one_sandbox() -> None:
+    """The dashboard's Start and a tool call's lazy attach, racing on the
+    same upstream, must open ONE sandbox between them.
+
+    They used to take different paths. The lazy attach coalesced through a
+    lock held at its own call site; Start's connect never took it. Each
+    ran its own ``Sandbox.create``, the loser's session was closed as an
+    orphan, and its teardown could delete the persisted record of the
+    winner's sandbox. The unit tests count opens on a fake; only a real
+    create against E2B shows what the account is billed for.
+    """
+    org_id = f"acme-t8-{TEST_RUN_ID}"
+    instance = f"e2e-t8-{TEST_RUN_ID}"
+    persistence = InMemorySandboxPersistenceRepository()
+    service = make_e2b_service(
+        instance=instance, persistence=persistence, reuse_on_restart=True,
+    )
+    upstream = make_everything_upstream("t8")
+    manager = make_e2b_manager(upstream, org_id, service)
+    client = make_test_client()
+
+    try:
+        creates_cursor = time.monotonic_ns()
+        start = asyncio.create_task(manager.connect_shared(upstream))
+        # The tool call arrives while Start's sandbox is still coming up.
+        await asyncio.sleep(0.5)
+        assert not start.done(), "precondition: Start is still connecting"
+        lazy = asyncio.create_task(manager.ensure_shared_connected(upstream))
+        started, attached = await asyncio.wait_for(
+            asyncio.gather(start, lazy), timeout=INITIALIZE_TIMEOUT,
+        )
+
+        creates = events_since("sandbox.e2b.create", creates_cursor)
+        assert len(creates) == 1, (
+            f"one Start and one tool call created {len(creates)} sandboxes "
+            "for one upstream"
+        )
+        assert started is attached, "both callers must end on one session"
+        assert manager.get_session(upstream.id) is attached
+        ref = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        assert ref is not None and ref.sandbox_id is not None, (
+            "the one sandbox must stay recorded, so the next wake reuses it"
+        )
+        live = await client.list_sandboxes(
+            metadata_filter={"mcpolis_instance": instance},
+        )
+        assert [info.sandbox_id for info in live] == [ref.sandbox_id], (
+            "exactly one sandbox may run for the upstream, and it must be "
+            f"the recorded one; E2B lists {[i.sandbox_id for i in live]}"
+        )
+        result = await asyncio.wait_for(
+            attached.list_tools(), timeout=TOOL_CALL_TIMEOUT,
+        )
+        assert result.tools
+    except E2BSDKError as exc:
+        if is_template_missing_error(exc):
+            pytest.skip(
+                "mcpolis E2B templates not published on the active "
+                "account — run `cd runner/e2b-templates && make build`.",
+            )
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            await manager.stop_all()
+        # Kill everything this test's instance created, including a second
+        # sandbox if the race regressed: the persisted ref only names one.
+        with contextlib.suppress(Exception):
+            for info in await client.list_sandboxes(
+                metadata_filter={"mcpolis_instance": instance},
+            ):
+                with contextlib.suppress(Exception):
+                    await client.kill_sandbox(info.sandbox_id)

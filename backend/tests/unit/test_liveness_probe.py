@@ -27,7 +27,8 @@ The probe is driven with a mocked ``ClientSession`` (an AsyncMock
 with a scripted ``list_tools``) plus a real
 ``UpstreamClientManager`` with a seeded session. Going through the
 real client_manager proves the disconnect call actually removes the
-session from ``_admin_sessions`` / ``_user_sessions``.
+session from ``_user_sessions``. An ``admin_oauth`` sign-in is the slot
+owner's own per-user session, so ``OWNER`` stands for it.
 """
 from __future__ import annotations
 
@@ -47,19 +48,21 @@ from mcpolis.adapters.upstream_clients.client_manager import (
 )
 from mcpolis.domain.model.policy import AuthMode
 from mcpolis.domain.model.upstream import UpstreamDefinition
-from mcpolis.domain.ports import ADMIN_USER_ID, DEFAULT_ORG_ID
+from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.domain.services import upstream_connection_service
 from mcpolis.domain.services.oauth_liveness import (
     ProbeOutcome,
     _summarize_probe_outcomes,  # pyright: ignore[reportPrivateUsage]
     probe_upstream_liveness,
 )
+from tests.unit._state_seed import seed_user_session
 from tests.unit.factories import make_oauth_upstream
 
 
 UPSTREAM_ID = "notion"
 UPSTREAM_URL = "https://mcp.example.invalid/mcp"
 SERVER_URL = "https://gateway.example.invalid"
+OWNER = "owner@co.com"
 
 
 def _make_upstream(
@@ -88,21 +91,14 @@ def _make_session(
 
 
 def _install_client_manager_with_session(
-    session: MagicMock, *, admin: bool = True,
-    user_id: str = ADMIN_USER_ID,
+    session: MagicMock, *, user_id: str = OWNER,
 ) -> UpstreamClientManager:
-    """Seed a real ``UpstreamClientManager`` via its public state-
-    machine surface — ``iter_live_oauth_sessions`` and
-    ``disconnect_user_session`` operate on the real storage, so
-    seeding through the public API proves the probe reaches
-    production bookkeeping rather than a mock shape that drifts."""
-    from tests.unit._state_seed import seed_admin_session, seed_user_session
-
+    """Seed a real ``UpstreamClientManager`` with ``user_id``'s session
+    — ``iter_live_oauth_sessions`` and the eviction operate on the real
+    storage, so this proves the probe reaches production bookkeeping
+    rather than a mock shape that drifts."""
     cm = UpstreamClientManager(upstreams=[_make_upstream()])
-    if admin:
-        seed_admin_session(cm, UPSTREAM_ID, session=session)
-    else:
-        seed_user_session(cm, UPSTREAM_ID, user_id, session=session)
+    seed_user_session(cm, UPSTREAM_ID, user_id, session=session)
     return cm
 
 
@@ -126,7 +122,7 @@ async def test_probe_healthy_session_left_alone(
     outcome = await probe_upstream_liveness(
         org_id=DEFAULT_ORG_ID,
         upstream=_make_upstream(),
-        user_id=ADMIN_USER_ID,
+        user_id=OWNER,
         session=session,
         client_manager=cm,
         connection_store=store,
@@ -134,8 +130,7 @@ async def test_probe_healthy_session_left_alone(
     )
 
     assert outcome is ProbeOutcome.healthy
-    # Session still in the admin dict.
-    assert cm.is_connected(UPSTREAM_ID) is True
+    assert cm.has_user_session(UPSTREAM_ID, OWNER) is True
     reconnect_spy.assert_not_called()
 
 
@@ -173,7 +168,7 @@ async def test_probe_transient_failures_leave_session_alone(
     outcome = await probe_upstream_liveness(
         org_id=DEFAULT_ORG_ID,
         upstream=_make_upstream(),
-        user_id=ADMIN_USER_ID,
+        user_id=OWNER,
         session=session,
         client_manager=cm,
         connection_store=store,
@@ -181,7 +176,7 @@ async def test_probe_transient_failures_leave_session_alone(
     )
 
     assert outcome is ProbeOutcome.transient
-    assert cm.is_connected(UPSTREAM_ID) is True
+    assert cm.has_user_session(UPSTREAM_ID, OWNER) is True
     reconnect_spy.assert_not_called()
 
 
@@ -209,7 +204,7 @@ async def test_probe_fatal_error_tears_down_and_triggers_reconnect(
     outcome = await probe_upstream_liveness(
         org_id=DEFAULT_ORG_ID,
         upstream=upstream,
-        user_id=ADMIN_USER_ID,
+        user_id=OWNER,
         session=session,
         client_manager=cm,
         connection_store=store,
@@ -217,8 +212,7 @@ async def test_probe_fatal_error_tears_down_and_triggers_reconnect(
     )
 
     assert outcome is ProbeOutcome.torn_down
-    # Admin session removed.
-    assert cm.is_connected(UPSTREAM_ID) is False
+    assert cm.has_user_session(UPSTREAM_ID, OWNER) is False
     # Reconnect attempted with the same (org, upstream, user).
     reconnect_spy.assert_awaited_once()
     assert reconnect_spy.await_args is not None
@@ -226,22 +220,21 @@ async def test_probe_fatal_error_tears_down_and_triggers_reconnect(
     # Positional args: (org, upstream, user_id, store, cm, server_url)
     assert args[0] == DEFAULT_ORG_ID
     assert args[1].id == UPSTREAM_ID
-    assert args[2] == ADMIN_USER_ID
+    assert args[2] == OWNER
 
 
 @pytest.mark.asyncio
 async def test_probe_fatal_error_on_per_user_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Per-user sessions must tear down via the per-user path, not the
-    admin path. Regression guard against a probe that ignores
-    ``user_id`` and collapses every disconnect onto ``_close_admin``."""
+    """On a ``per_user_oauth`` upstream the probe tears down exactly the
+    probed user's session and reconnects as that user."""
     store = FileConnectionStore(tmp_path)
     session = _make_session(
         list_tools_behavior=RuntimeError("auth dead"),
     )
     cm = _install_client_manager_with_session(
-        session, admin=False, user_id="alice@co.com",
+        session, user_id="alice@co.com",
     )
 
     reconnect_spy = AsyncMock(return_value=None)
@@ -260,9 +253,7 @@ async def test_probe_fatal_error_on_per_user_session(
         server_url=SERVER_URL,
     )
 
-    # Per-user session removed, admin dict untouched.
     assert cm.has_user_session(UPSTREAM_ID, "alice@co.com") is False
-    assert cm.has_admin_session(UPSTREAM_ID) is False
     reconnect_spy.assert_awaited_once()
     assert reconnect_spy.await_args is not None
     args, _ = reconnect_spy.await_args
@@ -272,30 +263,22 @@ async def test_probe_fatal_error_on_per_user_session(
 # ── iter_live_oauth_sessions shape ───────────────────────────────────
 
 
-def test_iter_live_oauth_sessions_includes_admin_and_user_entries() -> None:
-    """Sanity-check the manager-side API the probe depends on. Admin
-    entries surface under ``ADMIN_USER_ID``; per-user entries surface
-    under the real user_id. Service-account / non-OAuth upstreams
-    are filtered out by the ``oauth_upstream_ids`` set so a
-    service-account upstream's shared session never drags the probe
-    into a meaningless ``list_tools`` request."""
-    from tests.unit._state_seed import seed_admin_session, seed_user_session
-
+def test_iter_live_oauth_sessions_lists_every_user_of_oauth_upstreams() -> None:
+    """Sanity-check the manager-side API the probe depends on. Every
+    user's session surfaces under that user. Service-account / non-OAuth
+    upstreams are filtered out by the ``oauth_upstream_ids`` set so a
+    service-account upstream's session never drags the probe into a
+    meaningless ``list_tools`` request."""
     cm = UpstreamClientManager(upstreams=[])
-    admin_sess = MagicMock()
-    user_sess = MagicMock()
-    other_sess = MagicMock()  # different upstream, should be filtered
-    seed_admin_session(cm, UPSTREAM_ID, session=admin_sess)
-    seed_user_session(
-        cm, UPSTREAM_ID, "alice@co.com", session=user_sess,
-    )
-    seed_admin_session(cm, "slack", session=other_sess)
+    seed_user_session(cm, UPSTREAM_ID, OWNER, session=MagicMock())
+    seed_user_session(cm, UPSTREAM_ID, "alice@co.com", session=MagicMock())
+    # Different upstream, not in the OAuth set: filtered out.
+    seed_user_session(cm, "slack", OWNER, session=MagicMock())
 
     entries = cm.iter_live_oauth_sessions({UPSTREAM_ID})
 
     ids = {(upstream_id, user_id) for upstream_id, user_id, _ in entries}
-    assert (UPSTREAM_ID, ADMIN_USER_ID) in ids
-    assert (UPSTREAM_ID, "alice@co.com") in ids
+    assert ids == {(UPSTREAM_ID, OWNER), (UPSTREAM_ID, "alice@co.com")}
     # Slack (not in oauth_upstream_ids) must NOT be in the result.
     assert not any(u == "slack" for u, _, _ in entries)
 

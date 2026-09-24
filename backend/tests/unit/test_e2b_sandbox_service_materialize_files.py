@@ -167,3 +167,43 @@ async def test_sbx9_materialize_write_failure_aborts_session_with_sdk_message(
     assert client.commands == [], (
         "run_command must not fire when materialization fails"
     )
+    # And the sandbox it was created for is gone: nothing else knows its
+    # id, so a leftover would run for nobody until the next boot.
+    assert [k.sandbox_id for k in client.kills] == ["sbx-0"], (
+        "the sandbox created for the failed session was left running"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_command_that_fails_to_start_leaves_no_sandbox_behind() -> None:
+    """The MCP command fails to start in a freshly created sandbox. The
+    sandbox must be killed with the failure, not left running."""
+    client = make_mock_e2b_client()
+    service = E2BSandboxService(
+        client, mcpolis_instance="t", on_timeout_seconds=60,
+    )
+    upstream = make_upstream_definition(id="ups", command="npx")
+
+    from tests.unit.sandbox_e2b_mock import MockE2BSandboxHandle
+
+    async def _refuse_to_start(_self: Any, *_a: Any, **_k: Any) -> Any:
+        raise E2BSDKError("E2BSDKError", "command failed to start")
+
+    original_run = MockE2BSandboxHandle.run_command
+    MockE2BSandboxHandle.run_command = _refuse_to_start  # type: ignore[method-assign,assignment]
+    try:
+        with pytest.raises(E2BSDKError):
+            async with service.session(
+                session_id="s1",
+                org_id="acme",
+                upstream=upstream,
+                resources=_make_resources(),
+                denylist=(),
+            ):
+                pass
+    finally:
+        MockE2BSandboxHandle.run_command = original_run  # type: ignore[method-assign,assignment]
+
+    assert [k.sandbox_id for k in client.kills] == ["sbx-0"], (
+        "the sandbox created for the failed session was left running"
+    )

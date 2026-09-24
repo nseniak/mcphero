@@ -40,6 +40,8 @@ from mcpolis.domain.services.upstream_health_check import (
 )
 from mcpolis.domain.services.upstream_connection_service import (
     SilentReconnectAuthRequired,
+    failure_sign_in,
+    sign_in_is_still_stored,
     _build_oauth_provider,  # pyright: ignore[reportPrivateUsage]
     _exception_chain_contains,  # pyright: ignore[reportPrivateUsage]
     _extract_refresh_failure,  # pyright: ignore[reportPrivateUsage]
@@ -209,6 +211,9 @@ async def refresh_token_for_user(
         refresh_margin_seconds=TOKEN_REFRESH_MARGIN,
         max_age_seconds=TOKEN_MAX_AGE_SECONDS,
     )
+    # This refresh works from the row just read: what it writes back, and
+    # what it purges on a rejection, apply only while that row is stored.
+    storage.start_from(raw_token)
     oauth_auth = await _build_oauth_provider(
         upstream, storage,
         _noop_redirect, _noop_callback,
@@ -318,16 +323,16 @@ async def refresh_token_for_user(
         )
 
     if refreshed_token is None and last_error is not None:
-        # Tokens vanished during a network failure — the OAuth middleware
-        # may have cleared them on a transient error. Restore the backup.
+        # The sign-in was deleted while this refresh ran. Nothing in the
+        # refresh deletes it (the SDK only clears its in-memory copy), so
+        # someone did: a Disconnect, a user removal, a reconnect's
+        # cleanup. Writing the backup back used to undo that and sign the
+        # user in again without their say.
         logger.warning(
-            "oauth.token.refresh.tokens_lost.restoring_backup",
+            "oauth.token.refresh.tokens_gone",
             upstream_id=upstream.id,
             user=user_id,
             org_id=org_id,
-        )
-        await connection_store.put_user_token(
-            org_id, user_id, upstream.id, raw_token
         )
     elif refreshed_token is None:
         # Tokens cleared by OAuth middleware (shouldn't happen with the
@@ -376,6 +381,19 @@ async def refresh_token_for_user(
         # notification rather than staying silent.
         await connection_store.clear_notified(
             org_id, upstream.id, user_id,
+        )
+    elif signature is not None and not await sign_in_is_still_stored(
+        connection_store, org_id, upstream.id, user_id,
+        failure_sign_in(oauth_auth, storage),
+    ):
+        # Rejected, but the sign-in it was about is gone: the user signed
+        # in again or disconnected meanwhile. Record nothing, email nobody,
+        # delete nothing, as ``_classify_reconnect_failure`` does.
+        logger.info(
+            "oauth.token.refresh.failure_of_replaced_sign_in",
+            upstream_id=upstream.id,
+            user=user_id,
+            org_id=org_id,
         )
     elif signature is not None:
         # The silent-failure case that Gap A was specifically about:
@@ -457,6 +475,7 @@ async def refresh_token_for_user(
             # of re-presenting the dead client_id forever.
             await purge_user_oauth_state(
                 connection_store, org_id, upstream.id, user_id,
+                sign_in=failure_sign_in(oauth_auth, storage),
             )
     else:
         # Raised from DEBUG to INFO so the periodic loop's "no-op tick"

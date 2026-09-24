@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,9 +15,12 @@ from mcpolis.domain.ports import ADMIN_USER_ID
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 
-def _serialize_token(token: OAuthToken, authorized_by: str = "") -> dict[str, Any]:
+def _serialize_token(
+    token: OAuthToken, authorized_by: str = "", *, revision: str | None = None,
+) -> dict[str, Any]:
     now = datetime.now(UTC)
     return {
+        "revision": revision,
         "access_token": token.access_token,
         "refresh_token": token.refresh_token,
         "expires_at": token.expires_at.isoformat() if token.expires_at else None,
@@ -50,6 +54,7 @@ def _deserialize_token(data: dict[str, Any]) -> OAuthToken:
         scopes=data.get("scopes", []),
         refresh_token_created_at=refresh_token_created_at,
         updated_at=updated_at,
+        revision=data.get("revision"),
     )
 
 
@@ -125,17 +130,50 @@ class FileConnectionStore(ConnectionStore):
                 return None
             return _deserialize_token(entry)
 
-    async def put_user_token(self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken) -> None:
+    async def put_user_token(self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken) -> str:
+        revision = uuid.uuid4().hex
         async with self._lock:
             data = self._read()
-            data[self._user_key(user_id, upstream_id)] = _serialize_token(token)
+            data[self._user_key(user_id, upstream_id)] = _serialize_token(
+                token, revision=revision,
+            )
             self._write(data)
+        return revision
+
+    async def put_user_token_if_current(
+        self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken,
+        *, expected_revision: str | None,
+    ) -> str | None:
+        key = self._user_key(user_id, upstream_id)
+        revision = uuid.uuid4().hex
+        async with self._lock:
+            data = self._read()
+            entry = data.get(key)
+            if entry is None or entry.get("revision") != expected_revision:
+                return None
+            data[key] = _serialize_token(token, revision=revision)
+            self._write(data)
+        return revision
 
     async def delete_user_token(self, org_id: str, user_id: str, upstream_id: str) -> None:
         async with self._lock:
             data = self._read()
             data.pop(self._user_key(user_id, upstream_id), None)
             self._write(data)
+
+    async def delete_user_token_if_current(
+        self, org_id: str, user_id: str, upstream_id: str,
+        *, expected_revision: str | None,
+    ) -> bool:
+        key = self._user_key(user_id, upstream_id)
+        async with self._lock:
+            data = self._read()
+            entry = data.get(key)
+            if entry is None or entry.get("revision") != expected_revision:
+                return False
+            del data[key]
+            self._write(data)
+        return True
 
     async def delete_all_user_tokens(self, org_id: str, user_id: str) -> int:
         async with self._lock:

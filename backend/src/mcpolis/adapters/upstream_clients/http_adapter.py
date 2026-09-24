@@ -107,11 +107,13 @@ class HttpConnectionTask(ConnectionTaskBase):
                 )
                 async with session:
                     try:
-                        init_result = await asyncio.wait_for(
-                            session.initialize(), timeout=INIT_TIMEOUT
+                        init_result = await self._unless_abandoned(
+                            asyncio.wait_for(
+                                session.initialize(), timeout=INIT_TIMEOUT,
+                            ),
                         )
                     except Exception as exc:
-                        self._session_future.set_exception(exc)
+                        self._fail_start(exc)
                         return
 
                     si = init_result.serverInfo
@@ -145,11 +147,11 @@ class HttpConnectionTask(ConnectionTaskBase):
                         "upstream.http.connection.established",
                         upstream_id=self._upstream.id,
                     )
-                    self._session_future.set_result(session)
+                    if not self._hand_over(session):
+                        return
 
                     # Block until shutdown is requested
                     await self._shutdown_event.wait()
 
         except Exception as exc:
-            if not self._session_future.done():
-                self._session_future.set_exception(exc)
+            self._fail_start(exc)
