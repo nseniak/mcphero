@@ -299,10 +299,10 @@ class _InitializingOAuthClientProvider(OAuthClientProvider):
     """
 
     last_refresh_failure: RefreshFailureSignature | None = None
-    # The stored sign-in (its revision) whose refresh was rejected. The
-    # failure is about that sign-in only: by the time it is acted on, the
-    # user may have signed in again.
-    last_refresh_failure_sign_in: LoadedRevision = NO_ROW
+    # The stored tokens (their revision) whose refresh was rejected. The
+    # failure is about those tokens only: by the time it is acted on, the
+    # user may have signed in again, or another refresh saved newer ones.
+    last_refresh_failure_revision: LoadedRevision = NO_ROW
 
     async def _initialize(self) -> None:
         await super()._initialize()  # pyright: ignore[reportPrivateUsage]
@@ -328,7 +328,7 @@ class _InitializingOAuthClientProvider(OAuthClientProvider):
             )
             storage = self.context.storage
             if isinstance(storage, McpTokenStorage):
-                self.last_refresh_failure_sign_in = storage.loaded_revision
+                self.last_refresh_failure_revision = storage.loaded_revision
         return await super()._handle_refresh_response(response)  # pyright: ignore[reportPrivateUsage]
 
 
@@ -346,12 +346,12 @@ def _extract_refresh_failure(
     return None
 
 
-def failure_sign_in(
+def failure_revision(
     provider: OAuthClientProvider, storage: McpTokenStorage,
 ) -> LoadedRevision:
-    """Which stored sign-in a failed refresh or reconnect is about: the
-    one whose refresh was rejected, if one was; else the one the connect
-    used.
+    """Which stored tokens a failed refresh or reconnect is about: the
+    ones whose refresh was rejected, if one was; else the ones the
+    connect used.
 
     They differ when the user signed in again meanwhile. The rejected
     refresh (of the OLD sign-in) is remembered on the provider, while the
@@ -361,25 +361,27 @@ def failure_sign_in(
     if (
         isinstance(provider, _InitializingOAuthClientProvider)
         and provider.last_refresh_failure is not None
-        and provider.last_refresh_failure_sign_in is not NO_ROW
+        and provider.last_refresh_failure_revision is not NO_ROW
     ):
-        return provider.last_refresh_failure_sign_in
+        return provider.last_refresh_failure_revision
     return storage.loaded_revision
 
 
-async def sign_in_is_still_stored(
+async def tokens_are_still_stored(
     connection_store: ConnectionStore,
     org_id: str,
     upstream_id: str,
     user_id: str,
-    sign_in: LoadedRevision,
+    revision: LoadedRevision,
 ) -> bool:
-    """Whether the stored sign-in is still ``sign_in``: nobody signed in
-    again or disconnected since it was read."""
-    if sign_in is NO_ROW:
+    """Whether the stored tokens are still the ones read with ``revision``:
+    nobody signed in again or disconnected since, and no other refresh
+    saved newer tokens. Only then does their failure say anything about
+    what is stored."""
+    if revision is NO_ROW:
         return False
     stored = await connection_store.get_user_token(org_id, user_id, upstream_id)
-    return stored is not None and stored.revision == sign_in
+    return stored is not None and stored.revision == revision
 
 
 # §5.1 delete-vs-retry tuning knobs. Picked conservatively: five
@@ -416,7 +418,7 @@ async def purge_user_oauth_state(
     upstream_id: str,
     user_id: str,
     *,
-    sign_in: LoadedRevision,
+    revision: LoadedRevision,
 ) -> bool:
     """Tear down ALL per-user OAuth state for one (upstream, user) after a
     terminal auth rejection: the token, the DCR ``client_info``, the
@@ -433,20 +435,22 @@ async def purge_user_oauth_state(
     brick the backend can trigger on its own (the upstream's 400 at the
     browser ``/oauth/authorize`` step is never observable here).
 
-    Only while the stored sign-in is still ``sign_in``, the one the
-    rejection was about. A reconnect that started before the user signed
-    in again must not delete the new sign-in, nor the app registration
-    that sign-in uses. Returns whether anything was purged.
+    Only while the stored tokens are still the ones read with
+    ``revision``, the ones the rejection was about. A reconnect that
+    started before the user signed in again must not delete the new
+    sign-in, nor the app registration that sign-in uses; and newer tokens
+    another refresh of the same sign-in saved meanwhile may still work.
+    Returns whether anything was purged.
     """
-    if sign_in is NO_ROW or not await connection_store.delete_user_token_if_current(
-        org_id, user_id, upstream_id, expected_revision=sign_in,
+    if revision is NO_ROW or not await connection_store.delete_user_token_if_current(
+        org_id, user_id, upstream_id, expected_revision=revision,
     ):
         logger.info(
             "upstream.oauth.purge_skipped",
             upstream_id=upstream_id,
             user=user_id,
             org_id=org_id,
-            reason="sign_in_replaced",
+            reason="tokens_replaced",
         )
         return False
     await connection_store.delete_client_info(org_id, upstream_id, user_id)
@@ -1386,13 +1390,14 @@ async def _classify_reconnect_failure(
     in the structured logs and the persisted signature, not in the
     return value.
 
-    Steps 3 and 4 apply to the sign-in the failure is about only while
-    it is still the stored one. If the user signed in again (or
-    disconnected) while this reconnect ran, the failure says nothing
-    about what is stored now: nothing is recorded, nothing deleted.
+    Steps 3 and 4 apply to the tokens the failure is about only while
+    they are still the stored ones. If the user signed in again (or
+    disconnected), or another refresh saved newer tokens, while this
+    reconnect ran, the failure says nothing about what is stored now:
+    nothing is recorded, nothing deleted.
     """
     signature = _extract_refresh_failure(oauth_auth)
-    about = failure_sign_in(oauth_auth, storage)
+    about = failure_revision(oauth_auth, storage)
 
     # If the SDK's 401 handler fell into authorization_code grant
     # (our ``_noop_callback`` raised), the bearer is dead AND the
@@ -1429,11 +1434,11 @@ async def _classify_reconnect_failure(
             body_excerpt=signature.body_excerpt,
         )
 
-    if not await sign_in_is_still_stored(
+    if not await tokens_are_still_stored(
         connection_store, org_id, upstream.id, effective_user, about,
     ):
         logger.info(
-            "upstream.reconnect.failure_of_replaced_sign_in",
+            "upstream.reconnect.failure_of_replaced_tokens",
             upstream_id=upstream.id,
             user=effective_user,
             org_id=org_id,
@@ -1472,7 +1477,7 @@ async def _classify_reconnect_failure(
         # too, and leaving it would re-brick the next consent.
         await purge_user_oauth_state(
             connection_store, org_id, upstream.id, effective_user,
-            sign_in=about,
+            revision=about,
         )
     else:
         elapsed = int((datetime.now(UTC) - first_at).total_seconds())

@@ -22,6 +22,7 @@ from typing import Any
 from mcpolis.adapters.repositories.connection_store import (
     ConnectionStore,
     OAuthToken,
+    SavedSignIn,
 )
 from mcpolis.adapters.repositories.mongo_client import OrgScopedCollection
 from mcpolis.domain.ports import ADMIN_USER_ID
@@ -156,50 +157,60 @@ class MongoConnectionRepository(ConnectionStore, ConnectionRepository):
         )
         if doc is None or "token" not in doc:
             return None
-        # The revision sits beside the token, in plain text, so a
-        # conditional write can filter on it; the token's secrets are
-        # encrypted with a random nonce and cannot be.
+        # The revision and the sign-in id sit beside the token, in plain
+        # text, so a conditional write can filter on them; the token's
+        # secrets are encrypted with a random nonce and cannot be.
         return dataclasses.replace(
-            _deserialize_token(doc["token"]), revision=doc.get("revision"),
+            _deserialize_token(doc["token"]),
+            revision=doc.get("revision"),
+            sign_in=doc.get("sign_in"),
         )
 
     @staticmethod
     def _user_token_doc(
-        user_id: str, upstream_id: str, token: OAuthToken, revision: str,
+        user_id: str, upstream_id: str, token: OAuthToken,
+        *, revision: str, sign_in: str | None,
     ) -> dict[str, Any]:
         return {
             "key": _user_key(user_id, upstream_id),
             "token": _serialize_token(token),
             "revision": revision,
+            "sign_in": sign_in,
             "updated_at": datetime.now(UTC).isoformat(),
         }
 
     async def put_user_token(
         self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken
-    ) -> str:
-        revision = uuid.uuid4().hex
+    ) -> SavedSignIn:
+        saved = SavedSignIn(sign_in=uuid.uuid4().hex, revision=uuid.uuid4().hex)
         await self._coll.replace_one(
             org_id,
             {"key": _user_key(user_id, upstream_id)},
-            self._user_token_doc(user_id, upstream_id, token, revision),
+            self._user_token_doc(
+                user_id, upstream_id, token,
+                revision=saved.revision, sign_in=saved.sign_in,
+            ),
             upsert=True,
         )
-        return revision
+        return saved
 
-    async def put_user_token_if_current(
+    async def put_user_token_if_same_sign_in(
         self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken,
-        *, expected_revision: str | None,
+        *, expected_sign_in: str | None,
     ) -> str | None:
-        # ``revision: None`` also matches a row saved before revisions
+        # ``sign_in: None`` also matches a row saved before sign-in ids
         # existed (no such field), which is what ``None`` stands for.
         revision = uuid.uuid4().hex
         matched = await self._coll.replace_one(
             org_id,
             {
                 "key": _user_key(user_id, upstream_id),
-                "revision": expected_revision,
+                "sign_in": expected_sign_in,
             },
-            self._user_token_doc(user_id, upstream_id, token, revision),
+            self._user_token_doc(
+                user_id, upstream_id, token,
+                revision=revision, sign_in=expected_sign_in,
+            ),
             upsert=False,
         )
         return revision if matched else None

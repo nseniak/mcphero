@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Protocol
 
-from mcpolis.adapters.repositories.connection_store import OAuthToken
+from mcpolis.adapters.repositories.connection_store import OAuthToken, SavedSignIn
 
 
 class ConnectionRepository(Protocol):
@@ -21,11 +21,11 @@ class ConnectionRepository(Protocol):
 
     async def put_user_token(
         self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken
-    ) -> str: ...
+    ) -> SavedSignIn: ...
 
-    async def put_user_token_if_current(
+    async def put_user_token_if_same_sign_in(
         self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken,
-        *, expected_revision: str | None,
+        *, expected_sign_in: str | None,
     ) -> str | None: ...
 
     async def delete_user_token(

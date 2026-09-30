@@ -135,7 +135,7 @@ async def test_purge_user_oauth_state_drops_token_client_and_metadata(
     assert stored is not None
 
     purged = await purge_user_oauth_state(
-        store, DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID, sign_in=stored.revision,
+        store, DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID, revision=stored.revision,
     )
 
     assert purged is True
@@ -167,13 +167,47 @@ async def test_purge_keeps_a_sign_in_saved_after_the_failure(
     await _seed(store)  # the user signs in again: a new row
 
     purged = await purge_user_oauth_state(
-        store, DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID, sign_in=old.revision,
+        store, DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID, revision=old.revision,
     )
 
     assert purged is False
     assert await store.get_user_token(
         DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
     ) is not None
+    assert await store.get_client_info(
+        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+    ) is not None
+
+
+@pytest.mark.asyncio
+async def test_purge_keeps_newer_tokens_of_the_same_sign_in(
+    tmp_path: Path,
+) -> None:
+    """The failure was about the tokens read earlier; another refresh of
+    the same sign-in saved newer ones since. Those may still work, so the
+    purge must leave them and their app registration alone."""
+    store = FileConnectionStore(tmp_path)
+    await _seed(store)
+    failed = await store.get_user_token(DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID)
+    assert failed is not None
+    newer = OAuthToken(
+        access_token="refreshed-meanwhile",
+        refresh_token="refresh-meanwhile",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        scopes=[],
+    )
+    assert await store.put_user_token_if_same_sign_in(
+        DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID, newer,
+        expected_sign_in=failed.sign_in,
+    ) is not None
+
+    purged = await purge_user_oauth_state(
+        store, DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID, revision=failed.revision,
+    )
+
+    assert purged is False
+    stored = await store.get_user_token(DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID)
+    assert stored is not None and stored.access_token == "refreshed-meanwhile"
     assert await store.get_client_info(
         DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
     ) is not None

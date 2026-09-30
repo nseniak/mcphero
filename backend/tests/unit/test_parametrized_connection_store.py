@@ -8,6 +8,7 @@ not change observable behavior. When Mongo is not reachable the
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -848,81 +849,123 @@ async def test_delete_all_for_org_is_org_scoped() -> None:
         ) is not None
 
 
-# ── Sign-in revisions: a write or delete derived from one saved sign-in
-#    never lands on a newer one ──────────────────────────────────────────
+# ── Sign-in ids and revisions: a refresh lands only on its own sign-in,
+#    a delete only on the exact tokens it read ─────────────────────────
 
 
 async def _stored(store: ConnectionStore) -> OAuthToken | None:
     return await store.get_user_token(DEFAULT_ORG_ID, "alice", "notion")
 
 
-async def _save_legacy_row(store: ConnectionStore, token: OAuthToken) -> None:
-    """A row as saved before revisions existed: no revision field."""
+# Row shapes saved by earlier releases, as the fields they lack.
+OLDER_ROWS = {
+    "saved_before_revisions": ("revision", "sign_in"),
+    "saved_before_sign_in_ids": ("sign_in",),
+}
+
+
+async def _save_older_row(
+    store: ConnectionStore, token: OAuthToken, *, missing: tuple[str, ...],
+) -> None:
+    """A sign-in as an earlier release saved it: without ``missing``."""
     if isinstance(store, FileConnectionStore):
         await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", token)
         path = store._path  # pyright: ignore[reportPrivateUsage]
         data = json.loads(path.read_text())
         for row in data.values():
-            row.pop("revision", None)
+            for field in missing:
+                row.pop(field, None)
         path.write_text(json.dumps(data))
         return
     assert isinstance(store, MongoConnectionRepository)
+    doc: dict[str, object] = {
+        "key": "user:notion:alice",
+        "token": _mongo_serialize_token(token),
+        "revision": uuid.uuid4().hex,
+        "sign_in": uuid.uuid4().hex,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    for field in missing:
+        del doc[field]
     await store._coll.replace_one(  # pyright: ignore[reportPrivateUsage]
-        DEFAULT_ORG_ID,
-        {"key": "user:notion:alice"},
-        {
-            "key": "user:notion:alice",
-            "token": _mongo_serialize_token(token),
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        upsert=True,
+        DEFAULT_ORG_ID, {"key": "user:notion:alice"}, doc, upsert=True,
     )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
-async def test_each_save_is_a_new_revision(backend: str, tmp_path: Path) -> None:
+async def test_each_sign_in_gets_a_new_id_and_each_save_a_new_revision(
+    backend: str, tmp_path: Path,
+) -> None:
     async with _make_store(backend, tmp_path) as store:
         first = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("a"))
         second = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("b"))
         stored = await _stored(store)
-        assert first != second
-        assert stored is not None and stored.revision == second
+        assert first.sign_in != second.sign_in
+        assert first.revision != second.revision
+        assert stored is not None
+        assert (stored.sign_in, stored.revision) == (second.sign_in, second.revision)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
-async def test_a_conditional_save_lands_only_on_the_row_it_read(
+async def test_every_refresh_of_the_stored_sign_in_is_saved(
     backend: str, tmp_path: Path,
 ) -> None:
+    """Two holders of one sign-in each refresh it: both saves land, although
+    the first one changed the row the second had read. The sign-in id
+    stays; each save is a new revision."""
     async with _make_store(backend, tmp_path) as store:
-        read = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("old"))
-        refreshed = await store.put_user_token_if_current(
-            DEFAULT_ORG_ID, "alice", "notion", _token("refreshed"),
-            expected_revision=read,
+        signed_in = await store.put_user_token(
+            DEFAULT_ORG_ID, "alice", "notion", _token("old"),
         )
-        stale = await store.put_user_token_if_current(
-            DEFAULT_ORG_ID, "alice", "notion", _token("stale"),
-            expected_revision=read,
+        first = await store.put_user_token_if_same_sign_in(
+            DEFAULT_ORG_ID, "alice", "notion", _token("refreshed-1"),
+            expected_sign_in=signed_in.sign_in,
+        )
+        second = await store.put_user_token_if_same_sign_in(
+            DEFAULT_ORG_ID, "alice", "notion", _token("refreshed-2"),
+            expected_sign_in=signed_in.sign_in,
         )
         stored = await _stored(store)
-        assert refreshed is not None and refreshed != read
-        assert stale is None
+        assert first is not None and second is not None
+        assert len({signed_in.revision, first, second}) == 3
         assert stored is not None
-        assert (stored.access_token, stored.revision) == ("refreshed", refreshed)
+        assert (stored.access_token, stored.sign_in, stored.revision) == (
+            "refreshed-2", signed_in.sign_in, second,
+        )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
-async def test_a_conditional_save_never_recreates_a_deleted_row(
+async def test_a_refresh_never_lands_on_a_newer_sign_in(
     backend: str, tmp_path: Path,
 ) -> None:
     async with _make_store(backend, tmp_path) as store:
-        read = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("old"))
+        old = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("old"))
+        await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("new"))
+        saved = await store.put_user_token_if_same_sign_in(
+            DEFAULT_ORG_ID, "alice", "notion", _token("old-refreshed"),
+            expected_sign_in=old.sign_in,
+        )
+        stored = await _stored(store)
+        assert saved is None
+        assert stored is not None and stored.access_token == "new"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_a_refresh_never_recreates_a_deleted_row(
+    backend: str, tmp_path: Path,
+) -> None:
+    async with _make_store(backend, tmp_path) as store:
+        signed_in = await store.put_user_token(
+            DEFAULT_ORG_ID, "alice", "notion", _token("old"),
+        )
         await store.delete_user_token(DEFAULT_ORG_ID, "alice", "notion")
-        saved = await store.put_user_token_if_current(
+        saved = await store.put_user_token_if_same_sign_in(
             DEFAULT_ORG_ID, "alice", "notion", _token("refreshed"),
-            expected_revision=read,
+            expected_sign_in=signed_in.sign_in,
         )
         assert saved is None
         assert await _stored(store) is None
@@ -930,39 +973,61 @@ async def test_a_conditional_save_never_recreates_a_deleted_row(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
-async def test_a_conditional_delete_leaves_a_newer_sign_in(
+async def test_a_conditional_delete_takes_only_the_tokens_it_read(
     backend: str, tmp_path: Path,
 ) -> None:
+    """A cleanup of tokens read earlier deletes neither a newer sign-in nor
+    newer tokens of the same sign-in."""
     async with _make_store(backend, tmp_path) as store:
         old = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("old"))
         new = await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("new"))
         assert await store.delete_user_token_if_current(
-            DEFAULT_ORG_ID, "alice", "notion", expected_revision=old,
+            DEFAULT_ORG_ID, "alice", "notion", expected_revision=old.revision,
+        ) is False
+        refreshed = await store.put_user_token_if_same_sign_in(
+            DEFAULT_ORG_ID, "alice", "notion", _token("new-refreshed"),
+            expected_sign_in=new.sign_in,
+        )
+        assert await store.delete_user_token_if_current(
+            DEFAULT_ORG_ID, "alice", "notion", expected_revision=new.revision,
         ) is False
         stored = await _stored(store)
-        assert stored is not None and stored.access_token == "new"
+        assert stored is not None and stored.access_token == "new-refreshed"
         assert await store.delete_user_token_if_current(
-            DEFAULT_ORG_ID, "alice", "notion", expected_revision=new,
+            DEFAULT_ORG_ID, "alice", "notion", expected_revision=refreshed,
         ) is True
         assert await _stored(store) is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
-async def test_a_row_saved_before_revisions_existed_matches_none(
-    backend: str, tmp_path: Path,
+@pytest.mark.parametrize(
+    "missing", list(OLDER_ROWS.values()), ids=list(OLDER_ROWS),
+)
+async def test_an_older_row_keeps_refreshing_until_the_next_sign_in(
+    backend: str, tmp_path: Path, missing: tuple[str, ...],
 ) -> None:
-    """Sign-ins saved before this change keep working: their revision
-    reads as ``None``, and ``None`` matches them."""
+    """Sign-ins saved by earlier releases keep working: their sign-in id
+    reads as ``None``, and ``None`` matches them, so their refreshes are
+    saved. The next sign-in gets a real id, which a refresh of the older
+    sign-in no longer matches."""
     async with _make_store(backend, tmp_path) as store:
-        await _save_legacy_row(store, _token("legacy"))
+        await _save_older_row(store, _token("older"), missing=missing)
         stored = await _stored(store)
-        assert stored is not None and stored.revision is None
+        assert stored is not None and stored.sign_in is None
 
-        refreshed = await store.put_user_token_if_current(
+        assert await store.put_user_token_if_same_sign_in(
             DEFAULT_ORG_ID, "alice", "notion", _token("refreshed"),
-            expected_revision=None,
-        )
+            expected_sign_in=None,
+        ) is not None
+        refreshed = await _stored(store)
         assert refreshed is not None
-        again = await _stored(store)
-        assert again is not None and again.access_token == "refreshed"
+        assert (refreshed.access_token, refreshed.sign_in) == ("refreshed", None)
+
+        await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("new"))
+        assert await store.put_user_token_if_same_sign_in(
+            DEFAULT_ORG_ID, "alice", "notion", _token("older-refreshed"),
+            expected_sign_in=None,
+        ) is None
+        latest = await _stored(store)
+        assert latest is not None and latest.access_token == "new"

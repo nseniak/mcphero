@@ -242,6 +242,64 @@ async def sign_in_again(store: FileConnectionStore, access_token: str) -> None:
     await other.set_tokens(make_sdk_token(access_token))
 
 
+async def refresh_elsewhere(store: FileConnectionStore, access_token: str) -> None:
+    """Another holder of the same sign-in refreshes it and saves the new
+    tokens, the way the 10-minute background refresh does."""
+    other = McpTokenStorage(store, DEFAULT_ORG_ID, "notion", "alice@co.com")
+    await other.get_tokens()
+    await other.set_tokens(make_sdk_token(access_token))
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_is_saved_after_another_refresh_of_the_same_sign_in(
+    tmp_path: Path,
+) -> None:
+    """A connection holds its copy of the sign-in while the background
+    refresh saves newer tokens of that same sign-in. When the connection
+    refreshes in turn, its tokens are the newest the upstream issued, and
+    they must be saved. Skipping them (production, 2026-09-30) left only
+    tokens the upstream had replaced, and the user was signed out."""
+    store, storage = await make_signed_in_storage(tmp_path)
+    await refresh_elsewhere(store, "refreshed-in-background")
+
+    with structlog.testing.capture_logs() as logs:
+        await storage.set_tokens(make_sdk_token("refreshed-by-connection"))
+
+    assert await stored_access_token(store) == "refreshed-by-connection"
+    skipped = [e for e in logs if e["event"] == "oauth.token.storage.write_skipped"]
+    assert skipped == []
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_after_signing_in_through_the_same_storage_is_saved(
+    tmp_path: Path,
+) -> None:
+    """The sign-in flow saves the new sign-in and keeps using the same
+    storage: its later refreshes are of the new sign-in and must land."""
+    store, storage = await make_signed_in_storage(tmp_path)
+    storage.mark_fresh_sign_in()
+    await storage.set_tokens(make_sdk_token("new"))
+
+    await storage.set_tokens(make_sdk_token("new-refreshed"))
+
+    assert await stored_access_token(store) == "new-refreshed"
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_sign_in_stays_refused_after_the_new_one_is_refreshed(
+    tmp_path: Path,
+) -> None:
+    """A refresh keeps the new sign-in the new sign-in: a refresh of the
+    old one still does not land."""
+    store, storage = await make_signed_in_storage(tmp_path)
+    await sign_in_again(store, "new")
+    await refresh_elsewhere(store, "new-refreshed")
+
+    await storage.set_tokens(make_sdk_token("old-refreshed"))
+
+    assert await stored_access_token(store) == "new-refreshed"
+
+
 @pytest.mark.asyncio
 async def test_a_refresh_is_not_saved_over_a_newer_sign_in(tmp_path: Path) -> None:
     store, storage = await make_signed_in_storage(tmp_path)
@@ -312,8 +370,8 @@ async def test_peeking_does_not_change_which_sign_in_a_refresh_came_from(
 async def test_a_sign_in_saved_before_revisions_existed_still_refreshes(
     tmp_path: Path,
 ) -> None:
-    """Rows saved before this change carry no revision. They keep
-    working: a refresh of one is saved."""
+    """Rows saved before revisions existed carry neither a revision nor a
+    sign-in id. They keep working: a refresh of one is saved."""
     store = FileConnectionStore(tmp_path)
     await store.put_user_token(
         DEFAULT_ORG_ID, "alice@co.com", "notion",
@@ -322,6 +380,7 @@ async def test_a_sign_in_saved_before_revisions_existed_still_refreshes(
     data = json.loads((tmp_path / "connections.json").read_text())
     for row in data.values():
         row.pop("revision", None)
+        row.pop("sign_in", None)
     (tmp_path / "connections.json").write_text(json.dumps(data))
     storage = McpTokenStorage(store, DEFAULT_ORG_ID, "notion", "alice@co.com")
     await storage.get_tokens()

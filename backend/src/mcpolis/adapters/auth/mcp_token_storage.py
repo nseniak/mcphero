@@ -64,14 +64,18 @@ class McpTokenStorage:
     single rotation. Defaults to ``None`` (no max-age clamp).
 
     Writes never clobber a newer sign-in. The instance remembers which
-    stored row the sign-in library loaded (``get_tokens``); a token
-    refresh it writes back lands only while that row is still stored.
-    Otherwise the user signed in again meanwhile (a new row) or
-    disconnected (no row), and writing the refreshed OLD tokens would
-    silently put them back on the old sign-in or undo the Disconnect.
-    Only a fresh sign-in (``mark_fresh_sign_in``) writes regardless.
-    Code outside the library reads with ``peek_tokens``, which leaves
-    that record alone.
+    stored row the sign-in library loaded (``get_tokens``) and which
+    sign-in that row belongs to. A token refresh it writes back lands
+    only while that sign-in is still stored, even when another refresh of
+    it saved newer tokens meanwhile: this refresh's tokens are then the
+    newest the upstream issued, and an upstream that replaces its tokens
+    on every refresh accepts only those (production, 2026-09-30). When the
+    user signed in again meanwhile (another sign-in) or disconnected (no
+    row), writing the refreshed OLD tokens would silently put them back on
+    the old sign-in or undo the Disconnect, so the write is skipped. Only
+    a fresh sign-in (``mark_fresh_sign_in``) writes regardless. Code
+    outside the library reads with ``peek_tokens``, which leaves that
+    record alone.
     """
 
     def __init__(
@@ -91,6 +95,8 @@ class McpTokenStorage:
         self._refresh_margin_s = refresh_margin_seconds
         self._max_age_s = max_age_seconds
         self._loaded_revision: LoadedRevision = NO_ROW
+        # The sign-in of the loaded row; meaningless while no row is.
+        self._loaded_sign_in: str | None = None
         self._fresh_sign_in = False
         self._fresh_sign_in_saved = False
 
@@ -113,8 +119,9 @@ class McpTokenStorage:
     @property
     def loaded_revision(self) -> LoadedRevision:
         """The revision of the stored row the sign-in library holds, or
-        ``NO_ROW``. A cleanup acting on this sign-in's failure passes it,
-        so it cannot delete a newer sign-in."""
+        ``NO_ROW``. A cleanup acting on the failure of these tokens passes
+        it, so it deletes only them: not a newer sign-in, nor newer tokens
+        another refresh of the same sign-in saved since."""
         return self._loaded_revision
 
     @property
@@ -126,7 +133,11 @@ class McpTokenStorage:
     def start_from(self, stored: InternalOAuthToken) -> None:
         """Take ``stored``, already read by the caller, as the row this
         instance works from, as ``get_tokens`` would have."""
-        self._loaded_revision = stored.revision
+        self._load(stored)
+
+    def _load(self, stored: InternalOAuthToken | None) -> None:
+        self._loaded_revision = stored.revision if stored is not None else NO_ROW
+        self._loaded_sign_in = stored.sign_in if stored is not None else None
 
     def mark_fresh_sign_in(self) -> None:
         """The next write is a fresh sign-in (the authorization code is in
@@ -141,9 +152,7 @@ class McpTokenStorage:
         internal = await self._store.get_user_token(
             self._org_id, self._user_id, self._upstream_id
         )
-        self._loaded_revision = (
-            internal.revision if internal is not None else NO_ROW
-        )
+        self._load(internal)
         return self._to_sdk(internal)
 
     async def peek_tokens(self) -> OAuthToken | None:
@@ -183,18 +192,21 @@ class McpTokenStorage:
         previous = await self._store.get_user_token(
             self._org_id, self._user_id, self._upstream_id,
         )
+        revision: str | None
         if self._fresh_sign_in:
-            revision: str | None = await self._store.put_user_token(
+            saved = await self._store.put_user_token(
                 self._org_id, self._user_id, self._upstream_id, internal,
             )
+            revision = saved.revision
+            self._loaded_sign_in = saved.sign_in
             self._fresh_sign_in = False
             self._fresh_sign_in_saved = True
         elif self._loaded_revision is NO_ROW:
             revision = None
         else:
-            revision = await self._store.put_user_token_if_current(
+            revision = await self._store.put_user_token_if_same_sign_in(
                 self._org_id, self._user_id, self._upstream_id, internal,
-                expected_revision=self._loaded_revision,
+                expected_sign_in=self._loaded_sign_in,
             )
         if revision is None:
             # The sign-in these tokens were refreshed from is no longer

@@ -22,12 +22,26 @@ class OAuthToken:
     # window. ``None`` for legacy rows written before this field
     # existed; treat as "freshness unknown, fall back to expires_at".
     updated_at: datetime | None = None
-    # Which saved sign-in this row is: every write (a sign-in, a token
-    # refresh) gets a new value. Code that read one row may change or
-    # delete it only while it is still that row; see
-    # ``put_user_token_if_current``. ``None`` for rows saved before
+    # Which saved tokens this row is: every write (a sign-in, a token
+    # refresh) gets a new value. Code acting on the failure of the tokens
+    # it read deletes them only while they are still stored; see
+    # ``delete_user_token_if_current``. ``None`` for rows saved before
     # revisions existed, and ``None`` matches them.
     revision: str | None = None
+    # Which sign-in these tokens belong to: a new value when the user signs
+    # in, kept by every refresh of that sign-in. A token refresh is saved
+    # only while its sign-in is still stored; see
+    # ``put_user_token_if_same_sign_in``. ``None`` for rows saved before
+    # sign-in ids existed, and ``None`` matches them.
+    sign_in: str | None = None
+
+
+@dataclass(frozen=True)
+class SavedSignIn:
+    """A fresh sign-in as ``put_user_token`` saved it."""
+
+    sign_in: str
+    revision: str
 
 
 class ConnectionStore:
@@ -42,19 +56,23 @@ class ConnectionStore:
     async def get_user_token(self, org_id: str, user_id: str, upstream_id: str) -> OAuthToken | None:
         raise NotImplementedError
 
-    async def put_user_token(self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken) -> str:
-        """Save ``token`` as the user's sign-in, whatever is stored.
-        Returns the new row's revision."""
+    async def put_user_token(
+        self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken,
+    ) -> SavedSignIn:
+        """Save ``token`` as a new sign-in of the user, whatever is stored.
+        Returns the new sign-in's id and the row's revision."""
         raise NotImplementedError
 
-    async def put_user_token_if_current(
+    async def put_user_token_if_same_sign_in(
         self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken,
-        *, expected_revision: str | None,
+        *, expected_sign_in: str | None,
     ) -> str | None:
-        """Save ``token`` only while the stored row is still the one read
-        with ``expected_revision``. Returns the new revision, or ``None``
-        when the row has changed since (a newer sign-in) or is gone (a
-        Disconnect): writing then would undo either. Atomic."""
+        """Save a token refresh only while the stored row still belongs to
+        ``expected_sign_in``, the sign-in it was refreshed from, whichever
+        of that sign-in's refreshes is stored now. Returns the new
+        revision, or ``None`` when the user has signed in again (another
+        sign-in) or disconnected (no row): writing then would undo either.
+        Atomic."""
         raise NotImplementedError
 
     async def delete_user_token(self, org_id: str, user_id: str, upstream_id: str) -> None:
@@ -64,8 +82,10 @@ class ConnectionStore:
         self, org_id: str, user_id: str, upstream_id: str,
         *, expected_revision: str | None,
     ) -> bool:
-        """Delete the row only while it is still the one read with
-        ``expected_revision``. Returns whether it was deleted. Atomic."""
+        """Delete the row only while it still holds the exact tokens read
+        with ``expected_revision``: not a newer sign-in, nor newer tokens
+        another refresh of the same sign-in saved since. Returns whether
+        it was deleted. Atomic."""
         raise NotImplementedError
 
     async def delete_all_user_tokens(self, org_id: str, user_id: str) -> int:

@@ -40,8 +40,8 @@ from mcpolis.domain.services.upstream_health_check import (
 )
 from mcpolis.domain.services.upstream_connection_service import (
     SilentReconnectAuthRequired,
-    failure_sign_in,
-    sign_in_is_still_stored,
+    failure_revision,
+    tokens_are_still_stored,
     _build_oauth_provider,  # pyright: ignore[reportPrivateUsage]
     _exception_chain_contains,  # pyright: ignore[reportPrivateUsage]
     _extract_refresh_failure,  # pyright: ignore[reportPrivateUsage]
@@ -211,8 +211,9 @@ async def refresh_token_for_user(
         refresh_margin_seconds=TOKEN_REFRESH_MARGIN,
         max_age_seconds=TOKEN_MAX_AGE_SECONDS,
     )
-    # This refresh works from the row just read: what it writes back, and
-    # what it purges on a rejection, apply only while that row is stored.
+    # This refresh works from the row just read: what it writes back lands
+    # only while that row's sign-in is stored, and what it purges on a
+    # rejection only while that very row is.
     storage.start_from(raw_token)
     oauth_auth = await _build_oauth_provider(
         upstream, storage,
@@ -382,15 +383,16 @@ async def refresh_token_for_user(
         await connection_store.clear_notified(
             org_id, upstream.id, user_id,
         )
-    elif signature is not None and not await sign_in_is_still_stored(
+    elif signature is not None and not await tokens_are_still_stored(
         connection_store, org_id, upstream.id, user_id,
-        failure_sign_in(oauth_auth, storage),
+        failure_revision(oauth_auth, storage),
     ):
-        # Rejected, but the sign-in it was about is gone: the user signed
-        # in again or disconnected meanwhile. Record nothing, email nobody,
-        # delete nothing, as ``_classify_reconnect_failure`` does.
+        # Rejected, but the tokens it was about are no longer stored: the
+        # user signed in again or disconnected, or another refresh saved
+        # newer tokens, meanwhile. Record nothing, email nobody, delete
+        # nothing, as ``_classify_reconnect_failure`` does.
         logger.info(
-            "oauth.token.refresh.failure_of_replaced_sign_in",
+            "oauth.token.refresh.failure_of_replaced_tokens",
             upstream_id=upstream.id,
             user=user_id,
             org_id=org_id,
@@ -475,7 +477,7 @@ async def refresh_token_for_user(
             # of re-presenting the dead client_id forever.
             await purge_user_oauth_state(
                 connection_store, org_id, upstream.id, user_id,
-                sign_in=failure_sign_in(oauth_auth, storage),
+                revision=failure_revision(oauth_auth, storage),
             )
     else:
         # Raised from DEBUG to INFO so the periodic loop's "no-op tick"

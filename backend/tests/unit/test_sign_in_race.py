@@ -10,6 +10,10 @@ earlier acts on the store by key, on whatever row it finds there:
 - when it fails, its cleanup deletes the sign-in, so the user who has just
   signed in has to sign in again.
 
+The guard must still let through a refresh of the SAME sign-in that
+another refresh saved newer tokens of meanwhile: those are the newest
+tokens the upstream issued.
+
 REAL token endpoint (a small Starlette app whose answer the test releases,
 so the reconnect is provably mid-refresh when the new sign-in lands), REAL
 loopback MCP server, REAL file-backed store, REAL reconnect path.
@@ -17,6 +21,7 @@ loopback MCP server, REAL file-backed store, REAL reconnect path.
 NOTE: no ``from __future__ import annotations`` (see the race harness).
 """
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -54,6 +59,9 @@ from tests.unit._user_session_harness import (
     stop_upstream,
     wait_until,
 )
+# After the harness, which loads ``upstream_connection_service``: imported
+# first, ``oauth_refresh`` fails on its circular import with it.
+from mcpolis.domain.services.oauth_refresh import refresh_token_for_user
 
 
 class TokenEndpoint:
@@ -67,6 +75,18 @@ class TokenEndpoint:
         self.release = asyncio.Event()
 
 
+class RotatingTokenEndpoint:
+    """An upstream token endpoint that issues new tokens on every
+    refresh, as ``drop`` does, and holds the FIRST request until
+    ``release_first`` is set. ``issued`` lists the access tokens in the
+    order they were issued."""
+
+    def __init__(self) -> None:
+        self.requests = 0
+        self.issued: list[str] = []
+        self.release_first = asyncio.Event()
+
+
 async def start_token_endpoint(
     endpoint: TokenEndpoint,
 ) -> tuple[uvicorn.Server, asyncio.Task[None], str]:
@@ -75,6 +95,31 @@ async def start_token_endpoint(
         await endpoint.release.wait()
         return JSONResponse(endpoint.answer, status_code=endpoint.status)
 
+    return await serve_token_endpoint(token)
+
+
+async def start_rotating_token_endpoint(
+    endpoint: RotatingTokenEndpoint,
+) -> tuple[uvicorn.Server, asyncio.Task[None], str]:
+    async def token(_request: Request) -> JSONResponse:
+        endpoint.requests += 1
+        if endpoint.requests == 1:
+            await endpoint.release_first.wait()
+        access_token = f"issued-{len(endpoint.issued) + 1}"
+        endpoint.issued.append(access_token)
+        return JSONResponse({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": f"refresh-{access_token}",
+        })
+
+    return await serve_token_endpoint(token)
+
+
+async def serve_token_endpoint(
+    token: Callable[[Request], Awaitable[JSONResponse]],
+) -> tuple[uvicorn.Server, asyncio.Task[None], str]:
     port = free_port()
     app = Starlette(routes=[Route("/token", token, methods=["POST"])])
     server = uvicorn.Server(uvicorn.Config(
@@ -207,4 +252,48 @@ async def test_a_failing_reconnect_never_deletes_a_sign_in_made_meanwhile(
     finally:
         endpoint.release.set()
         await mgr.stop_all()
+        await stop_upstream(token_server, token_task)
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_refresh_is_saved_after_the_background_refresh_saved_first(
+    tmp_path: Path,
+) -> None:
+    """Production, 2026-09-30 (Sentry MCPOLIS-BACKEND-18): a connection
+    refreshed the sign-in it had loaded after the 10-minute background
+    refresh had saved newer tokens of the SAME sign-in. The upstream then
+    accepted only the connection's tokens, but they were not saved, as if
+    the user had signed in again. The next refresh was rejected, and the
+    user was signed out."""
+    endpoint = RotatingTokenEndpoint()
+    token_server, token_task, token_base = await start_rotating_token_endpoint(
+        endpoint,
+    )
+    server, server_task, url = await start_upstream(ConnectionGate())
+    upstream = make_upstream(url)
+    store = await make_store_with_old_sign_in(tmp_path, token_base)
+    mgr = UpstreamClientManager([upstream])
+    try:
+        request = asyncio.create_task(acquire(mgr, upstream, store))
+        await wait_until(lambda: endpoint.requests >= 1)
+
+        await refresh_token_for_user(
+            DEFAULT_ORG_ID, upstream, ALICE, store, GATEWAY_URL,
+        )
+        endpoint.release_first.set()
+        await asyncio.wait_for(
+            asyncio.gather(request, return_exceptions=True), timeout=30,
+        )
+
+        assert len(endpoint.issued) == 2, endpoint.issued
+        stored = await store.get_user_token(DEFAULT_ORG_ID, ALICE, UPSTREAM_ID)
+        assert stored is not None, "the sign-in was deleted"
+        assert stored.access_token == endpoint.issued[-1], (
+            "the reconnect's tokens, the newest the upstream issued, were "
+            f"not saved; the store holds {stored.access_token!r}"
+        )
+    finally:
+        endpoint.release_first.set()
+        await mgr.stop_all()
+        await stop_upstream(server, server_task)
         await stop_upstream(token_server, token_task)

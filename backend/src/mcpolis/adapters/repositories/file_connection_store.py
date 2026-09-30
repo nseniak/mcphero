@@ -9,18 +9,24 @@ from typing import Any
 
 import structlog
 
-from mcpolis.adapters.repositories.connection_store import ConnectionStore, OAuthToken
+from mcpolis.adapters.repositories.connection_store import (
+    ConnectionStore,
+    OAuthToken,
+    SavedSignIn,
+)
 from mcpolis.domain.ports import ADMIN_USER_ID
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 
 def _serialize_token(
-    token: OAuthToken, authorized_by: str = "", *, revision: str | None = None,
+    token: OAuthToken, authorized_by: str = "", *,
+    revision: str | None = None, sign_in: str | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(UTC)
     return {
         "revision": revision,
+        "sign_in": sign_in,
         "access_token": token.access_token,
         "refresh_token": token.refresh_token,
         "expires_at": token.expires_at.isoformat() if token.expires_at else None,
@@ -55,6 +61,7 @@ def _deserialize_token(data: dict[str, Any]) -> OAuthToken:
         refresh_token_created_at=refresh_token_created_at,
         updated_at=updated_at,
         revision=data.get("revision"),
+        sign_in=data.get("sign_in"),
     )
 
 
@@ -130,28 +137,32 @@ class FileConnectionStore(ConnectionStore):
                 return None
             return _deserialize_token(entry)
 
-    async def put_user_token(self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken) -> str:
-        revision = uuid.uuid4().hex
+    async def put_user_token(
+        self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken,
+    ) -> SavedSignIn:
+        saved = SavedSignIn(sign_in=uuid.uuid4().hex, revision=uuid.uuid4().hex)
         async with self._lock:
             data = self._read()
             data[self._user_key(user_id, upstream_id)] = _serialize_token(
-                token, revision=revision,
+                token, revision=saved.revision, sign_in=saved.sign_in,
             )
             self._write(data)
-        return revision
+        return saved
 
-    async def put_user_token_if_current(
+    async def put_user_token_if_same_sign_in(
         self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken,
-        *, expected_revision: str | None,
+        *, expected_sign_in: str | None,
     ) -> str | None:
         key = self._user_key(user_id, upstream_id)
         revision = uuid.uuid4().hex
         async with self._lock:
             data = self._read()
             entry = data.get(key)
-            if entry is None or entry.get("revision") != expected_revision:
+            if entry is None or entry.get("sign_in") != expected_sign_in:
                 return None
-            data[key] = _serialize_token(token, revision=revision)
+            data[key] = _serialize_token(
+                token, revision=revision, sign_in=expected_sign_in,
+            )
             self._write(data)
         return revision
 
