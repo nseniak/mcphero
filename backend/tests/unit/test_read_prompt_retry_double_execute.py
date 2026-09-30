@@ -45,6 +45,9 @@ from mcpolis.adapters.repositories.audit_repository import AuditRepository
 from mcpolis.adapters.upstream_clients.client_manager import (
     UpstreamClientManager,
 )
+from mcpolis.adapters.upstream_clients.connection_task_base import (
+    in_flight_connection_loss,
+)
 from mcpolis.domain.model.audit import AuditEntry
 from mcpolis.domain.model.settings import SettingsConfig
 from mcpolis.domain.model.upstream import ToolAnnotations
@@ -79,6 +82,21 @@ def _timeout() -> BaseException:
 def _closed() -> BaseException:
     """A PRE-delivery stall (a dead/closed transport)."""
     return anyio.ClosedResourceError()
+
+
+def _in_flight_loss() -> BaseException:
+    """A POST-delivery stall: the connection ended while the request was
+    in flight (what a session's ended transport answers it with)."""
+    return McpError(in_flight_connection_loss())
+
+
+def _sdk_connection_closed() -> BaseException:
+    """A POST-delivery stall: what the SDK itself answers a request still
+    waiting when the read side of its connection closes (an E2B sandbox
+    pausing, a local process exiting)."""
+    return McpError(mcp_types.ErrorData(
+        code=mcp_types.CONNECTION_CLOSED, message="Connection closed",
+    ))
 
 
 class _StallThenSucceedSession:
@@ -200,18 +218,18 @@ def make_router(
 # --- the classifier + the decision matrix (pure units) -----------------------
 
 
-def test_is_post_delivery_stall_only_classifies_the_silent_timeout() -> None:
-    """Only the synthesized ``asyncio.TimeoutError`` (request in flight,
-    response lost) is post-delivery. Every already-dead-transport shape is
-    pre-delivery (the request never left the gateway)."""
+def test_is_post_delivery_stall_classifies_only_requests_already_sent() -> None:
+    """Post-delivery: the synthesized ``asyncio.TimeoutError`` (request in
+    flight, response lost) and every ``CONNECTION_CLOSED``: the SDK sends
+    that only to requests already written, when their connection ends
+    (and so do we, sooner, with the in-flight message). A dead transport
+    that refuses the write is pre-delivery: the request never left the
+    gateway."""
     assert _is_post_delivery_stall(asyncio.TimeoutError()) is True
+    assert _is_post_delivery_stall(_in_flight_loss()) is True
+    assert _is_post_delivery_stall(_sdk_connection_closed()) is True
     assert _is_post_delivery_stall(anyio.ClosedResourceError()) is False
     assert _is_post_delivery_stall(anyio.BrokenResourceError()) is False
-    assert _is_post_delivery_stall(
-        McpError(mcp_types.ErrorData(
-            code=mcp_types.CONNECTION_CLOSED, message="closed",
-        )),
-    ) is False
     assert _is_post_delivery_stall(
         McpError(mcp_types.ErrorData(code=32600, message="Session terminated")),
     ) is False
@@ -296,6 +314,58 @@ async def test_read_resource_pre_delivery_stall_recovers_via_retry() -> None:
     assert session.read_calls == 2, "a pre-delivery stall must recover via retry"
     assert result.contents
     assert router.settle_calls == 0, "a recovered call must not settle"
+
+
+@pytest.mark.asyncio
+async def test_read_resource_in_flight_connection_loss_runs_upstream_once() -> None:
+    """A connection that ended with the read in flight answers it at once
+    now, instead of at the liveness probe. The read may have run
+    upstream, so it is not re-run, exactly as after the probe's stall."""
+    session = _StallThenSucceedSession(_in_flight_loss)
+    router = make_router(session)
+
+    with pytest.raises(UpstreamRouterError):
+        await router.read_resource(
+            org_id=DEFAULT_ORG_ID, upstream_id=UPSTREAM_ID,
+            original_uri=RESOURCE_URI, user_id=USER, session_id=None,
+        )
+
+    assert session.read_calls == 1, "an in-flight read must NOT double-execute"
+
+
+@pytest.mark.asyncio
+async def test_read_resource_sdk_connection_closed_runs_upstream_once() -> None:
+    """The SDK's own ``CONNECTION_CLOSED`` reaches only a read that was
+    already sent: the sandbox paused or the process exited while it ran.
+    Re-running it could repeat a side effect, so it is not re-run."""
+    session = _StallThenSucceedSession(_sdk_connection_closed)
+    router = make_router(session)
+
+    with pytest.raises(UpstreamRouterError):
+        await router.read_resource(
+            org_id=DEFAULT_ORG_ID, upstream_id=UPSTREAM_ID,
+            original_uri=RESOURCE_URI, user_id=USER, session_id=None,
+        )
+
+    assert session.read_calls == 1, "an in-flight read must NOT double-execute"
+
+
+@pytest.mark.asyncio
+async def test_readonly_tool_retries_after_in_flight_connection_loss() -> None:
+    """A tool that declared itself repeatable still recovers on a fresh
+    session."""
+    session = _StallThenSucceedSession(_in_flight_loss)
+    router = make_router(
+        session, tool_annotations=ToolAnnotations(readOnlyHint=True),
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID, prefixed_name=f"{UPSTREAM_ID}__{TOOL_NAME}",
+        arguments={}, user_id=USER, session_id=None,
+    )
+
+    assert session.tool_calls == 2
+    assert not result.isError
 
 
 @pytest.mark.asyncio

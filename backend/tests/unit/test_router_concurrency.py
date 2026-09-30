@@ -27,7 +27,11 @@ from mcpolis.adapters.upstream_clients.client_manager import (
 )
 from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.domain.services.sandbox_resolver import SandboxResolver
-from mcpolis.domain.services.tool_router import dispatch_with_liveness
+from mcpolis.domain.services.tool_registry import is_transport_stall
+from mcpolis.domain.services.tool_router import (  # pyright: ignore[reportPrivateUsage]
+    _is_post_delivery_stall,
+    dispatch_with_liveness,
+)
 from tests.unit.factories import make_upstream_definition
 from tests.unit.fake_sandbox_service import (
     FakeSandboxService,
@@ -132,9 +136,10 @@ async def test_idle_sweep_during_inflight_dispatch_surfaces_clean_stall() -> Non
     The call runs through the production ``dispatch_with_liveness`` path
     (exactly as ``ToolRouter._dispatch_with_recovery`` runs it). The sweep's
     ``task.close()`` tears the transport down out from under the in-flight
-    op; the dispatch's liveness ping then sees the now-closed stream and
-    raises a bounded ``asyncio.TimeoutError`` (the in-flight "pin" that
-    keeps a sweep-induced teardown from hanging the caller). Awaiting the
+    op, and the ended session answers the op at once with the in-flight
+    connection loss. The router classifies that exactly like the liveness
+    probe's ``asyncio.TimeoutError`` it replaces: a stall, heal, and
+    possibly delivered, so a non-repeatable op is not re-run. Awaiting the
     dispatch directly inside ``pytest.raises`` is the no-hang assertion: a
     genuine hang would never return and the test would time out.
 
@@ -183,8 +188,10 @@ async def test_idle_sweep_during_inflight_dispatch_surfaces_clean_stall() -> Non
 
     # The in-flight dispatch must surface a clean stall, NOT hang. Awaiting
     # it directly (no outer wait_for) makes a hang fail by never returning.
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(Exception) as stalled:
         await dispatch
+    assert is_transport_stall(stalled.value), stalled.value
+    assert _is_post_delivery_stall(stalled.value), stalled.value
 
     # Let the orphaned server-side tool unblock so teardown is clean.
     release.set()

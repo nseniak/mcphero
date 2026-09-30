@@ -363,8 +363,14 @@ async def refresh_token_for_user(
         new_remaining = (
             refreshed_token.expires_at - datetime.now(UTC)
         ).total_seconds()
+        # The stored tokens changed, but maybe not through this refresh:
+        # another holder of the sign-in (a reconnect, a live session) may
+        # have renewed them first, rejecting this refresh's own request.
+        # The sign-in works either way; only the credit differs.
         logger.info(
-            "oauth.token.refresh.success",
+            "oauth.token.refresh.success"
+            if storage.tokens_saved
+            else "oauth.token.refresh.refreshed_elsewhere",
             upstream_id=upstream.id,
             user=user_id,
             org_id=org_id,

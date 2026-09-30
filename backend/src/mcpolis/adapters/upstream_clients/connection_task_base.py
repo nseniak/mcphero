@@ -36,8 +36,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable
 from typing import TypeVar
 
+import anyio
 import structlog
 from mcp.client.session import ClientSession
+from mcp.shared.exceptions import McpError
+from mcp.types import CONNECTION_CLOSED, ErrorData, JSONRPCError
 
 from mcpolis.adapters.upstream_clients.notification_handler import (
     OnPromptListChanged,
@@ -63,6 +66,57 @@ DEFAULT_CLOSE_TIMEOUT = 10.0
 ABANDON_TIMEOUT = 30.0
 
 T = TypeVar("T")
+
+
+# What a request still in flight gets when its connection ends. The
+# SDK's own CONNECTION_CLOSED code, so it reads as a dead transport and
+# the session is rebuilt; this message, so the router knows the request
+# was already sent and may have run upstream.
+_IN_FLIGHT_CONNECTION_LOST = "Connection lost while the request was in flight"
+
+
+def in_flight_connection_loss() -> ErrorData:
+    """The error ``fail_in_flight_requests`` answers requests with."""
+    return ErrorData(code=CONNECTION_CLOSED, message=_IN_FLIGHT_CONNECTION_LOST)
+
+
+def is_in_flight_connection_loss(exc: BaseException) -> bool:
+    """Whether ``exc`` is a request's answer when its connection ended
+    while it was in flight: the upstream may have run it, so running it
+    again could repeat its effect."""
+    return (
+        isinstance(exc, McpError)
+        and exc.error.code == CONNECTION_CLOSED
+        and exc.error.message == _IN_FLIGHT_CONNECTION_LOST
+    )
+
+
+def fail_in_flight_requests(session: ClientSession) -> int:
+    """Answer every request still waiting on ``session`` with
+    ``in_flight_connection_loss``. Returns how many were answered.
+
+    The SDK answers them itself when its read loop ends, in a
+    ``finally``. But a session torn down by cancellation, which is how a
+    failing transport ends it and also how a close ends it, cancels that
+    ``finally`` at its first ``await``, and the requests hung until the
+    router's liveness probe, 30 s later (e2e 18c, 2026-09-30).
+    ``send_nowait`` needs no ``await``, so this works where the SDK's
+    answer cannot.
+    """
+    streams = session._response_streams  # pyright: ignore[reportPrivateUsage]
+    answered = 0
+    for request_id, stream in list(streams.items()):
+        try:
+            stream.send_nowait(JSONRPCError(
+                jsonrpc="2.0", id=request_id, error=in_flight_connection_loss(),
+            ))
+            answered += 1
+        except (anyio.WouldBlock, anyio.BrokenResourceError, anyio.ClosedResourceError):
+            # Already answered, or nobody waits on it any more.
+            pass
+        stream.close()
+    streams.clear()
+    return answered
 
 
 class ConnectAbandoned(Exception):
@@ -100,6 +154,9 @@ class ConnectionTaskBase(ABC):
         )
         self._task: asyncio.Task[None] | None = None
         self._closed = False
+        # Set once the background task has ended, whatever ended it: the
+        # session it served can no longer send anything.
+        self._run_ended = False
         # Set when whoever waited on ``start`` gave up; ``_run`` then lets
         # go of whatever it holds at its next step (see ``start``).
         self._abandoned = asyncio.Event()
@@ -118,11 +175,13 @@ class ConnectionTaskBase(ABC):
     def is_transport_alive(self) -> bool:
         """Whether this task's transport is still usable.
 
-        ``False`` once the backend has signalled an unrecoverable
-        transport failure. Conservatively returns ``True`` when no
-        failure signal is wired (HTTP, or before a session exists), so
-        existing reuse behaviour is unchanged for those paths.
+        ``False`` once the background task has ended (the transport died,
+        or the session was closed), or once the backend has signalled an
+        unrecoverable transport failure. Otherwise ``True``, also before a
+        session exists.
         """
+        if self._run_ended:
+            return False
         return self._transport_failed is None or not self._transport_failed.is_set()
 
     @abstractmethod
@@ -189,11 +248,31 @@ class ConnectionTaskBase(ABC):
         self._task = asyncio.create_task(
             self._run_in_session_context(), context=fresh_ctx,
         )
+        self._task.add_done_callback(self._on_run_ended, context=fresh_ctx)
         try:
             return await self._session_future
         except asyncio.CancelledError:
             await self._abandon_despite_cancels()
             raise
+
+    def _on_run_ended(self, _task: "asyncio.Task[None]") -> None:
+        """The background task has ended, so the session it served is
+        dead: the manager must stop handing it out, and the requests
+        still waiting on it are answered now instead of at the router's
+        liveness probe, 30 s later."""
+        self._run_ended = True
+        future = self._session_future
+        if not future.done() or future.cancelled() or future.exception() is not None:
+            return
+        answered = fail_in_flight_requests(future.result())
+        if answered:
+            logger.info(
+                "upstream.session.in_flight_failed",
+                upstream_id=self._upstream.id,
+                requests=answered,
+                closed_on_purpose=self._closed,
+                **self._log_extras(),
+            )
 
     async def _abandon_despite_cancels(self) -> None:
         """``_abandon``, carried to its end even if this task is cancelled

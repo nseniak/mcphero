@@ -12,6 +12,7 @@ from typing import Any, Generic, TypeVar
 
 import mcp.types as mcp_types
 import structlog
+from mcp.shared.exceptions import McpError
 from pydantic import AnyUrl
 
 from mcpolis.adapters.observability.analytics_client import get_analytics
@@ -184,6 +185,14 @@ async def dispatch_with_liveness(
                 )
             except Exception as ping_exc:
                 if is_transport_stall(ping_exc):
+                    if (
+                        op_task.done()
+                        and not op_task.cancelled()
+                        and op_task.exception() is None
+                    ):
+                        # The op finished just before its connection died
+                        # under the ping: its answer stands.
+                        return op_task.result()
                     # No pong within ping_timeout (or the stream broke):
                     # the transport went silent. Signal a stall; the
                     # ``finally`` cancels the abandoned op.
@@ -225,6 +234,12 @@ async def dispatch_with_liveness(
                 # abandoned op: the surfaced outcome is the stall (or an
                 # outer cancellation propagating through this finally).
                 pass
+        elif not op_task.cancelled():
+            # Read the error of an op that failed while the ping was out
+            # (a connection that ends answers both at once): unread,
+            # asyncio logs "Task exception was never retrieved" at ERROR,
+            # which reaches Sentry.
+            op_task.exception()
 
 
 def _is_post_delivery_stall(exc: BaseException) -> bool:
@@ -236,21 +251,31 @@ def _is_post_delivery_stall(exc: BaseException) -> bool:
     ``asyncio.TimeoutError`` only once the op has been in flight past the
     probe interval AND the upstream stopped answering pings: the request
     was already delivered and its response was lost (the E2B #1128 silent
-    post-reattach stall). That is the one stall the gateway *synthesizes*
-    for "in flight, went silent", so it is the precise post-delivery
-    signal.
+    post-reattach stall). That is one stall the gateway *synthesizes* for
+    "in flight, went silent".
 
-    Every other ``is_transport_stall`` shape — ``ClosedResourceError`` /
-    ``BrokenResourceError`` / ``CONNECTION_CLOSED`` / "Session terminated"
-    — means the cached transport was already dead (the dead-idle-session
-    case, Sentry MCPOLIS-BACKEND-R/-S), so the request never left the
-    gateway: pre-delivery, safe to re-run. HEURISTIC LIMIT: a stream that
-    breaks mid-flight *after* delivery also surfaces as
+    ``CONNECTION_CLOSED`` is the same phase: it answers a request that was
+    already written and still waited for its answer when the connection
+    ended. The SDK sends it itself when the read side closes (an E2B
+    sandbox pausing or its stream dying, a local process exiting), and a
+    session sends it with the in-flight message when its connection task
+    ends (``fail_in_flight_requests``) instead of leaving the request to
+    the probe. Same verdict as the probe's timeout, only sooner.
+
+    The pre-delivery shapes are the ones where the transport refused the
+    write: ``ClosedResourceError`` / ``BrokenResourceError`` (the
+    dead-idle-session case, Sentry MCPOLIS-BACKEND-R/-S) and "Session
+    terminated" (the server rejects the session id, so it ran nothing):
+    the request never left the gateway, safe to re-run. HEURISTIC LIMIT: a
+    stream that breaks mid-flight *after* delivery can also surface as
     ``ClosedResourceError`` and is treated as pre-delivery here — so this
     narrows the double-execute window rather than closing it. A read known
     to side-effect needs a per-upstream opt-out, not this classifier.
     """
-    return isinstance(exc, asyncio.TimeoutError)
+    return isinstance(exc, asyncio.TimeoutError) or (
+        isinstance(exc, McpError)
+        and exc.error.code == mcp_types.CONNECTION_CLOSED
+    )
 
 
 @dataclass

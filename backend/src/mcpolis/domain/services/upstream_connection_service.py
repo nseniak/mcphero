@@ -296,6 +296,9 @@ class _InitializingOAuthClientProvider(OAuthClientProvider):
     the context tokens. That's the only moment where status+body are
     still available — after it, the forensic trail dead-ends in a
     ``WARNING: Token refresh failed`` line.
+
+    And: reload the stored tokens before refreshing an expired copy (see
+    ``_initialized``).
     """
 
     last_refresh_failure: RefreshFailureSignature | None = None
@@ -303,6 +306,24 @@ class _InitializingOAuthClientProvider(OAuthClientProvider):
     # failure is about those tokens only: by the time it is acted on, the
     # user may have signed in again, or another refresh saved newer ones.
     last_refresh_failure_revision: LoadedRevision = NO_ROW
+
+    # The SDK loads the stored tokens once, then keeps its own copy. Its
+    # only reload hook is this flag, read at the start of every request.
+    # It reads False while the copy has expired, so the SDK reloads the
+    # stored tokens before it refreshes: another holder of the same
+    # sign-in (the background refresh, a reconnect) may have renewed them
+    # already, which used up this copy's refresh token. Refreshing with it
+    # anyway is rejected by upstreams that rotate refresh tokens, and ones
+    # with reuse detection revoke the whole sign-in.
+    _loaded_once = False
+
+    @property
+    def _initialized(self) -> bool:  # pyright: ignore[reportIncompatibleVariableOverride]
+        return self._loaded_once and self.context.is_token_valid()
+
+    @_initialized.setter
+    def _initialized(self, value: bool) -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        self._loaded_once = value
 
     async def _initialize(self) -> None:
         await super()._initialize()  # pyright: ignore[reportPrivateUsage]

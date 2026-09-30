@@ -99,6 +99,7 @@ class McpTokenStorage:
         self._loaded_sign_in: str | None = None
         self._fresh_sign_in = False
         self._fresh_sign_in_saved = False
+        self._tokens_saved = False
 
     @property
     def connection_store(self) -> ConnectionStore:
@@ -129,6 +130,12 @@ class McpTokenStorage:
         """Whether a fresh sign-in's tokens were saved through this
         instance."""
         return self._fresh_sign_in_saved
+
+    @property
+    def tokens_saved(self) -> bool:
+        """Whether any tokens (a sign-in, a refresh) were saved through
+        this instance, as opposed to by another holder of the sign-in."""
+        return self._tokens_saved
 
     def start_from(self, stored: InternalOAuthToken) -> None:
         """Take ``stored``, already read by the caller, as the row this
@@ -222,6 +229,7 @@ class McpTokenStorage:
             )
             return
         self._loaded_revision = revision
+        self._tokens_saved = True
         # Last 6 chars of the access token — enough to visually confirm
         # the value actually changed (not just a re-write of the same
         # row) without logging the full credential.

@@ -26,15 +26,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+import structlog
 import uvicorn
-from mcp.shared.auth import OAuthClientInformationFull
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken as SdkToken
 from pydantic import AnyUrl
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
 from mcpolis.adapters.repositories.connection_store import (
     OAuthToken as StoredToken,
 )
@@ -59,6 +62,11 @@ from tests.unit._user_session_harness import (
     stop_upstream,
     wait_until,
 )
+from mcpolis.domain.services.upstream_connection_service import (  # pyright: ignore[reportPrivateUsage]
+    _build_oauth_provider,
+    _noop_callback,
+    _noop_redirect,
+)
 # After the harness, which loads ``upstream_connection_service``: imported
 # first, ``oauth_refresh`` fails on its circular import with it.
 from mcpolis.domain.services.oauth_refresh import refresh_token_for_user
@@ -78,13 +86,28 @@ class TokenEndpoint:
 class RotatingTokenEndpoint:
     """An upstream token endpoint that issues new tokens on every
     refresh, as ``drop`` does, and holds the FIRST request until
-    ``release_first`` is set. ``issued`` lists the access tokens in the
+    ``release_first`` is set; with ``reject_first`` it then answers that
+    request ``invalid_grant``. ``issued`` lists the access tokens in the
     order they were issued."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, reject_first: bool = False) -> None:
         self.requests = 0
         self.issued: list[str] = []
         self.release_first = asyncio.Event()
+        self.reject_first = reject_first
+
+
+class StrictRotatingUpstream:
+    """An upstream whose token endpoint accepts each refresh token once
+    (reuse is ``invalid_grant``, as with refresh-token rotation), issues a
+    1-second access token first and 1-hour ones after, and whose
+    ``/resource`` records the bearer each request carried."""
+
+    def __init__(self, first_refresh_token: str) -> None:
+        self.refreshes = 0
+        self.issued: list[str] = []
+        self.valid_refresh_tokens = {first_refresh_token}
+        self.bearers: list[str | None] = []
 
 
 async def start_token_endpoint(
@@ -105,6 +128,8 @@ async def start_rotating_token_endpoint(
         endpoint.requests += 1
         if endpoint.requests == 1:
             await endpoint.release_first.wait()
+            if endpoint.reject_first:
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
         access_token = f"issued-{len(endpoint.issued) + 1}"
         endpoint.issued.append(access_token)
         return JSONResponse({
@@ -117,11 +142,44 @@ async def start_rotating_token_endpoint(
     return await serve_token_endpoint(token)
 
 
+async def start_strict_rotating_upstream(
+    upstream: StrictRotatingUpstream,
+) -> tuple[uvicorn.Server, asyncio.Task[None], str]:
+    async def token(request: Request) -> JSONResponse:
+        upstream.refreshes += 1
+        form = await request.form()
+        refresh_token = form.get("refresh_token")
+        if refresh_token not in upstream.valid_refresh_tokens:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        upstream.valid_refresh_tokens.discard(str(refresh_token))
+        access_token = f"issued-{len(upstream.issued) + 1}"
+        upstream.issued.append(access_token)
+        upstream.valid_refresh_tokens.add(f"refresh-{access_token}")
+        return JSONResponse({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 1 if len(upstream.issued) == 1 else 3600,
+            "refresh_token": f"refresh-{access_token}",
+        })
+
+    async def resource(request: Request) -> JSONResponse:
+        upstream.bearers.append(request.headers.get("authorization"))
+        return JSONResponse({})
+
+    return await serve_token_endpoint(
+        token, extra=[Route("/resource", resource, methods=["POST"])],
+    )
+
+
 async def serve_token_endpoint(
     token: Callable[[Request], Awaitable[JSONResponse]],
+    *,
+    extra: list[Route] | None = None,
 ) -> tuple[uvicorn.Server, asyncio.Task[None], str]:
     port = free_port()
-    app = Starlette(routes=[Route("/token", token, methods=["POST"])])
+    app = Starlette(
+        routes=[Route("/token", token, methods=["POST"]), *(extra or [])],
+    )
     server = uvicorn.Server(uvicorn.Config(
         app, host="127.0.0.1", port=port, log_level="warning", ws="none",
     ))
@@ -292,6 +350,156 @@ async def test_a_reconnect_refresh_is_saved_after_the_background_refresh_saved_f
             "the reconnect's tokens, the newest the upstream issued, were "
             f"not saved; the store holds {stored.access_token!r}"
         )
+    finally:
+        endpoint.release_first.set()
+        await mgr.stop_all()
+        await stop_upstream(server, server_task)
+        await stop_upstream(token_server, token_task)
+
+
+@pytest.mark.asyncio
+async def test_a_connection_uses_tokens_another_refresh_saved_instead_of_refreshing_its_old_copy(
+    tmp_path: Path,
+) -> None:
+    """A connection keeps its own copy of the tokens. When the background
+    refresh renews the sign-in, that copy's refresh token is used up. The
+    connection must pick up the renewed tokens when its copy expires:
+    refreshing its old copy is rejected by an upstream that rotates
+    refresh tokens (and, with reuse detection, revokes the sign-in)."""
+    upstream_server = StrictRotatingUpstream(first_refresh_token="old-refresh")
+    server, server_task, base = await start_strict_rotating_upstream(
+        upstream_server,
+    )
+    upstream = make_upstream(f"{base}/resource")
+    store = await make_store_with_old_sign_in(tmp_path, base)
+    connection = await _build_oauth_provider(
+        upstream,
+        McpTokenStorage(store, DEFAULT_ORG_ID, UPSTREAM_ID, ALICE),
+        _noop_redirect, _noop_callback, GATEWAY_URL,
+    )
+    try:
+        async with httpx.AsyncClient(auth=connection) as client:
+            await client.post(f"{base}/resource", json={})
+            assert upstream_server.bearers == ["Bearer issued-1"]
+
+            await refresh_token_for_user(
+                DEFAULT_ORG_ID, upstream, ALICE, store, GATEWAY_URL,
+            )
+            await asyncio.sleep(1.2)  # the connection's own copy expires
+            await client.post(f"{base}/resource", json={})
+
+        assert upstream_server.bearers[-1] == "Bearer issued-2", (
+            "the connection did not use the tokens the background refresh "
+            f"saved; bearers seen: {upstream_server.bearers}"
+        )
+        assert upstream_server.refreshes == 2, (
+            "the connection refreshed its old copy "
+            f"({upstream_server.refreshes} refresh requests)"
+        )
+    finally:
+        await stop_upstream(server, server_task)
+
+
+class CountingStorage(McpTokenStorage):
+    """Counts how often the sign-in library loads the stored tokens."""
+
+    loads = 0
+
+    async def get_tokens(self) -> SdkToken | None:
+        self.loads += 1
+        return await super().get_tokens()
+
+
+@pytest.mark.asyncio
+async def test_a_connection_does_not_reload_the_sign_in_while_its_copy_is_valid(
+    tmp_path: Path,
+) -> None:
+    """The reload before a refresh must not become a store read on every
+    request: while the copy is valid, the connection keeps using it."""
+    store = FileConnectionStore(tmp_path)
+    await store.put_user_token(
+        DEFAULT_ORG_ID, ALICE, UPSTREAM_ID, make_token("tok"),
+    )
+    storage = CountingStorage(store, DEFAULT_ORG_ID, UPSTREAM_ID, ALICE)
+    connection = await _build_oauth_provider(
+        make_upstream("http://upstream.test/mcp"), storage,
+        _noop_redirect, _noop_callback, GATEWAY_URL,
+    )
+    bearers: list[str | None] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        bearers.append(request.headers.get("authorization"))
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        auth=connection, transport=httpx.MockTransport(answer),
+    ) as client:
+        for _ in range(5):
+            await client.post("http://upstream.test/mcp", json={})
+
+    assert bearers == ["Bearer tok"] * 5
+    assert storage.loads == 1, (
+        f"the stored sign-in was loaded {storage.loads} times for 5 requests"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_background_refresh_that_saves_its_own_tokens_logs_success(
+    tmp_path: Path,
+) -> None:
+    endpoint = RotatingTokenEndpoint()
+    endpoint.release_first.set()
+    token_server, token_task, token_base = await start_rotating_token_endpoint(
+        endpoint,
+    )
+    server, server_task, url = await start_upstream(ConnectionGate())
+    upstream = make_upstream(url)
+    store = await make_store_with_old_sign_in(tmp_path, token_base)
+    try:
+        with structlog.testing.capture_logs() as logs:
+            await refresh_token_for_user(
+                DEFAULT_ORG_ID, upstream, ALICE, store, GATEWAY_URL,
+            )
+
+        events = [e["event"] for e in logs]
+        assert "oauth.token.refresh.success" in events, events
+        assert "oauth.token.refresh.refreshed_elsewhere" not in events, events
+    finally:
+        await stop_upstream(server, server_task)
+        await stop_upstream(token_server, token_task)
+
+
+@pytest.mark.asyncio
+async def test_a_background_refresh_beaten_by_another_refresh_does_not_log_success(
+    tmp_path: Path,
+) -> None:
+    """The background refresh's own request is rejected because a
+    reconnect refreshed the same sign-in first. The sign-in is fine, but
+    the log must not credit the background refresh with the success."""
+    endpoint = RotatingTokenEndpoint(reject_first=True)
+    token_server, token_task, token_base = await start_rotating_token_endpoint(
+        endpoint,
+    )
+    server, server_task, url = await start_upstream(ConnectionGate())
+    upstream = make_upstream(url)
+    store = await make_store_with_old_sign_in(tmp_path, token_base)
+    mgr = UpstreamClientManager([upstream])
+    try:
+        background = asyncio.create_task(refresh_token_for_user(
+            DEFAULT_ORG_ID, upstream, ALICE, store, GATEWAY_URL,
+        ))
+        await wait_until(lambda: endpoint.requests >= 1)
+        await asyncio.wait_for(acquire(mgr, upstream, store), timeout=30)
+
+        with structlog.testing.capture_logs() as logs:
+            endpoint.release_first.set()
+            await asyncio.wait_for(background, timeout=30)
+
+        events = [e["event"] for e in logs]
+        assert "oauth.token.refresh.refreshed_elsewhere" in events, events
+        assert "oauth.token.refresh.success" not in events, events
+        stored = await store.get_user_token(DEFAULT_ORG_ID, ALICE, UPSTREAM_ID)
+        assert stored is not None and stored.access_token == "issued-1"
     finally:
         endpoint.release_first.set()
         await mgr.stop_all()
