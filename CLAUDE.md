@@ -132,6 +132,26 @@ Both modes serve the same ports:
   `/tmp/mcpolis-e2e-aggregate.{json,txt}`. Convention for splitting
   a spec: extract shared fixtures into `tests/e2e/_<feature>_helpers.ts`,
   break the file into `<NN><letter>-<slug>.spec.ts` siblings.
+
+  **Loopback rule: 127.0.0.1, never `localhost`.** Every e2e server
+  binds 127.0.0.1 and every e2e URL names it (`LOOPBACK_HOST` in the
+  orchestrator). On the dev Mac, sustained bursts of new loopback TCP
+  connections make every *new* loopback connection on the host stall
+  1-8 s, and some fail with `ETIMEDOUT`; connections already open are
+  unaffected (measured 2026-10-01). Those stalls were the `connect
+  ECONNREFUSED ::1`, `connect ETIMEDOUT` and `ERR_SOCKET_NOT_CONNECTED`
+  flakes under `make test-all`: the 4-shard e2e run held 130+ new
+  connections/s for 6-12 s at a time and hit 3-6 stalls per run. Two
+  causes: `localhost` doubled the attempts, because every client the
+  tests use (Chromium, Playwright, Node fetch, httpx) tries the
+  refused `::1` first, and the Vite proxy opened two new connections
+  per API call until it got a pool (`backendAgent` in
+  [frontend/vite.config.ts](frontend/vite.config.ts), guarded by
+  `43-` and `44-*.spec.ts`). Since then the run stays under ~100/s
+  (p95 63-92/s) with no stalls seen, but the margin is unknown: a
+  synthetic churn test stalled at ~75/s held for over 10 s. Keep new
+  e2e servers, fakes and URLs on 127.0.0.1, and keep their
+  connections pooled.
 - Frontend unit tests (vitest, jsdom): `bash frontend/run-unit-tests.sh [vitest args...]`.
   Outputs `/tmp/mcpolis-vitest-junit.xml` + `/tmp/mcpolis-vitest-report.json`
   for grep-able pass/fail. Mirror of the pytest wrapper. Plain
@@ -282,6 +302,20 @@ Consequences to keep in mind when touching this area:
   persist" shortcut.
 - `set_timeout` must still be re-applied after any resume: E2B
   resets the idle window to its own 300s default on `auto_resume`.
+- E2B's window is NOT an idle timer: it runs from the create or the
+  last `set_timeout`, and traffic does not reset it (measured
+  2026-10-01). `IdlePauseTimer` makes it one by re-arming it on
+  CALLER traffic only: a request in `COUNTED_METHODS` (initialize,
+  tools/call, resources/read, prompts/get, completion/complete), the
+  answer to one, and every ~idle/3 while one is unanswered (capped at
+  300s). Without it a busy sandbox paused every 60s and cut off
+  running calls. The MCP program is the customer's own code, so
+  nothing it causes may count: its notifications, answers to no
+  request, the list requests its `list_changed` notices trigger, or
+  the gateway's pings. Counting any of them is the keep-alive Terms §3
+  forbids. Answer ids are matched the way the MCP client matches them
+  (text "7" answers request 7), and a request is recorded BEFORE it is
+  written: a fast answer can arrive before `send_stdin` returns.
 - The pump's wake branch is a BACKSTOP, not the main path: it
   catches the race (a dispatch that passed the liveness gate just
   before the watcher fired) and the case where E2B goes quiet

@@ -9,7 +9,7 @@ spins the same demo on ``127.0.0.1:9999`` against
 widgets that phone home.
 
 Run:  python tests/e2e/test_mcp_server.py
-Listens on http://localhost:9999/mcp (StreamableHTTP).
+Listens on http://127.0.0.1:9999/mcp (StreamableHTTP).
 """
 from __future__ import annotations
 

@@ -33,6 +33,7 @@ from collections.abc import Callable
 import sentry_sdk
 import structlog
 from structlog.contextvars import get_contextvars
+from sentry_sdk.integrations.logging import ignore_logger
 from sentry_sdk.types import Event, Hint
 
 from mcpolis.domain.ports import DEFAULT_ORG_ID, MULTI_ORG_SENTINEL
@@ -60,6 +61,15 @@ _ANON_USER = "anonymous"
 # included). We sample these to 0.0 so the probe volume can never spend
 # quota, independent of how often it fires.
 _UNTRACED_PATHS = frozenset({"/health", "/healthz"})
+
+# Third-party loggers whose ERROR lines must never become Sentry issues.
+# The E2B SDK logs every failed API answer as a bare "Response <status>"
+# at ERROR, with no context. Our code already catches each such failure
+# and logs it, with context, at the level it deserves. The pause timer
+# makes these lines more frequent: a refresh can race a pause and get a
+# 404, and an E2B outage means one failed retry every few seconds per
+# busy sandbox. The lines still reach the log pipeline.
+_NO_SENTRY_LOGGERS = ("e2b.api",)
 
 
 def _first_real(
@@ -157,6 +167,10 @@ def _make_traces_sampler(
 
 def init_sentry(settings: Settings) -> bool:
     """Initialize Sentry if a DSN is configured. Returns True if enabled."""
+    # Before the DSN check: harmless when Sentry is off, and it keeps the
+    # rule in force however Sentry ends up enabled.
+    for name in _NO_SENTRY_LOGGERS:
+        ignore_logger(name)
     if not settings.sentry_dsn:
         return False
     sentry_sdk.init(

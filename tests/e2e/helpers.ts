@@ -1,4 +1,4 @@
-import { type Page, type APIRequestContext } from "@playwright/test";
+import { test, type Page, type APIRequestContext } from "@playwright/test";
 import { Client, type ClientOptions } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -7,13 +7,20 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 // own backend + MCP fakes instead of trampling another shard's state.
 // Defaults match the historic single-shard ports so a stale invocation
 // without env vars still hits the same endpoints a developer is used
-// to.
+// to. They name 127.0.0.1, the address those servers bind (see
+// LOOPBACK_HOST in tests/run-e2e-tests.py); the OAuth fake advertises
+// 127.0.0.1, and the MCP SDK rejects a resource on another host.
 export const BACKEND_URL =
-  process.env.E2E_BACKEND_URL ?? "http://localhost:8080";
+  process.env.E2E_BACKEND_URL ?? "http://127.0.0.1:8080";
 export const TEST_MCP_URL =
-  process.env.E2E_TEST_MCP_URL ?? "http://localhost:9999";
+  process.env.E2E_TEST_MCP_URL ?? "http://127.0.0.1:9999";
 export const OAUTH_TEST_MCP_URL =
-  process.env.E2E_OAUTH_TEST_MCP_URL ?? "http://localhost:9998";
+  process.env.E2E_OAUTH_TEST_MCP_URL ?? "http://127.0.0.1:9998";
+
+/** Host of the frontend the running test's pages load (its baseURL). */
+export function frontendHost(): string {
+  return new URL(test.info().project.use.baseURL ?? BACKEND_URL).hostname;
+}
 
 /**
  * Walk the dev-stub dashboard OAuth flow end-to-end:
@@ -37,8 +44,10 @@ export async function loginAs(
   const context = page.context();
   await runDevStubLogin(context.request, email);
 
-  // Surface the cookie on the frontend origin too (Vite proxies /api
-  // to the backend, but the browser cookie jar pairs by origin).
+  // Copy the cookie onto the frontend's host. Cookies ignore the port,
+  // so when frontend and backend share a host (always, under the
+  // orchestrator) this just rewrites the same cookie. It matters when
+  // they differ, e.g. pages on `localhost` against a 127.0.0.1 backend.
   const cookies = await context.cookies(BACKEND_URL);
   const sessionCookie = cookies.find((c) => c.name === "mcpolis_session");
   if (!sessionCookie) {
@@ -47,7 +56,7 @@ export async function loginAs(
   await context.addCookies([
     {
       ...sessionCookie,
-      domain: "localhost",
+      domain: frontendHost(),
       path: "/",
     },
   ]);

@@ -135,6 +135,11 @@ class MockE2BProcessHandle:
         # underlying sandbox has died (E2B kill timer, network blip)
         # and stdin fails after the session was opened.
         self.stdin_send_error: Exception | None = None
+        # When set, ``send_stdin`` awaits it with the bytes before
+        # returning. Real E2B delivers stdin before its HTTP call
+        # returns, so a fast server's answer can arrive mid-send; a
+        # test reproduces that by answering from here.
+        self.during_send: Callable[[bytes], Awaitable[None]] | None = None
 
     @property
     def pid(self) -> int:
@@ -163,6 +168,8 @@ class MockE2BProcessHandle:
     async def send_stdin(self, data: bytes) -> None:
         if self.stdin_send_error is not None:
             raise self.stdin_send_error
+        if self.during_send is not None:
+            await self.during_send(data)
         self._stdin.append(data)
 
     async def wait(self) -> int:
@@ -252,12 +259,23 @@ class MockE2BSandboxHandle:
             raise self._client.kill_command_error
 
     async def set_timeout(self, timeout_seconds: int) -> None:
+        # Real E2B answers "not found" for a paused sandbox and leaves
+        # it paused (measured 2026-10-01); mirror that so a refresh
+        # landing after a pause is exercised the way production sees it.
+        for info in self._client.live_infos:
+            if info.sandbox_id == self._sandbox_id and info.state == "paused":
+                raise E2BNotFoundError(
+                    "SandboxNotFoundException",
+                    f"Sandbox {self._sandbox_id} not found",
+                )
         self._client.set_timeouts.append(
             _RecordedSetTimeout(
                 sandbox_id=self._sandbox_id,
                 timeout_seconds=timeout_seconds,
             ),
         )
+        if self._client.set_timeout_gate is not None:
+            await self._client.set_timeout_gate.wait()
 
     async def pause(self) -> str:
         snapshot_id = f"snap-{self._sandbox_id}"
@@ -321,6 +339,9 @@ class MockE2BClient(E2BClient):
     set_timeouts: list[_RecordedSetTimeout] = field(
         default_factory=list[_RecordedSetTimeout],
     )
+    # When set, ``set_timeout`` records the call and then waits for it,
+    # so a test can hold a pause-timer refresh open (a slow E2B API).
+    set_timeout_gate: asyncio.Event | None = None
     kills: list[_RecordedKill] = field(default_factory=list[_RecordedKill])
     file_writes: list[_RecordedFileWrite] = field(
         default_factory=list[_RecordedFileWrite],

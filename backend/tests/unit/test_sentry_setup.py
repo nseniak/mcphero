@@ -9,9 +9,11 @@ because the hook only read the (unset) ``current_user_id`` ContextVar.
 """
 from __future__ import annotations
 
+import logging
 from typing import cast
 
 import structlog
+from sentry_sdk.integrations.logging import EventHandler
 from sentry_sdk.types import Event, Hint
 
 from mcpolis.adapters.observability.sentry_setup import (
@@ -19,8 +21,9 @@ from mcpolis.adapters.observability.sentry_setup import (
     _make_before_send,
     _make_traces_sampler,
     _org_sentinels,
+    init_sentry,
 )
-from mcpolis.entrypoints.config import Mode
+from mcpolis.entrypoints.config import Mode, Settings
 from mcpolis.entrypoints.controllers.gateway_controller import (
     current_org_id,
     current_user_id,
@@ -192,3 +195,28 @@ def test_before_send_scrubs_auth_headers() -> None:
     assert headers["Authorization"] == "[Filtered]"
     assert headers["Cookie"] == "[Filtered]"
     assert headers["User-Agent"] == "ua"
+
+
+def test_e2b_sdk_error_lines_never_become_sentry_issues() -> None:
+    """The E2B SDK's own "Response 404" lines must not page anyone.
+
+    The SDK logs every failed API answer at ERROR with no context, and
+    Sentry turns ERROR lines into issues. Our code already catches each
+    of those failures and logs it with context. The pause timer makes
+    them more frequent: a refresh racing a pause gets a 404, and an E2B
+    outage costs one failed retry every few seconds per busy sandbox.
+    """
+    init_sentry(Settings(_env_file=None, sentry_dsn=""))  # type: ignore[call-arg]
+
+    def record_from(logger_name: str) -> logging.LogRecord:
+        return logging.LogRecord(
+            logger_name, logging.ERROR, __file__, 1, "Response 404", None, None,
+        )
+
+    handler = EventHandler()
+    assert not handler._can_record(record_from("e2b.api")), (  # pyright: ignore[reportPrivateUsage]
+        "the E2B SDK's bare error lines must stay out of Sentry"
+    )
+    assert handler._can_record(  # pyright: ignore[reportPrivateUsage]
+        record_from("mcpolis.adapters.sandbox_e2b.service"),
+    ), "our own errors must still reach Sentry"

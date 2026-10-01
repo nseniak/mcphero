@@ -1,14 +1,16 @@
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
-import { BACKEND_URL, createOrg, loginAs } from "./helpers";
+import { BACKEND_URL, createOrg, frontendHost, loginAs } from "./helpers";
 
-/** Switch the session to ``slug`` and re-mirror the rotated cookie.
+/** Switch the session to ``slug`` and re-copy the rotated cookie.
  *
- * ``POST /api/orgs/{slug}/switch`` rotates the session cookie to carry
- * the new org slug. ``loginAs`` mirrors the backend-origin cookie onto
- * the frontend origin, but that copy was taken BEFORE the switch, so
- * without re-mirroring the SPA reads a session with no current org and
- * DefaultRedirect sends it to /signup. That made this spec flaky. */
+ * ``POST /api/orgs/{slug}/switch`` rotates the session cookie, on the
+ * backend's host, to carry the new org slug. When the frontend runs on
+ * another host, the copy ``loginAs`` put there predates the switch, and
+ * the SPA would read a session with no current org (DefaultRedirect
+ * then sends it to /signup). With one shared host, as under the
+ * orchestrator, the page already sees the rotated cookie and this copy
+ * just rewrites it. */
 async function switchOrgAndSyncCookie(page: Page, slug: string) {
   const context = page.context();
   const resp = await context.request.post(
@@ -18,7 +20,7 @@ async function switchOrgAndSyncCookie(page: Page, slug: string) {
   const cookies = await context.cookies(BACKEND_URL);
   const session = cookies.find((c) => c.name === "mcpolis_session");
   if (!session) throw new Error("switch did not leave a session cookie");
-  await context.addCookies([{ ...session, domain: "localhost", path: "/" }]);
+  await context.addCookies([{ ...session, domain: frontendHost(), path: "/" }]);
 }
 
 /**

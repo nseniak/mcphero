@@ -2282,6 +2282,10 @@ def run() -> None:
     configure_structlog(
         json_logs=settings.sentry_environment != "development",
     )
+    # Keeps uvicorn's default 5 s ``timeout_keep_alive``. The dev Vite
+    # proxy's connection pool (``backendAgent`` in frontend/vite.config.ts)
+    # drops idle sockets after 2 s so it never reuses one this side is
+    # closing; lowering the keep-alive below that would bring the race back.
     uvicorn.run(
         create_app(settings),
         host=settings.host,

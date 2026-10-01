@@ -97,6 +97,17 @@ def test_e2b_idle_pause_seconds_rejects_garbage() -> None:
         make_settings(e2b_idle_pause_seconds="not-a-number")
 
 
+def test_e2b_idle_pause_seconds_rejects_a_window_under_10s() -> None:
+    """The pause timer re-arms the window at fractions of it, so a tiny
+    window would make it hammer E2B's API (0 means a loop). Refuse at
+    startup instead."""
+    with pytest.raises(ValidationError):
+        make_settings(e2b_idle_pause_seconds="0")
+    with pytest.raises(ValidationError):
+        make_settings(e2b_idle_pause_seconds="9")
+    assert make_settings(e2b_idle_pause_seconds="10").e2b_idle_pause_seconds == 10
+
+
 # ---------- genuine os.environ round-trip ----------
 
 

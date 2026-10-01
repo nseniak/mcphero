@@ -537,10 +537,12 @@ class RealE2BClient:
         e2b = _import_sdk()
         # ``lifecycle={"on_timeout": "pause", "auto_resume": True}``
         # turns the SDK's default ``on_timeout="kill"`` into a soft
-        # pause: when ``timeout_seconds`` elapses with no API
-        # activity, E2B snapshots the sandbox instead of terminating
-        # it, and the next API call (typically our stdin send to the
-        # MCP process) transparently resumes from the snapshot. The
+        # pause: when ``timeout_seconds`` elapses, E2B snapshots the
+        # sandbox instead of terminating it, and the next API call
+        # (typically our stdin send to the MCP process) transparently
+        # resumes from the snapshot. The clock runs from create or the
+        # last ``set_timeout``; traffic does not reset it, which is
+        # why ``IdlePauseTimer`` re-arms it on MCP traffic. The
         # alternative — relying on the kill default — bricks any
         # session that goes idle longer than the timer (the sandbox
         # is gone, mcpolis still thinks it's connected, the next

@@ -73,6 +73,17 @@ TEST_REDIS_PORT = 6380
 TEST_MONGO_CONTAINER = "mcpolis-mongo-test"
 TEST_REDIS_CONTAINER = "mcpolis-redis-test"
 
+# Every e2e server binds this address and every e2e URL names it. Never
+# ``localhost``: it resolves to both 127.0.0.1 and ::1, and every client
+# here (Chromium, Playwright's request context, Node's fetch, httpx)
+# tries ::1 first, gets refused, and only then connects over IPv4. That
+# doubles the loopback connection attempts, and sustained bursts of new
+# loopback connections (this run used to hold 130+/s for 6-12 s) make
+# macOS stall every new loopback connection on the host for seconds.
+# Those stalls were the "connect ECONNREFUSED ::1" / "connect ETIMEDOUT"
+# flakes under ``make test-all``; see the "Loopback rule" in CLAUDE.md.
+LOOPBACK_HOST = "127.0.0.1"
+
 # Per-shard port plan. Tests live in the 1xxxx range so they never
 # collide with the dev stack on 8080 / 5173. See CLAUDE.md
 # "test port range" for the convention.
@@ -127,7 +138,7 @@ def _port_is_free(port: int) -> bool:
     shared."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         try:
-            sock.bind(("127.0.0.1", port))
+            sock.bind((LOOPBACK_HOST, port))
             return True
         except OSError:
             return False
@@ -160,7 +171,7 @@ def _find_free_port(preferred: int, span: int = 400) -> int:
             _allocated_ports.add(candidate)
             return candidate
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
+        sock.bind((LOOPBACK_HOST, 0))
         port = int(sock.getsockname()[1])
     _allocated_ports.add(port)
     return port
@@ -183,19 +194,19 @@ class ShardConfig:
 
     @property
     def backend_url(self) -> str:
-        return f"http://localhost:{self.backend_port}"
+        return f"http://{LOOPBACK_HOST}:{self.backend_port}"
 
     @property
     def frontend_url(self) -> str:
-        return f"http://localhost:{self.frontend_port}"
+        return f"http://{LOOPBACK_HOST}:{self.frontend_port}"
 
     @property
     def demo_mcp_url(self) -> str:
-        return f"http://localhost:{self.demo_mcp_port}"
+        return f"http://{LOOPBACK_HOST}:{self.demo_mcp_port}"
 
     @property
     def oauth_mcp_url(self) -> str:
-        return f"http://localhost:{self.oauth_mcp_port}"
+        return f"http://{LOOPBACK_HOST}:{self.oauth_mcp_port}"
 
 
 def make_shard(index: int, total: int) -> ShardConfig:
@@ -509,7 +520,7 @@ def wait_for_port_free(port: int, timeout: float = 10) -> None:
         sock = socket.socket()
         sock.settimeout(0.2)
         try:
-            sock.connect(("127.0.0.1", port))
+            sock.connect((LOOPBACK_HOST, port))
             sock.close()
             time.sleep(0.2)
         except (ConnectionRefusedError, socket.timeout, OSError):
@@ -656,11 +667,11 @@ def _build_backend_env(shard: ShardConfig) -> dict[str, str]:
             env.pop(key, None)
     env.update({
         "MCPOLIS_MODE": "cloud",
-        "MCPOLIS_HOST": "127.0.0.1",
+        "MCPOLIS_HOST": LOOPBACK_HOST,
         "MCPOLIS_PORT": str(shard.backend_port),
-        "MCPOLIS_MONGO_URI": f"mongodb://localhost:{TEST_MONGO_PORT}",
+        "MCPOLIS_MONGO_URI": f"mongodb://{LOOPBACK_HOST}:{TEST_MONGO_PORT}",
         "MCPOLIS_MONGO_DB_NAME": shard.db_name,
-        "MCPOLIS_REDIS_URL": f"redis://localhost:{TEST_REDIS_PORT}",
+        "MCPOLIS_REDIS_URL": f"redis://{LOOPBACK_HOST}:{TEST_REDIS_PORT}",
         # Dev-stub auth: enables in-app email picker + the gateway's
         # test-mcp-token endpoint that helpers.ts calls for direct
         # MCP-protocol tests.
@@ -731,7 +742,7 @@ def _build_backend_env(shard: ShardConfig) -> dict[str, str]:
 
 def _build_frontend_env(shard: ShardConfig) -> dict[str, str]:
     env = os.environ.copy()
-    env["MCPOLIS_BACKEND_HOST"] = "127.0.0.1"
+    env["MCPOLIS_BACKEND_HOST"] = LOOPBACK_HOST
     env["MCPOLIS_BACKEND_PORT"] = str(shard.backend_port)
     return env
 
@@ -831,10 +842,14 @@ def start_shard(shard: ShardConfig) -> ShardProcesses:
         f"shard{shard.index} backend", shard.backend_port, backend,
     )
 
+    # ``--host``: Vite's default ``localhost`` binds whichever address
+    # the OS lists first (::1 on some Macs), which would not match the
+    # 127.0.0.1 URL Playwright navigates to. It goes after ``--port`` so
+    # the reaper's ``vite --port 15`` marker still matches.
     frontend = _spawn(
         f"shard{shard.index}/frontend",
         ["npm", "run", "dev", "--", "--port", str(shard.frontend_port),
-         "--strictPort"],
+         "--strictPort", "--host", LOOPBACK_HOST],
         cwd=FRONTEND_DIR,
         env=_build_frontend_env(shard),
     )

@@ -25,6 +25,8 @@
 #   bash backend/tests/integration/run-e2b-broad-matrix.sh                 # whole broad subset, parallel
 #   bash backend/tests/integration/run-e2b-broad-matrix.sh -j 1            # serial
 #   bash backend/tests/integration/run-e2b-broad-matrix.sh -k tiers -v     # narrow + verbose
+#   bash backend/tests/integration/run-e2b-broad-matrix.sh tests/integration/test_e2b_m_tiers_e2e.py
+#       ^ that file ONLY: any test path replaces the default broad files.
 #
 # Parallelism:
 #   ``-j N`` (or ``--jobs N``) sets the pytest-xdist worker count
@@ -91,7 +93,20 @@ if [ -n "$KEXPR" ]; then
     KEXPR_ARGS=(-k "$KEXPR")
 fi
 
-exec python -m pytest tests/integration/test_e2b_m_*_e2e.py \
+# Default to the broad-matrix files ONLY when the caller names no test
+# path, the same rule as run-integration-tests.sh (see the note there):
+# pytest falls back to ``testpaths`` only when no file, folder or node id
+# is on the command line, so a caller's own path runs just that instead
+# of the whole broad subset plus that path. The glob is expanded and
+# checked here, not left to pytest: when ``testpaths`` matches nothing,
+# pytest only warns and collects the whole backend, every paid test.
+DEFAULT_PATHS=(tests/integration/test_e2b_m_*_e2e.py)
+if [ ! -e "${DEFAULT_PATHS[0]}" ]; then
+    echo "ERROR: no broad-matrix files match ${DEFAULT_PATHS[0]}" >&2
+    exit 4
+fi
+
+exec python -m pytest -o "testpaths=${DEFAULT_PATHS[*]}" \
     "${KEXPR_ARGS[@]+"${KEXPR_ARGS[@]}"}" \
     "${PARALLEL_ARGS[@]+"${PARALLEL_ARGS[@]}"}" \
     --junitxml="$JUNIT_OUT" \

@@ -224,6 +224,12 @@ class E2BSandboxHandle(Protocol):
     async def set_timeout(self, timeout_seconds: int) -> None:
         """Re-apply the sandbox's idle ``on_timeout`` window.
 
+        E2B counts the window from this call (or the create), and
+        traffic does not reset it, so the pause only measures idle time
+        if this is called on traffic: see ``IdlePauseTimer``. On a
+        paused sandbox it raises ``E2BNotFoundError`` and does not wake
+        it (both measured 2026-10-01).
+
         Required after any call triggers an ``auto_resume``
         (today: :meth:`kill_command` or :meth:`run_command` on a
         paused sandbox): E2B resets the timeout to the SDK default

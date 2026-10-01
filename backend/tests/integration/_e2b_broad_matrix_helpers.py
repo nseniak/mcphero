@@ -20,6 +20,7 @@ import uuid
 
 from mcpolis.adapters.sandbox_e2b import E2BSandboxService, RealE2BClient
 from mcpolis.adapters.sandbox_e2b.client import E2BSDKError
+from mcpolis.adapters.sandbox_e2b.idle_pause_timer import MIN_REFRESH_GAP_SECONDS
 from mcpolis.domain.ports.sandbox_persistence_repository import (
     SandboxPersistenceRepository,
 )
@@ -31,7 +32,9 @@ E2B_API_KEY: str | None = os.environ.get("E2B_API_KEY") or None
 TEST_RUN_ID: str = uuid.uuid4().hex[:12]
 
 IDLE_PAUSE_SECONDS = 30
-REATTACH_WAIT_SECONDS = IDLE_PAUSE_SECONDS + 5
+# The pause timer re-arms the window on traffic, at most once per
+# refresh gap, so a pause lands up to one gap after the window.
+REATTACH_WAIT_SECONDS = IDLE_PAUSE_SECONDS + MIN_REFRESH_GAP_SECONDS + 5
 INITIALIZE_TIMEOUT = 120.0
 DOCKER_INITIALIZE_TIMEOUT = 240.0
 TOOL_CALL_TIMEOUT = 30.0

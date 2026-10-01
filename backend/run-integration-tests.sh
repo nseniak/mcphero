@@ -10,7 +10,10 @@
 # Usage:
 #   bash backend/run-integration-tests.sh                                # all, parallel
 #   bash backend/run-integration-tests.sh -j 1                           # serial
+#   bash backend/run-integration-tests.sh -k reattach                    # all, filtered by name
 #   bash backend/run-integration-tests.sh tests/integration/test_e2b_sandbox_service_real_sdk.py -v
+#       ^ that file ONLY. Any test path (file, folder or ``file::test``
+#         node id) replaces the default tests/integration/ folder.
 #
 # Parallelism:
 #   ``-j N`` (or ``--jobs N``) sets the pytest-xdist worker count.
@@ -75,12 +78,18 @@ if [ "$JOBS" != "1" ]; then
     PARALLEL_ARGS=(-n "$JOBS" --dist loadfile)
 fi
 
-# Always scope to tests/integration/ — pytest's default ``testpaths`` in
-# pyproject.toml points at tests/unit/ for the offline suite, so without
-# an explicit path here we'd accidentally re-run unit tests under
-# the integration banner. Extra args (-v, -s, -k, a specific file)
-# stack on top.
-exec python -m pytest tests/integration/ \
+# Default to tests/integration/ ONLY when the caller names no test path.
+# pyproject.toml's ``testpaths`` points at tests/unit/ for the offline
+# suite, so a bare pytest here would re-run the unit tests under the
+# integration banner; ``-o testpaths=`` points that default here instead.
+# pytest falls back to ``testpaths`` only when no file, folder or node id
+# is on the command line, so a caller's ``tests/integration/test_x.py``
+# (or ``...::test_y``) runs just that. pytest itself tells a path from an
+# option's value, so ``-k expr`` or ``--deselect <id>`` never counts as a
+# path. Don't go back to a positional ``tests/integration/``: a caller's
+# path then stacks on top of it, and a one-file run became the whole paid
+# suite (12 minutes, 2026-10-01).
+exec python -m pytest -o testpaths=tests/integration \
     "${PARALLEL_ARGS[@]+"${PARALLEL_ARGS[@]}"}" \
     --junitxml="$JUNIT_OUT" \
     --json-report --json-report-file="$JSON_OUT" --json-report-omit=keywords,streams \

@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock
 import anyio
 import mcp.types as mcp_types
 import pytest
+import structlog
+from mcp.shared.exceptions import McpError
 from pydantic import AnyUrl
 
 from mcpolis.adapters.repositories.file_audit_repository import FileAuditRepository
@@ -663,3 +665,61 @@ async def test_read_resource_session_unavailable_writes_no_audit(
     assert not log_path.exists() or log_path.read_text().strip() == "", (
         "session-unavailable on the first attempt must not write an audit row"
     )
+
+
+# --- an invalid-params answer is the caller's mistake on every verb -------
+#
+# Sentry MCPOLIS-BACKEND-1B was a tools/call; resources/read and
+# prompts/get share the same failure path, so they must give the same
+# verdict: a warning, and our own "Invalid params" text for the caller.
+
+
+def make_invalid_params_error() -> McpError:
+    return McpError(mcp_types.ErrorData(
+        code=mcp_types.INVALID_PARAMS,
+        message="failed to deserialize parameters: missing field `name`",
+    ))
+
+
+@pytest.mark.asyncio
+async def test_read_resource_invalid_params_is_the_callers_mistake(
+    tmp_path: Path,
+) -> None:
+    router, session, _cm, _ = make_stall_router(tmp_path)
+    session.read_resource = AsyncMock(side_effect=make_invalid_params_error())
+
+    with structlog.testing.capture_logs() as logs:
+        with pytest.raises(UpstreamRouterError) as exc_info:
+            await router.read_resource(
+                org_id=DEFAULT_ORG_ID, upstream_id="notion",
+                original_uri="test://hello", user_id="alice",
+                session_id=None,
+            )
+
+    message = exc_info.value.message
+    assert "(Invalid params)" in message, message
+    assert "deserialize" not in message, "the upstream's text must not cross"
+    failures = [e for e in logs if e.get("event") == "resource.read.failed"]
+    assert [e["log_level"] for e in failures] == ["warning"]
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_invalid_params_is_the_callers_mistake(
+    tmp_path: Path,
+) -> None:
+    router, session, _cm, _ = make_stall_router(tmp_path)
+    session.get_prompt = AsyncMock(side_effect=make_invalid_params_error())
+
+    with structlog.testing.capture_logs() as logs:
+        with pytest.raises(UpstreamRouterError) as exc_info:
+            await router.get_prompt(
+                org_id=DEFAULT_ORG_ID, upstream_id="notion",
+                original_name="summarize", arguments={}, user_id="alice",
+                session_id=None,
+            )
+
+    message = exc_info.value.message
+    assert "(Invalid params)" in message, message
+    assert "deserialize" not in message, "the upstream's text must not cross"
+    failures = [e for e in logs if e.get("event") == "prompt.get.failed"]
+    assert [e["log_level"] for e in failures] == ["warning"]

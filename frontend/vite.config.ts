@@ -1,10 +1,11 @@
-import { defineConfig, loadEnv, type Plugin } from 'vite'
+import { defineConfig, loadEnv, type Plugin, type ProxyOptions } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import prerender from '@prerenderer/rollup-plugin'
 import PuppeteerRenderer from '@prerenderer/renderer-puppeteer'
 import { readFile, writeFile, rename } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
+import { Agent } from 'node:http'
 import { resolve } from 'node:path'
 
 // Public files that aren't index.html and therefore aren't covered by Vite's
@@ -117,10 +118,45 @@ export default defineConfig(({ command, mode }) => {
   // to the canonical dev port; the e2e sharding orchestrator (see
   // tests/run-e2e-tests.py) overrides via env so each shard's
   // frontend talks to its own backend instance.
-  const backendHost = process.env.MCPOLIS_BACKEND_HOST || 'localhost'
+  // 127.0.0.1, not `localhost`: the backend binds 127.0.0.1 by default and
+  // `localhost` also resolves to ::1, which it does not listen on.
+  const backendHost = process.env.MCPOLIS_BACKEND_HOST || '127.0.0.1'
   const backendPort = process.env.MCPOLIS_BACKEND_PORT || '8080'
   const backendHttp = `http://${backendHost}:${backendPort}`
   const backendWs = `ws://${backendHost}:${backendPort}`
+  // Reuse connections to the backend. Without an agent, Vite's proxy sends
+  // every request with `Connection: close` and passes the backend's close on
+  // to the browser, so each API call opens two brand-new TCP connections
+  // (browser -> Vite and Vite -> backend). The 4-shard e2e run made 200+ new
+  // loopback connections per second for seconds at a time, and such bursts
+  // make macOS stall every new loopback connection on the host for seconds.
+  //
+  // The pool closes a socket after 2 s idle, before uvicorn's default 5 s
+  // keep-alive closes it (uvicorn sends no Keep-Alive hint, and
+  // backend/src/mcpolis/entrypoints/app.py keeps the default), so a socket
+  // the backend is closing is never reused. Node also arms this 2 s timeout
+  // on sockets that are busy, e.g. a quiet SSE stream; that is harmless
+  // because nothing here acts on 'timeout' (no `proxyTimeout`).
+  const backendAgent = new Agent({ keepAlive: true, timeout: 2000 })
+  // Same options Vite derives from a plain string target, plus the pool.
+  const toBackend = (): ProxyOptions => ({
+    target: backendHttp,
+    changeOrigin: true,
+    agent: backendAgent,
+    // When the backend answers before reading the whole request body (a 401
+    // or 429 to a large upload), the browser's body never finishes, so the
+    // pooled request never finishes either: the agent would neither reuse
+    // nor close that socket, and uvicorn keeps its end open. Close it.
+    configure: (proxy) => {
+      proxy.on('proxyReq', (proxyReq, req) => {
+        proxyReq.on('response', (upstreamRes) => {
+          upstreamRes.on('end', () => {
+            if (!req.complete) proxyReq.destroy()
+          })
+        })
+      })
+    },
+  })
   return {
   plugins: [
     react(),
@@ -181,11 +217,11 @@ export default defineConfig(({ command, mode }) => {
       allow: ['.', '..'],
     },
     proxy: {
-      '/api': backendHttp,
-      '/oauth': backendHttp,
-      '/mcp': backendHttp,
-      '/admin-mcp': backendHttp,
-      '/.well-known': backendHttp,
+      '/api': toBackend(),
+      '/oauth': toBackend(),
+      '/mcp': toBackend(),
+      '/admin-mcp': toBackend(),
+      '/.well-known': toBackend(),
       // Bundled demo upstream + future dev mounts. WebSockets need an
       // explicit ws:// target with `ws: true` so Vite forwards the
       // upgrade — without this entry the counter / solar widgets
@@ -194,7 +230,7 @@ export default defineConfig(({ command, mode }) => {
         target: backendWs,
         ws: true,
       },
-      '/dev': backendHttp,
+      '/dev': toBackend(),
     },
   },
   }

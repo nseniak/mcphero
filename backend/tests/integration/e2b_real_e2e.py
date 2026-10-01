@@ -90,6 +90,9 @@ from mcpolis.adapters.sandbox_e2b import (  # noqa: E402
     E2BSandboxService,
     RealE2BClient,
 )
+from mcpolis.adapters.sandbox_e2b.idle_pause_timer import (  # noqa: E402
+    MIN_REFRESH_GAP_SECONDS,
+)
 from mcpolis.adapters.upstream_clients.client_manager import (  # noqa: E402
     UpstreamClientManager,
 )
@@ -113,9 +116,11 @@ RUN_ID = uuid.uuid4().hex[:8]
 # seconds, not the production-default 5 min. Anything below ~10s
 # risks the box snapshotting mid-init on a slow cold-pull.
 IDLE_PAUSE_SECONDS = 30
-# Buffer past the idle window. Empirically auto-pause fires within a
-# few seconds of the configured deadline; +5s gives consistent reproc.
-REATTACH_WAIT_SECONDS = IDLE_PAUSE_SECONDS + 5
+# Buffer past the idle window. The pause timer re-arms the window on
+# traffic, at most once per refresh gap, so the deadline lands up to
+# one gap after the last traffic; empirically auto-pause fires within a
+# few seconds of the deadline; +5s gives consistent reproc.
+REATTACH_WAIT_SECONDS = IDLE_PAUSE_SECONDS + MIN_REFRESH_GAP_SECONDS + 5
 # Bound on how long ``initialize`` may take. Cold npm/uvx installs
 # inside a fresh sandbox can stretch — the existing real-SDK suite
 # uses 120s and it's been adequate.

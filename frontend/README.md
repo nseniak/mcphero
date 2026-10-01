@@ -18,8 +18,10 @@ npm run dev        # Vite dev server with HMR on http://localhost:5173
 ```
 
 The dev server proxies `/api` and `/mcp` to the backend on
-`http://localhost:8080`; override with `MCPOLIS_BACKEND_HOST` /
-`MCPOLIS_BACKEND_PORT`. When serving behind a proxy or tunnel, set
+`http://127.0.0.1:8080` (the backend's default bind address); override
+with `MCPOLIS_BACKEND_HOST` / `MCPOLIS_BACKEND_PORT`, e.g.
+`MCPOLIS_BACKEND_HOST=::1` for a backend bound to IPv6 loopback only. It
+reuses its backend connections. When serving behind a proxy or tunnel, set
 `MCPOLIS_DEV_ALLOWED_HOSTS` to the external host(s), comma-separated.
 
 ## Commands

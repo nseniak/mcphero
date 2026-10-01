@@ -1,6 +1,6 @@
 """Fake OAuth-demanding MCP upstream for e2e tests.
 
-Listens on http://localhost:9998 and serves three things:
+Listens on http://127.0.0.1:9998 and serves three things:
 
 - An MCP server at ``/mcp/`` that 401s without a valid Bearer token,
   and returns ``WWW-Authenticate: Bearer resource_metadata=...`` so
@@ -58,7 +58,11 @@ from starlette.types import ASGIApp, Receive, Scope, Send  # noqa: E402
 # keep working; the sharding orchestrator overrides via
 # ``MCPOLIS_OAUTH_TEST_PORT`` so each shard gets its own fake.
 PORT = int(os.environ.get("MCPOLIS_OAUTH_TEST_PORT", "9998"))
-ISSUER = f"http://localhost:{PORT}"
+# The address we bind and advertise. Not ``localhost``: the gateway's
+# HTTP client tries ::1 first and gets refused; see LOOPBACK_HOST in
+# tests/run-e2e-tests.py for why that matters under load.
+HOST = "127.0.0.1"
+ISSUER = f"http://{HOST}:{PORT}"
 RESOURCE = f"{ISSUER}/mcp"
 
 CLIENT_ID = "e2e-client"
@@ -532,7 +536,7 @@ def main() -> None:
     app: ASGIApp = BearerAuthMiddleware(mcp_app)
 
     config = uvicorn.Config(
-        app, host="127.0.0.1", port=PORT,
+        app, host=HOST, port=PORT,
         log_level="warning", ws="none",
     )
     uvicorn.Server(config).run()

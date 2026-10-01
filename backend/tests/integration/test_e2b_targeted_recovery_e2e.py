@@ -59,6 +59,7 @@ from mcpolis.adapters.repositories.file_audit_repository import (
 )
 from mcpolis.adapters.sandbox_e2b import E2BSandboxService, RealE2BClient
 from mcpolis.adapters.sandbox_e2b.client import E2BSDKError
+from mcpolis.adapters.sandbox_e2b.idle_pause_timer import MIN_REFRESH_GAP_SECONDS
 from mcpolis.adapters.sandbox_e2b.reconciler import E2BSandboxReconciler
 from mcpolis.adapters.upstream_clients.client_manager import (
     UpstreamClientManager,
@@ -102,11 +103,13 @@ pytestmark = pytest.mark.skipif(
 
 _SERVER_URL = "http://localhost:8000"
 # Short idle window so the reattach scenarios provoke an E2B
-# auto-pause in seconds, not the production-default 5 min. +5s past
-# the deadline gives a consistent reproduction (auto-pause fires
-# within a few seconds of the configured timeout).
+# auto-pause in seconds, not the production-default 5 min. The pause
+# timer re-arms the window on traffic, at most once per refresh gap,
+# so the pause lands up to one gap after the window; +5s past that
+# gives a consistent reproduction (auto-pause fires within a few
+# seconds of the deadline).
 IDLE_PAUSE_SECONDS = 30
-REATTACH_WAIT_SECONDS = IDLE_PAUSE_SECONDS + 5
+REATTACH_WAIT_SECONDS = IDLE_PAUSE_SECONDS + MIN_REFRESH_GAP_SECONDS + 5
 INITIALIZE_TIMEOUT = 120.0
 TOOL_CALL_TIMEOUT = 30.0
 

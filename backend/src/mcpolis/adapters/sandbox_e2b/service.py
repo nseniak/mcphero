@@ -33,6 +33,7 @@ from mcpolis.adapters.sandbox_e2b.client import (
     E2BSandboxHandle,
     E2BSDKError,
 )
+from mcpolis.adapters.sandbox_e2b.idle_pause_timer import IdlePauseTimer
 from mcpolis.adapters.sandbox_e2b.template_grid import (
     E2BTemplateGrid,
     language_for_command,
@@ -358,6 +359,14 @@ class E2BSandboxService:
         # trusted after a freeze. See ``_fail_transport`` below.
         transport_failed = asyncio.Event()
 
+        # E2B pauses the sandbox ``on_timeout_seconds`` after the last
+        # ``set_timeout``, whatever the traffic. This re-arms it on MCP
+        # traffic so the pause measures idle time. It records traffic
+        # from here on; its refresh loop starts once the sandbox exists.
+        pause_timer = IdlePauseTimer(
+            idle_seconds=self._on_timeout_seconds, session_id=session_id,
+        )
+
         async def _fail_transport() -> None:
             """Mark the transport dead and close the read side so the
             ``ClientSession`` read loop ends and fails every in-flight
@@ -366,8 +375,13 @@ class E2BSandboxService:
             ``Exception`` object down ``read_writer`` does NOT do this:
             MCP SDK ≥1.x routes it to the message handler, which drops
             it, leaving the pending request to hang.)
+
+            Also stops the pause timer. The requests it was waiting on
+            will never be answered on this transport, and keeping the
+            sandbox awake for them would be a keep-alive.
             """
             transport_failed.set()
+            pause_timer.stop()
             try:
                 await read_writer.aclose()
             except Exception:
@@ -417,7 +431,14 @@ class E2BSandboxService:
                         method=getattr(_root, "method", None),
                         nbytes=len(line),
                     )
-                #
+                # Only answers can count, and the timer keeps only those
+                # to a caller's request. Messages the server sends on its
+                # own (logs, progress, answers to nothing) must not keep a
+                # sandbox awake that nobody is using.
+                if isinstance(
+                    msg.root, (types.JSONRPCResponse, types.JSONRPCError),
+                ):
+                    pause_timer.response_received(msg.root.id)
                 try:
                     await read_writer.send(SessionMessage(message=msg))
                 except (
@@ -696,6 +717,18 @@ class E2BSandboxService:
                         body = session_message.message.model_dump_json(
                             by_alias=True, exclude_none=True,
                         )
+                        # Requests only (the timer keeps the callers'
+                        # ones): our answers to the server's own requests,
+                        # and notifications, are not a caller using the
+                        # sandbox. Recorded BEFORE the write: a fast
+                        # server answers while ``send_stdin``'s own HTTP
+                        # call is still returning, and an answer that
+                        # beats its request's record leaves the request
+                        # "unanswered", keeping the sandbox awake until the
+                        # cap. The real-SDK test caught exactly that.
+                        root = session_message.message.root
+                        if isinstance(root, types.JSONRPCRequest):
+                            pause_timer.request_sent(root.id, root.method)
                         try:
                             await process.send_stdin(
                                 (body + "\n").encode("utf-8"),
@@ -712,6 +745,11 @@ class E2BSandboxService:
                 return
 
         stdin_task = asyncio.create_task(stdin_pump())
+        pause_timer_task: asyncio.Task[None] = asyncio.create_task(
+            pause_timer.run(
+                lambda: sandbox.set_timeout(self._on_timeout_seconds),
+            ),
+        )
 
         try:
             yield SandboxSession(
@@ -745,6 +783,15 @@ class E2BSandboxService:
             watch_task.cancel()
             try:
                 await watch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+            # Stop re-arming the pause timer before the kill below, so a
+            # refresh never races a dying sandbox. A preserved sandbox
+            # keeps its last deadline and pauses on its own.
+            pause_timer_task.cancel()
+            try:
+                await pause_timer_task
             except (asyncio.CancelledError, Exception):
                 pass
 

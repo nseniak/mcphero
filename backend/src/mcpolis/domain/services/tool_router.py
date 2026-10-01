@@ -75,8 +75,34 @@ _CLIENT_ERROR_PHRASES: tuple[tuple[str, str], ...] = tuple(
 )
 
 
+# The JSON-RPC 2.0 spec's own name for code -32602, which is the only
+# JSON-RPC error that is the caller's mistake:
+#
+# - -32602 Invalid params: the upstream rejected the ARGUMENTS, and the
+#   caller chose them. Sentry MCPOLIS-BACKEND-1B: an AI client left out
+#   a required argument and a Rust (rmcp) server answered -32602
+#   "failed to deserialize parameters: missing field ...". rmcp and the
+#   MCP spec also use -32602 for an unknown tool, which here would mean
+#   our tool list is stale (the gateway only forwards names the upstream
+#   listed itself); rare, and the next connect re-lists. So does a bad
+#   operator-set default argument, merged into every call; also rare,
+#   and the WARNING record still names the upstream.
+# - -32601 Method not found: NOT the caller's. The caller only picked
+#   an entry from our list; the upstream not implementing the method
+#   behind it is something an operator has to look at.
+# - -32600 Invalid request / -32700 Parse error: NOT the caller's. Our
+#   MCP client library builds the request envelope, not the caller, so
+#   a rejected envelope is a protocol mismatch between us and the
+#   upstream.
+#
+# The label is fixed text from the spec, never the upstream's message,
+# which can quote the caller's data or the server's internals.
+_INVALID_PARAMS_LABEL = "Invalid params"
+
+
 def client_error_status(exc: BaseException) -> str | None:
-    """``"400 Bad Request"`` when *exc* reports a 4xx, else ``None``.
+    """``"400 Bad Request"`` when *exc* reports a 4xx, ``"Invalid
+    params"`` when the upstream rejected the arguments, else ``None``.
 
     A 4xx means the upstream understood the request and rejected its
     CONTENTS. That is the caller's own mistake and the one failure they
@@ -88,23 +114,32 @@ def client_error_status(exc: BaseException) -> str | None:
     returned 400 for a malformed ES|QL query, the caller saw only
     "Upstream tool call failed", and retried the same broken query.
 
+    A JSON-RPC -32602 is the same verdict from the MCP server itself
+    rather than from its backend. See ``_INVALID_PARAMS_LABEL`` for why
+    that code and no other.
+
     Two properties make this safe to surface:
 
     - **Closed output.** The returned string is built from
-      :class:`http.HTTPStatus`, never from the upstream's message. The
-      message is only searched, never echoed, so the URL and hostname
-      it usually carries cannot escape.
+      :class:`http.HTTPStatus` or the JSON-RPC spec, never from the
+      upstream's message. The message is only searched, never echoed,
+      so the URL and hostname it usually carries cannot escape.
     - **Fail-closed.** No recognised phrase means ``None`` means fully
       opaque, which is the old behaviour.
 
     Detection requires the digits AND the canonical reason together, so
     a message that merely happens to contain "400" (a row count, a
     port) does not trigger it.
+
+    The 4xx search runs first, so an invalid-params answer that also
+    carries a 401/403/429 keeps that status, and with it the alert.
     """
     message = str(exc)
     for needle, label in _CLIENT_ERROR_PHRASES:
         if needle.lower() in message.lower():
             return label
+    if isinstance(exc, McpError) and exc.error.code == mcp_types.INVALID_PARAMS:
+        return _INVALID_PARAMS_LABEL
     return None
 
 
@@ -131,10 +166,13 @@ def is_caller_fault(client_error: str | None) -> bool:
     Sentry MCPOLIS-BACKEND-17 is why this exists. One malformed ES|QL
     query was filed as a platform fault, and resolving it by hand would
     only have held until the next typo, since Sentry reopens a resolved
-    issue when it recurs.
+    issue when it recurs. MCPOLIS-BACKEND-1B was the same thing reported
+    as a JSON-RPC invalid-params answer instead of an HTTP 400.
     """
     if client_error is None:
         return False
+    if client_error == _INVALID_PARAMS_LABEL:
+        return True
     code = int(client_error.split(" ", 1)[0])
     return code not in _ACTIONABLE_CLIENT_ERRORS
 
@@ -505,10 +543,11 @@ class ToolRouter:
             # logged server-side; return an opaque error with a correlation id
             # the user can quote when asking an admin to investigate.
             #
-            # The one exception is a 4xx, which says the caller's own
-            # request was wrong. See ``client_error_status``: the text
-            # added here is generated from ``http.HTTPStatus``, never
-            # copied from the upstream, so nothing internal rides along.
+            # The one exception is a 4xx or an invalid-params answer,
+            # which says the caller's own request was wrong. See
+            # ``client_error_status``: the text added here is generated
+            # from ``http.HTTPStatus`` or the JSON-RPC spec, never copied
+            # from the upstream, so nothing internal rides along.
             detail = f" ({client_error})" if client_error else ""
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(

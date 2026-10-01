@@ -600,11 +600,11 @@ async def test_a_bare_number_is_not_mistaken_for_a_status(
 # --- a caller's own bad request is not an application error ----------------
 
 
-async def _level_of_failure(tmp_path: Path, message: str) -> str:
+async def _level_of_failure(
+    tmp_path: Path, message: str, code: int = mcp_types.INTERNAL_ERROR,
+) -> str:
     """Route one call that fails with *message*; return its log level."""
-    err = McpError(mcp_types.ErrorData(
-        code=mcp_types.INTERNAL_ERROR, message=message,
-    ))
+    err = McpError(mcp_types.ErrorData(code=code, message=message))
     router, _call_tool, _cm = make_stall_router(
         tmp_path, annotations=None, call_behaviours=[err],
     )
@@ -664,5 +664,124 @@ async def test_a_server_failure_is_still_an_error(tmp_path: Path) -> None:
     level = await _level_of_failure(
         tmp_path,
         "HTTP status server error (500 Internal Server Error) for url (x)",
+    )
+    assert level == "error"
+
+
+# --- an invalid-params answer is the caller's mistake too -------------------
+#
+# Sentry MCPOLIS-BACKEND-1B: an AI client called a tool without a required
+# argument, and the upstream (a Rust rmcp server) answered with JSON-RPC
+# -32602 rather than an HTTP 400. Same mistake, same verdict.
+
+# rmcp's own wording for a missing argument (serde's message).
+_SERDE_MISSING_FIELD = (
+    "failed to deserialize parameters: missing field `query_body`"
+)
+
+
+async def _text_of_failure(tmp_path: Path, err: McpError) -> str:
+    """Route one call that fails with *err*; return what the caller sees."""
+    router, _call_tool, _cm = make_stall_router(
+        tmp_path, annotations=None, call_behaviours=[err],
+    )
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID, prefixed_name="mee6__do_thing",
+        arguments={}, user_id="alice", session_id="s1",
+    )
+    assert result.isError
+    return result.content[0].text  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_invalid_params_is_logged_as_a_warning(tmp_path: Path) -> None:
+    """A missing or wrong argument must not raise a Sentry issue.
+
+    The caller chose the arguments, so this is their mistake, exactly
+    like the HTTP 400 case above. Production put it on the operator's
+    dashboard as an application error.
+    """
+    level = await _level_of_failure(
+        tmp_path, _SERDE_MISSING_FIELD, code=mcp_types.INVALID_PARAMS,
+    )
+    assert level == "warning", (
+        f"a caller's bad arguments must not page anyone; logged as {level}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_params_tells_the_caller_in_our_own_words(
+    tmp_path: Path,
+) -> None:
+    """The caller learns their arguments were rejected, and nothing more.
+
+    "Invalid params" is the JSON-RPC spec's name for the code, which an
+    AI client can act on: re-read the tool's schema and call again. The
+    upstream's message is never copied, because it can quote the
+    caller's data or the server's internals.
+    """
+    text = await _text_of_failure(tmp_path, McpError(mcp_types.ErrorData(
+        code=mcp_types.INVALID_PARAMS, message=_SERDE_MISSING_FIELD,
+    )))
+    assert "(Invalid params)" in text, (
+        f"the caller must learn their arguments were rejected; got {text!r}"
+    )
+    assert "query_body" not in text and "deserialize" not in text, (
+        f"the upstream's own message must never cross; got {text!r}"
+    )
+    assert "Reference:" in text
+
+
+@pytest.mark.asyncio
+async def test_invalid_params_with_an_auth_status_still_pages(
+    tmp_path: Path,
+) -> None:
+    """An expired credential keeps its alert, whatever code wraps it.
+
+    If an upstream reports its backend's 403 inside an invalid-params
+    answer, the 403 is what matters: someone has to renew a credential.
+    The status check runs first so it wins.
+    """
+    err = McpError(mcp_types.ErrorData(
+        code=mcp_types.INVALID_PARAMS,
+        message="HTTP status client error (403 Forbidden) for url (x)",
+    ))
+    level = await _level_of_failure(
+        tmp_path, str(err.error.message), code=mcp_types.INVALID_PARAMS,
+    )
+    assert level == "error", (
+        f"an auth failure must still raise an issue; logged as {level}"
+    )
+    text = await _text_of_failure(tmp_path, err)
+    assert "(403 Forbidden)" in text, text
+
+
+@pytest.mark.asyncio
+async def test_method_not_found_is_still_an_error(tmp_path: Path) -> None:
+    """-32601 is not the caller's mistake, so it keeps paging.
+
+    The caller only picked a tool from our list. An upstream that does
+    not implement the method behind it needs an operator, and nothing
+    the caller types can fix it. Its text stays opaque.
+    """
+    level = await _level_of_failure(
+        tmp_path, "tools/call", code=mcp_types.METHOD_NOT_FOUND,
+    )
+    assert level == "error"
+    text = await _text_of_failure(tmp_path, McpError(mcp_types.ErrorData(
+        code=mcp_types.METHOD_NOT_FOUND, message="tools/call",
+    )))
+    assert "(" not in text, f"no status may be surfaced; got {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_invalid_request_is_still_an_error(tmp_path: Path) -> None:
+    """-32600 means the request ENVELOPE was rejected.
+
+    Our MCP client library builds the envelope, not the caller, so a
+    rejected one is a protocol mismatch between us and the upstream.
+    """
+    level = await _level_of_failure(
+        tmp_path, "Invalid request", code=mcp_types.INVALID_REQUEST,
     )
     assert level == "error"

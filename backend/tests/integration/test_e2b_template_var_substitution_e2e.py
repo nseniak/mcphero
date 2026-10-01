@@ -17,7 +17,7 @@ To run::
     cd runner/e2b-templates && make build      # one-time, ~15 min
     export E2B_API_KEY=...
     bash backend/run-integration-tests.sh \
-        tests/integration/test_e2b_secret_substitution_e2e.py -v -s
+        tests/integration/test_e2b_template_var_substitution_e2e.py -v -s
 """
 from __future__ import annotations
 

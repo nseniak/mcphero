@@ -3,7 +3,9 @@ import { defineConfig } from "@playwright/test";
 // Default to the historic single-shard ports so a stale invocation
 // without env vars still hits the same backend a developer is used
 // to. The Python orchestrator (tests/run-e2e-tests.py) overrides
-// these per-shard via E2E_BASE_URL.
+// these per-shard via E2E_BASE_URL. The default stays `localhost`: the
+// dev stack's Vite binds whichever address `localhost` resolves to
+// first, so only the name reaches it reliably.
 const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:5173";
 
 // Per-test timeout and retry count are env-tunable so the cross-suite

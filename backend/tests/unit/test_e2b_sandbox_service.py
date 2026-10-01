@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import time
 import tracemalloc
 from datetime import UTC, datetime
@@ -21,6 +22,9 @@ from typing import Any, cast
 
 import anyio
 import pytest
+from anyio.streams.memory import MemoryObjectReceiveStream
+from mcp import types as mcp_types
+from mcp.shared.message import SessionMessage
 
 from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (
     InMemorySandboxPersistenceRepository,
@@ -78,6 +82,7 @@ def make_e2b_service(
     mcpolis_instance: str = "test-instance",
     persistence: SandboxPersistenceRepository | None = None,
     volumes_enabled: bool = True,
+    on_timeout_seconds: int = 60,
 ) -> tuple[E2BSandboxService, MockE2BClient]:
     """Builder for the E2B service with a fresh mock client.
 
@@ -91,7 +96,7 @@ def make_e2b_service(
         E2BSandboxService(
             real_client,
             mcpolis_instance=mcpolis_instance,
-            on_timeout_seconds=60,
+            on_timeout_seconds=on_timeout_seconds,
             persistence=persistence,
             volumes_enabled=volumes_enabled,
         ),
@@ -2927,3 +2932,404 @@ async def test_sbx14_resolver_returns_global_provider() -> None:
     resolver = SandboxResolver(global_provider="e2b")
     assert await resolver.resolve(org_id="any-org") == "e2b"
     assert await resolver.resolve(org_id="other") == "e2b"
+
+
+# ---------- pause timer: re-armed on MCP traffic, and only on it ----------
+#
+# E2B pauses a sandbox a fixed time after the last ``set_timeout``,
+# whatever the traffic. The session used to call it only on open, so a
+# sandbox in constant use paused every 60 s (production, 2026-10-01).
+# These drive the real session wiring through the mock SDK; the timer's
+# own rules are in ``test_e2b_idle_pause_timer.py``.
+
+
+def make_request_message(request_id: int) -> SessionMessage:
+    return SessionMessage(message=mcp_types.JSONRPCMessage.model_validate({
+        "jsonrpc": "2.0", "id": request_id,
+        "method": "tools/call", "params": {"name": "noop", "arguments": {}},
+    }))
+
+
+async def feed_stdout(
+    mock: MockE2BClient,
+    read_stream: MemoryObjectReceiveStream[SessionMessage | Exception],
+    payload: dict[str, Any],
+) -> None:
+    """Deliver one JSON-RPC line from the MCP process, as E2B would."""
+    cb = mock.last_on_stdout
+    assert cb is not None
+    feeder = await _invoke_cb_concurrently(
+        cb, (json.dumps(payload) + "\n").encode(),
+    )
+    await asyncio.wait_for(read_stream.receive(), timeout=2.0)
+    await asyncio.wait_for(feeder, timeout=2.0)
+
+
+async def wait_for_set_timeouts(
+    mock: MockE2BClient, count: int, *, within: float,
+) -> None:
+    deadline = time.monotonic() + within
+    while len(mock.set_timeouts) < count and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_request_written_rearms_the_pause_timer() -> None:
+    """Writing a request to the MCP process re-arms E2B's pause timer.
+
+    A 40 s window means a 5 s refresh gap and a 13 s pending-call
+    cadence, so the one refresh seen here can only be the request's.
+    """
+    service, mock = make_e2b_service(on_timeout_seconds=40)
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="timer-request", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        sandbox_id = service._live_sandboxes[  # pyright: ignore[reportPrivateUsage]
+            "timer-request"
+        ].sandbox_id
+        assert mock.set_timeouts == [], "create arms the timer by itself"
+        await session.write_stream.send(make_request_message(1))
+        await wait_for_set_timeouts(mock, 1, within=2.0)
+        armed = [(t.sandbox_id, t.timeout_seconds) for t in mock.set_timeouts]
+    assert armed == [(sandbox_id, 40)], (
+        f"a request must re-arm the sandbox's own window; got {armed}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_response_read_rearms_the_pause_timer() -> None:
+    """The answer to a call re-arms the timer too, and ends the call.
+
+    The pause must count from the END of a call, not its start, or a
+    call that took most of the window leaves little idle time after.
+    A 2 s window: a 0.5 s gap, and a 0.67 s cadence while a call is
+    pending. The answer earns exactly one refresh at the gap's end; an
+    answer that went unmatched would leave the call pending and earn
+    one every 0.67 s instead.
+    """
+    service, mock = make_e2b_service(on_timeout_seconds=2)
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="timer-response", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        await session.write_stream.send(make_request_message(1))
+        await wait_for_set_timeouts(mock, 1, within=2.0)
+        await feed_stdout(mock, session.read_stream, {
+            "jsonrpc": "2.0", "id": 1, "result": {"content": []},
+        })
+        await asyncio.sleep(1.5)
+        count = len(mock.set_timeouts)
+    assert count == 2, (
+        f"one refresh for the call and one for its answer; got {count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_server_talking_on_its_own_does_not_rearm_the_timer(
+) -> None:
+    """Only a caller's traffic keeps a sandbox awake.
+
+    The MCP process is the customer's own program. If its logs, its
+    progress reports, its own requests or answers to nothing counted,
+    or the housekeeping requests the gateway sends because of it, the
+    program could keep its sandbox running with nobody using it, which
+    Terms §3 fair use rules out. Our own notifications are not a call
+    either. A 40 s window means any counted traffic refreshes at once.
+    """
+    service, mock = make_e2b_service(on_timeout_seconds=40)
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="timer-chatter", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        await feed_stdout(mock, session.read_stream, {
+            "jsonrpc": "2.0", "method": "notifications/message",
+            "params": {"level": "info", "data": "still here"},
+        })
+        await feed_stdout(mock, session.read_stream, {
+            "jsonrpc": "2.0", "id": 99, "method": "roots/list",
+        })
+        await feed_stdout(mock, session.read_stream, {
+            "jsonrpc": "2.0", "id": 424242, "result": {},
+        })
+        await session.write_stream.send(SessionMessage(
+            message=mcp_types.JSONRPCMessage.model_validate({
+                "jsonrpc": "2.0", "method": "notifications/initialized",
+            }),
+        ))
+        for request_id, method in ((5, "tools/list"), (6, "ping")):
+            await session.write_stream.send(SessionMessage(
+                message=mcp_types.JSONRPCMessage.model_validate({
+                    "jsonrpc": "2.0", "id": request_id, "method": method,
+                }),
+            ))
+            await feed_stdout(mock, session.read_stream, {
+                "jsonrpc": "2.0", "id": request_id, "result": {},
+            })
+        await asyncio.sleep(0.5)
+        count = len(mock.set_timeouts)
+    assert count == 0, (
+        f"server chatter and gateway housekeeping must not re-arm; "
+        f"got {count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_long_call_keeps_the_sandbox_awake_until_answered() -> None:
+    """A call longer than the window is never paused underneath.
+
+    Production: 50-57 s ES|QL calls against a 60 s window, and a call
+    still running at the pause was cut off. Once the answer arrives
+    and traffic stops, the refreshes stop, so the pause comes on time.
+    """
+    service, mock = make_e2b_service(on_timeout_seconds=1)
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="timer-long-call", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        await session.write_stream.send(make_request_message(7))
+        await asyncio.sleep(1.2)
+        during_call = len(mock.set_timeouts)
+        await feed_stdout(mock, session.read_stream, {
+            "jsonrpc": "2.0", "id": 7, "result": {"content": []},
+        })
+        await asyncio.sleep(0.5)
+        after_answer = len(mock.set_timeouts)
+        await asyncio.sleep(1.0)
+        settled = len(mock.set_timeouts)
+    assert during_call >= 3, (
+        f"a pending call must keep re-arming a 1 s window; "
+        f"got {during_call} refreshes in 1.2 s"
+    )
+    assert settled == after_answer, (
+        "once the call is answered and traffic stops, refreshing must stop"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_refresh_after_the_stream_dies() -> None:
+    """A sandbox that paused is never refreshed again by this session.
+
+    The stream dies at the pause. Requests still pending will never be
+    answered on this transport, so refreshing for them would keep the
+    sandbox awake for nothing; the session is rebuilt instead.
+    """
+    service, mock = make_e2b_service(on_timeout_seconds=1)
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="timer-dead-stream", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        live_handle = cast(
+            MockE2BSandboxHandle,
+            service._live_sandboxes["timer-dead-stream"],  # pyright: ignore[reportPrivateUsage]
+        )
+        process = live_handle.last_process
+        assert process is not None
+        await session.write_stream.send(make_request_message(7))
+        await wait_for_set_timeouts(mock, 1, within=2.0)
+        process.simulate_exit(0)
+        assert session.transport_failed is not None
+        for _ in range(100):
+            if session.transport_failed.is_set():
+                break
+            await asyncio.sleep(0.01)
+        at_death = len(mock.set_timeouts)
+        await asyncio.sleep(1.0)
+        later = len(mock.set_timeouts)
+    assert later == at_death, (
+        f"no refresh may follow the stream's death; "
+        f"{later - at_death} did"
+    )
+
+
+@pytest.mark.asyncio
+async def test_closing_the_session_stops_the_pause_timer() -> None:
+    """After the session closes, its sandbox gets no more refreshes."""
+    service, mock = make_e2b_service(on_timeout_seconds=1)
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="timer-close", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        await session.write_stream.send(make_request_message(7))
+        await wait_for_set_timeouts(mock, 1, within=2.0)
+    at_close = len(mock.set_timeouts)
+    await asyncio.sleep(1.0)
+    assert len(mock.set_timeouts) == at_close, (
+        "a closed session must not refresh its sandbox"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_slow_refresh_never_holds_up_a_call() -> None:
+    """Refreshing runs beside the tool calls, never in their way.
+
+    E2B's API answered ``set_timeout`` in about 150 ms in production,
+    and can be slower on a bad day. Here it never answers at all:
+    requests must still reach the MCP process and answers must still
+    reach the caller.
+    """
+    mock = make_mock_e2b_client()
+    mock.set_timeout_gate = asyncio.Event()  # E2B never answers
+    service, _ = make_e2b_service(client=mock, on_timeout_seconds=40)
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="timer-slow-api", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        live_handle = cast(
+            MockE2BSandboxHandle,
+            service._live_sandboxes["timer-slow-api"],  # pyright: ignore[reportPrivateUsage]
+        )
+        process = live_handle.last_process
+        assert process is not None
+        for request_id in (1, 2, 3):
+            await asyncio.wait_for(
+                session.write_stream.send(make_request_message(request_id)),
+                timeout=1.0,
+            )
+        for _ in range(100):
+            if len(process.stdin_buffer) == 3:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.wait_for(feed_stdout(mock, session.read_stream, {
+            "jsonrpc": "2.0", "id": 1, "result": {"content": []},
+        }), timeout=2.0)
+        written = len(process.stdin_buffer)
+        stuck = len(mock.set_timeouts)
+        mock.set_timeout_gate.set()
+    assert stuck == 1, "the refresh must be in flight, and only one"
+    assert written == 3, (
+        f"every request must reach the process while a refresh hangs; "
+        f"{written} of 3 did"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_answer_that_beats_its_own_write_still_counts() -> None:
+    """A request answered before its write returns is not left pending.
+
+    E2B delivers stdin before ``send_stdin``'s HTTP call returns, so a
+    fast tool's answer can arrive while the write is still in flight.
+    The real-SDK test caught the session recording the request only
+    AFTER the write: the answer found nothing to clear, the request
+    stayed "unanswered", and the sandbox was kept awake for minutes
+    with nobody using it.
+    """
+    service, mock = make_e2b_service(on_timeout_seconds=1)
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="timer-fast-answer", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        live_handle = cast(
+            MockE2BSandboxHandle,
+            service._live_sandboxes["timer-fast-answer"],  # pyright: ignore[reportPrivateUsage]
+        )
+        process = live_handle.last_process
+        assert process is not None
+        received: list[SessionMessage | Exception] = []
+
+        async def drain() -> None:
+            async for item in session.read_stream:
+                received.append(item)
+
+        async def answer_mid_send(data: bytes) -> None:
+            request = json.loads(data)
+            cb = mock.last_on_stdout
+            assert cb is not None
+            line = json.dumps({
+                "jsonrpc": "2.0", "id": request["id"],
+                "result": {"content": []},
+            }) + "\n"
+            result: Any = cb(line.encode())
+            if asyncio.iscoroutine(result):
+                await result
+
+        drainer = asyncio.create_task(drain())
+        process.during_send = answer_mid_send
+        await session.write_stream.send(make_request_message(7))
+        for _ in range(100):
+            if received:
+                break
+            await asyncio.sleep(0.01)
+        assert received, "the answer must reach the caller"
+        await asyncio.sleep(0.6)  # the traffic refreshes settle
+        settled = len(mock.set_timeouts)
+        await asyncio.sleep(1.0)  # three pending-call periods
+        later = len(mock.set_timeouts)
+        drainer.cancel()
+    assert later == settled, (
+        f"an answered request must not keep re-arming the timer; "
+        f"{later - settled} refreshes followed its answer"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_answer_with_its_id_as_text_still_ends_the_call() -> None:
+    """A server that echoes ids as text must not leave calls pending.
+
+    The MCP client library accepts "7" as the answer to request 7,
+    because real servers do that. If the session did not, every call to
+    such a server would stay "pending" and re-arm the timer for the
+    full 5-minute cap, keeping the sandbox awake between calls.
+    """
+    service, mock = make_e2b_service(on_timeout_seconds=1)
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    async with service.session(
+        session_id="timer-text-id", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ) as session:
+        await session.write_stream.send(make_request_message(7))
+        await wait_for_set_timeouts(mock, 1, within=2.0)
+        await feed_stdout(mock, session.read_stream, {
+            "jsonrpc": "2.0", "id": "7", "result": {"content": []},
+        })
+        await asyncio.sleep(0.6)  # the answer's refresh settles
+        settled = len(mock.set_timeouts)
+        await asyncio.sleep(1.0)  # three pending-call periods
+        later = len(mock.set_timeouts)
+    assert later == settled, (
+        f"an answered call must stop re-arming the timer; "
+        f"{later - settled} refreshes followed its answer"
+    )
+
+
+@pytest.mark.asyncio
+async def test_closing_mid_refresh_leaves_no_timer_behind() -> None:
+    """Closing a session ends its timer even if E2B is not answering.
+
+    The timer must be gone before the sandbox is killed, and must not
+    linger afterwards, waiting on a sandbox that no longer exists.
+    """
+    mock = make_mock_e2b_client()
+    mock.set_timeout_gate = asyncio.Event()  # E2B never answers
+    service, _ = make_e2b_service(client=mock, on_timeout_seconds=40)
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+
+    def timer_tasks() -> list[asyncio.Task[Any]]:
+        return [
+            task for task in asyncio.all_tasks()
+            if "IdlePauseTimer.run" in repr(task.get_coro())
+        ]
+
+    started = time.monotonic()
+    async with service.session(
+        session_id="timer-close-mid-refresh", org_id="acme",
+        upstream=upstream, resources=make_default_resources(), denylist=(),
+    ) as session:
+        await session.write_stream.send(make_request_message(7))
+        await wait_for_set_timeouts(mock, 1, within=2.0)
+        assert timer_tasks(), "the timer runs while the session is open"
+        started = time.monotonic()
+    closed_in = time.monotonic() - started
+    leftover = [task for task in timer_tasks() if not task.done()]
+    mock.set_timeout_gate.set()
+    assert closed_in < 2.0, f"closing took {closed_in:.1f} s"
+    assert not leftover, "no timer may outlive its session"
+    assert mock.kills, "the sandbox is still killed on close"

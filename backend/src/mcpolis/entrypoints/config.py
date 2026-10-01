@@ -216,17 +216,21 @@ class Settings(BaseSettings):
     e2b_volumes_enabled: bool = Field(default=False)
     # E2B-side idle window before a sandbox auto-pauses. Passed
     # through to ``Sandbox.create(timeout=…)`` together with
-    # ``lifecycle={on_timeout: pause, auto_resume: True}``. After this
-    # many seconds without an API call, the sandbox snapshots; the
-    # next call (typically a tool invocation) auto-resumes it and
-    # ``E2BSandboxService._session_cm`` reattaches the streaming RPC.
+    # ``lifecycle={on_timeout: pause, auto_resume: True}``. E2B counts
+    # it from the create or the last ``set_timeout``, NOT from activity
+    # (measured 2026-10-01), so ``IdlePauseTimer`` re-arms it on MCP
+    # traffic; the sandbox pauses after this many seconds with no MCP
+    # traffic. The next call auto-resumes it and the session is
+    # rebuilt on a fresh MCP process.
     # Default 60s — paused sandboxes are free (E2B billing docs:
     # "Once a sandbox is paused, killed or times out, billing stops
     # immediately"), wake-from-paused was empirically measured at
     # 361–759 ms in the integration suite, so a tighter window is
     # the right cost/UX trade-off. Lower bound: ~60s; below that,
-    # sandboxes risk pausing mid-operation.
-    e2b_idle_pause_seconds: int = Field(default=60)
+    # sandboxes risk pausing mid-operation. Hard floor 10s: the pause
+    # timer re-arms at fractions of this window, and 0 would make it
+    # re-arm in a loop.
+    e2b_idle_pause_seconds: int = Field(default=60, ge=10)
     # Reuse-on-restart for stdio service_account upstreams. When
     # ``True``, ``E2BSandboxService`` writes a live ``(sandbox_id,
     # pid)`` ref on session entry; the lifespan handler marks
