@@ -126,5 +126,5 @@ exec python -m pytest \
     "${PARALLEL_ARGS[@]+"${PARALLEL_ARGS[@]}"}" \
     "${RERUN_ARGS[@]+"${RERUN_ARGS[@]}"}" \
     --junitxml="$JUNIT_OUT" \
-    --json-report --json-report-file="$JSON_OUT" --json-report-omit=keywords,streams \
+    --json-report --json-report-omit keywords streams log --json-report-file="$JSON_OUT" \
     "${PASSTHRU[@]+"${PASSTHRU[@]}"}"

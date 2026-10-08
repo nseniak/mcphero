@@ -145,6 +145,12 @@ class SessionOwnerGuard:
         if session_manager.stateless:
             # No session ids to own: every request carrying one would 404.
             raise ValueError("SessionOwnerGuard needs a stateful session manager")
+        # The guard ends idle sessions itself. The SDK's own timer (on
+        # by default since mcp 1.30, 30 minutes with no HTTP request
+        # open) would end a session whose tool call goes on after its
+        # client hung up. The SDK reads the setting when it opens a
+        # session, so turning it off here covers every guarded endpoint.
+        session_manager.session_idle_timeout = None
         self._app = app
         self._session_manager = session_manager
         self._on_session_end = on_session_end
@@ -241,8 +247,8 @@ class SessionOwnerGuard:
         return self._session_manager._server_instances  # pyright: ignore[reportPrivateUsage]
 
     def _is_live(self, session_id: str) -> bool:
-        # A DELETEd session stays in the SDK's table, terminated, until
-        # ``_release_if_ended`` drops it: "terminated" counts as ended.
+        # A session the SDK ended is gone from its table, or (before
+        # mcp 1.30, after a DELETE) still there, terminated.
         transport = self._sessions().get(session_id)
         return transport is not None and not transport.is_terminated
 
@@ -313,12 +319,14 @@ class SessionOwnerGuard:
             logger.exception(failure_event, session_id_prefix=session_id[:8])
 
     def _release_if_ended(self, session_id: str) -> None:
-        """After a DELETE: drop the session if it ended (terminated)."""
+        """After a DELETE: drop the session if it ended. Since mcp 1.30
+        the SDK removes an ended session from its table itself; before,
+        it left it there, terminated."""
         sessions = self._sessions()
         transport = sessions.get(session_id)
-        if transport is None or not transport.is_terminated:
+        if transport is not None and not transport.is_terminated:
             return
-        del sessions[session_id]
+        sessions.pop(session_id, None)
         self._forget(session_id)
 
     def _forget(self, session_id: str) -> None:

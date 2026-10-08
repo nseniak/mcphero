@@ -5,7 +5,8 @@ The inner app stands in for the SDK. A request without a session id
 opens a session: added to the session manager, its ``mcp-session-id``
 on the answer, which is 200 for a POST and 400 otherwise (the SDK opens
 a session for a GET without an id, then refuses the GET). A DELETE
-ends the session like the SDK does: terminated, left in the manager.
+ends the session like the SDK does (mcp 1.30): terminated, removed from
+the manager.
 Any other request is answered "handled". The
 caller and org are set the way the auth and org middleware set them,
 through ``auth_context_var`` and ``current_org_id``. The full-app tests
@@ -84,7 +85,7 @@ def make_sdk_stand_in(
                 headers={"mcp-session-id": session_id},
             )
         elif scope["method"] == "DELETE":
-            await session_manager._server_instances[session_id].terminate()
+            await session_manager._server_instances.pop(session_id).terminate()
             response = Response("ended")
         elif scope["method"] == "GET" and stream_open is not None:
             await stream_open.wait()
@@ -335,6 +336,18 @@ def test_a_stateless_session_manager_is_refused() -> None:
             make_sdk_stand_in(make_session_manager(), []),
             StreamableHTTPSessionManager(app=Server("guard-test"), stateless=True),
         )
+
+
+def test_the_guard_turns_off_the_sdk_idle_timer() -> None:
+    """Since mcp 1.30 the SDK ends a session after 30 minutes with no
+    HTTP request open, even while a tool call whose client hung up is
+    still running. The guard's own idle rule waits for that call."""
+    session_manager = StreamableHTTPSessionManager(app=Server("guard-test"))
+    assert session_manager.session_idle_timeout is not None
+
+    make_guard(session_manager)
+
+    assert session_manager.session_idle_timeout is None
 
 
 @pytest.mark.asyncio

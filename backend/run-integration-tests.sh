@@ -103,5 +103,5 @@ fi
 exec python -m pytest -o testpaths=tests/integration \
     "${PARALLEL_ARGS[@]+"${PARALLEL_ARGS[@]}"}" \
     --junitxml="$JUNIT_OUT" \
-    --json-report --json-report-file="$JSON_OUT" --json-report-omit=keywords,streams \
+    --json-report --json-report-omit keywords streams log --json-report-file="$JSON_OUT" \
     "${PASSTHRU[@]+"${PASSTHRU[@]}"}"

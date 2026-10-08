@@ -81,5 +81,3 @@ tests/e2e/test-results/
 # Mondrian interactive-diagram tool state (served locally; not part of the repo)
 .mondrian/
 
-# coyomap project map (local only, not tracked)
-.coyomap/

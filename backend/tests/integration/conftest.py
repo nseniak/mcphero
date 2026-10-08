@@ -17,7 +17,10 @@ Loading rules:
   it). The E2B SDK and the test code read the bare ``E2B_API_KEY``, so we
   mirror the canonical value into it. Set only ``MCPOLIS_E2B_API_KEY``.
 - We read ``.env.test`` only, never prod secrets. Point at a different
-  file with ``MCPOLIS_INTEGRATION_ENV=/path/to/file``.
+  file with ``MCPOLIS_INTEGRATION_ENV=/path/to/file``. In a git worktree
+  without its own copy, the main checkout's is used (``_env_file.py``).
+- No key after loading prints one warning: every paid test then skips,
+  and a skip-only run would otherwise read as a pass.
 
 The tests share their E2B account with production, so each pytest session
 deletes the sandboxes it created, and only those, when it ends (passed,
@@ -34,16 +37,18 @@ from pathlib import Path
 
 import pytest
 
+from tests.integration._env_file import default_env_file
 from tests.integration._run_sandboxes import (
     cleanup_run_sandboxes,
     current_run_id,
     start_run,
 )
 
+_INTEGRATION_DIR = Path(__file__).resolve().parent
 _ENV_TEST_FILE = Path(
     os.environ.get(
         "MCPOLIS_INTEGRATION_ENV",
-        str(Path(__file__).parent / ".env.test"),
+        str(default_env_file(_INTEGRATION_DIR, _INTEGRATION_DIR.parents[2])),
     )
 )
 
@@ -81,6 +86,21 @@ def _mirror_e2b_key() -> None:
 
 _load_env_file(_ENV_TEST_FILE)
 _mirror_e2b_key()
+_NO_KEY_WARNING = (
+    None
+    if os.environ.get("E2B_API_KEY")
+    else f"WARNING: no E2B key (looked in {_ENV_TEST_FILE}): "
+    "every paid integration test SKIPS"
+)
+
+
+def pytest_report_header() -> str | None:
+    return _NO_KEY_WARNING
+
+
+def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    if _NO_KEY_WARNING is not None:
+        terminalreporter.write_line(_NO_KEY_WARNING, red=True, bold=True)
 
 # An xdist worker inherits the controller's id; anything else starts a run.
 if os.environ.get("PYTEST_XDIST_WORKER") is None:
