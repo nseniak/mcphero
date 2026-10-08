@@ -107,6 +107,8 @@ services:
       - mcpolis-config:/app/config
       - mcpolis-data:/app/data
     restart: unless-stopped
+    # Room for the SIGTERM drain and shutdown cleanup; see ``backend``.
+    stop_grace_period: 90s
 
   # ---- Cloud: backend behind nginx, Mongo + Redis ----
 
@@ -132,12 +134,34 @@ services:
       # so prod Mongo runs with --auth. See docker-compose.proxied.yml.
       MCPOLIS_MONGO_URI: ${MCPOLIS_MONGO_URI:-mongodb://mongo:27017}
       MCPOLIS_REDIS_URL: redis://redis:6379
+      # Proxies in front of the backend that append to X-Forwarded-For:
+      # here only the bundled nginx (it binds host port 80). The per-IP
+      # sign-in rate limit reads the client IP from that header, so
+      # this must match the real chain. docker-compose.proxied.yml
+      # raises it to 2 for its external proxy.
+      MCPOLIS_TRUSTED_PROXY_HOPS: ${MCPOLIS_TRUSTED_PROXY_HOPS:-1}
     depends_on:
       mongo:
         condition: service_started
       redis:
         condition: service_started
     restart: unless-stopped
+    # SIGTERM (every deploy) drains for up to MCPOLIS_DRAIN_TIMEOUT
+    # (30 s), gives open connections MCPOLIS_GRACEFUL_SHUTDOWN_TIMEOUT
+    # (5 s), then runs the shutdown cleanup, at most 42 s: sandboxes are
+    # marked to be kept, periodic jobs stop (2 s), every MCP endpoint's
+    # sessions close at once, a cancelled Admin MCP call waiting up to
+    # 10 s for its action (11 s), the org runtimes stop while every
+    # background job finishes, a sandbox create a stopped connect waits
+    # for and a sign-in warning's 15 s SMTP step included (20 s, then 2 s
+    # for what had to be cut), sign-in changes are saved (5 s) and the
+    # stores close (2 s); see ShutdownBudget in
+    # backend/src/mcpolis/entrypoints/lifecycle.py. Worst case about 77 s,
+    # which leaves 13 s of this grace spare
+    # (backend/tests/unit/test_container_timing.py checks it). Docker's
+    # default 10 s would kill a slow drain before the cleanup runs.
+    # Usually it all takes a few seconds.
+    stop_grace_period: 90s
     # Cap the default json-file driver so a runaway log loop can't
     # fill the host disk before the vector sidecar can throttle it.
     logging:

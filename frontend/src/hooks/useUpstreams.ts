@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { fetchUpstreams, refreshUpstreamStatus } from "../api/admin";
+import { fetchUpstreams } from "../api/admin";
 import type { UpstreamSummary } from "../api/types";
 import { useOrgSlug } from "./useOrgSlug";
 
@@ -31,11 +31,6 @@ export function useUpstreams(opts: { enabled?: boolean } = {}) {
   ).length;
   const stdioCount = upstreams.filter((u) => u.transport === "stdio").length;
 
-  const refresh = async () => {
-    const updated = await refreshUpstreamStatus();
-    queryClient.setQueryData(queryKey, updated);
-  };
-
   const setUpstreams = (updater: UpstreamSummary[] | ((prev: UpstreamSummary[]) => UpstreamSummary[])) => {
     queryClient.setQueryData<UpstreamSummary[]>(queryKey, (prev) => {
       if (typeof updater === "function") return updater(prev ?? []);
@@ -45,5 +40,5 @@ export function useUpstreams(opts: { enabled?: boolean } = {}) {
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey });
 
-  return { upstreams, isLoading, connectedCount, disconnectedCount, errorCount, httpCount, stdioCount, refresh, setUpstreams, invalidate };
+  return { upstreams, isLoading, connectedCount, disconnectedCount, errorCount, httpCount, stdioCount, setUpstreams, invalidate };
 }

@@ -23,7 +23,7 @@ async def test_set_then_get_round_trips_value(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_summaries_returns_value_for_password_rows(
+async def test_list_summaries_never_returns_password_value(
     tmp_path: Path,
 ) -> None:
     repo = make_repo(tmp_path)
@@ -31,11 +31,27 @@ async def test_list_summaries_returns_value_for_password_rows(
     summaries = await repo.list_summaries("default", "github")
     assert len(summaries) == 1
     assert summaries[0].name == "TOKEN"
-    assert summaries[0].last_four == "xxxx"
-    # The list path now carries the plaintext for password rows too —
-    # the SPA obfuscates by default and exposes an eye toggle.
     assert summaries[0].is_secret is True
-    assert summaries[0].value == "x" * 32
+    assert summaries[0].value is None
+    assert summaries[0].has_value is True
+    assert "x" * 32 not in summaries[0].model_dump_json()
+    # The plaintext stays reachable through get_value (substitution).
+    assert await repo.get_value("default", "github", "TOKEN") == "x" * 32
+
+
+@pytest.mark.asyncio
+async def test_set_never_returns_password_value(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    summary = await repo.set("default", "github", "TOKEN", "pw-value-123")
+    assert summary.value is None
+    assert summary.has_value is True
+
+
+@pytest.mark.asyncio
+async def test_empty_password_reports_no_value(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    summary = await repo.set("default", "github", "TOKEN", "")
+    assert summary.has_value is False
 
 
 @pytest.mark.asyncio
@@ -55,13 +71,6 @@ async def test_set_replaces_value_but_keeps_created_at(tmp_path: Path) -> None:
     assert first.created_at == second.created_at
     assert second.updated_at >= first.updated_at
     assert await repo.get_value("default", "github", "TOKEN") == "second-value-1234"
-
-
-@pytest.mark.asyncio
-async def test_short_values_have_no_last_four(tmp_path: Path) -> None:
-    repo = make_repo(tmp_path)
-    summary = await repo.set("default", "github", "TOKEN", "short")
-    assert summary.last_four is None
 
 
 @pytest.mark.asyncio
@@ -132,7 +141,11 @@ async def test_replace_preserves_is_secret_flag(tmp_path: Path) -> None:
         is_secret=False,  # caller's flag is ignored
     )
     assert summary.is_secret is True
-    assert summary.value == "rotated-value-1234567890"
+    assert summary.value is None
+    assert (
+        await repo.get_value("default", "github", "TOKEN")
+        == "rotated-value-1234567890"
+    )
 
 
 @pytest.mark.asyncio
@@ -162,7 +175,6 @@ async def test_legacy_record_without_is_secret_field_reads_as_secret(
             "github": {
                 "LEGACY": {
                     "value": "value-from-v1",
-                    "last_four": "rom1",
                     "created_at": "2026-04-01T00:00:00+00:00",
                     "updated_at": "2026-04-01T00:00:00+00:00",
                 },
@@ -172,7 +184,5 @@ async def test_legacy_record_without_is_secret_field_reads_as_secret(
     summaries = await repo.list_summaries("default", "github")
     assert len(summaries) == 1
     assert summaries[0].is_secret is True
-    # v1 records stored the plaintext under ``value`` already; the
-    # new contract returns it for password rows too, so the legacy
-    # row surfaces its plaintext through the SPA's reveal toggle.
-    assert summaries[0].value == "value-from-v1"
+    assert summaries[0].value is None
+    assert summaries[0].has_value is True

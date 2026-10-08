@@ -59,7 +59,7 @@ async def test_value_is_encrypted_at_rest() -> None:
 
 @pytest.mark.skipif(not mongo_available(), reason="Mongo not reachable")
 @pytest.mark.asyncio
-async def test_list_summaries_returns_value_for_password_rows() -> None:
+async def test_list_summaries_never_returns_password_value() -> None:
     async with temp_mongo_database() as db:
         scoped = OrgScopedCollection(
             db[COLL_TEMPLATE_VARS], COLL_TEMPLATE_VARS, encryptor=_make_encryptor(),
@@ -69,13 +69,11 @@ async def test_list_summaries_returns_value_for_password_rows() -> None:
         summaries = await repo.list_summaries("default", "github")
         assert len(summaries) == 1
         assert summaries[0].name == "TOKEN"
-        assert summaries[0].last_four == "xxxx"
-        # The list path now carries the plaintext for password rows
-        # too — the SPA obfuscates by default and exposes an eye
-        # toggle. Encryption-at-rest still applies via the
-        # OrgScopedCollection wrapper (decrypts on read).
         assert summaries[0].is_secret is True
-        assert summaries[0].value == "x" * 32
+        assert summaries[0].value is None
+        assert summaries[0].has_value is True
+        assert "x" * 32 not in summaries[0].model_dump_json()
+        assert await repo.get_value("default", "github", "TOKEN") == "x" * 32
 
 
 @pytest.mark.skipif(not mongo_available(), reason="Mongo not reachable")
@@ -151,7 +149,8 @@ async def test_replace_preserves_is_secret_flag() -> None:
             "default", "github", "TOKEN", "rotated", is_secret=False,
         )
         assert summary.is_secret is True
-        assert summary.value == "rotated"
+        assert summary.value is None
+        assert await repo.get_value("default", "github", "TOKEN") == "rotated"
 
 
 @pytest.mark.skipif(not mongo_available(), reason="Mongo not reachable")
@@ -166,7 +165,6 @@ async def test_legacy_doc_without_is_secret_reads_as_secret() -> None:
             "upstream_id": "github",
             "name": "LEGACY",
             "value": encryptor.encrypt_string("v1-value"),
-            "last_four": "alue",
             "created_at": datetime(2026, 4, 1, tzinfo=timezone.utc),
             "updated_at": datetime(2026, 4, 1, tzinfo=timezone.utc),
         })
@@ -177,11 +175,8 @@ async def test_legacy_doc_without_is_secret_reads_as_secret() -> None:
         summaries = await repo.list_summaries("default", "github")
         assert len(summaries) == 1
         assert summaries[0].is_secret is True
-        # v1 docs stored the encrypted plaintext under ``value``;
-        # the OrgScopedCollection wrapper decrypts it before our
-        # repo's _summary_from_doc sees it, so it surfaces in the
-        # list (under the new "always include value" contract).
-        assert summaries[0].value == "v1-value"
+        assert summaries[0].value is None
+        assert summaries[0].has_value is True
 
 
 @pytest.mark.skipif(not mongo_available(), reason="Mongo not reachable")

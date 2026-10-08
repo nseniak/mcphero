@@ -34,6 +34,7 @@ from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
 from tests.unit._dev_stub_login import login_as
+from tests.unit.factories import make_config_users_accepted
 
 
 MCP_JSON = json.dumps({
@@ -90,6 +91,7 @@ def make_app_and_store(tmp_path: Path) -> tuple[TestClient, FileConnectionStore]
     config = tmp_path / "config.json"
     config.write_text(CONFIG_JSON)
     data_dir = tmp_path / "data"
+    make_config_users_accepted(data_dir, CONFIG_JSON)
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         mcp_json_path=mcp_json,
@@ -270,7 +272,7 @@ async def test_detail_per_user_oauth_uniform_slot_owner(
 
 
 # ---------------------------------------------------------------------
-# Take-over conflict (existing 409 behaviour preserved across schema)
+# Take-over conflict: a running upstream another admin signed in to
 # ---------------------------------------------------------------------
 
 
@@ -291,7 +293,7 @@ async def test_connect_admin_oauth_returns_409_when_other_admin_owns_slot(
     resp = client.post("/api/admin/upstreams/slack/connect")
     assert resp.status_code == 409
     assert "alice@co.com" in resp.json()["detail"].lower()
-    assert "disconnect" in resp.json()["detail"].lower()
+    assert "already signed in" in resp.json()["detail"].lower()
 
 
 @pytest.mark.asyncio
@@ -312,18 +314,15 @@ async def test_connect_per_user_oauth_returns_409_when_other_admin_owns_slot(
     resp = client.post("/api/admin/upstreams/notion/connect")
     assert resp.status_code == 409
     assert "alice@co.com" in resp.json()["detail"].lower()
-    assert "disconnect" in resp.json()["detail"].lower()
+    assert "already signed in" in resp.json()["detail"].lower()
 
 
 @pytest.mark.asyncio
-async def test_disconnect_per_user_oauth_admin_clears_slot_owner_keeps_users(
+async def test_disconnect_per_user_oauth_keeps_every_sign_in(
     tmp_path: Path,
 ) -> None:
-    """Phase B: the admin-tab disconnect on a per_user_oauth upstream
-    clears the slot-owning admin's row (so a subsequent take-over by
-    another admin can succeed) without touching non-admin users'
-    independent rows.
-    """
+    """The admin-tab disconnect (Stop) deletes no saved sign-in, the
+    slot owner's included, so Start needs nobody to sign in again."""
     client, store = make_app_and_store(tmp_path)
     await store.put_user_token(
         DEFAULT_ORG_ID, "alice@co.com", "notion", make_token(),
@@ -342,17 +341,16 @@ async def test_disconnect_per_user_oauth_admin_clears_slot_owner_keeps_users(
     carol_token = await store.get_user_token(
         DEFAULT_ORG_ID, "carol@co.com", "notion",
     )
-    assert alice_token is None
-    assert carol_token is not None  # non-admin row preserved
+    assert alice_token is not None
+    assert carol_token is not None
 
 
 @pytest.mark.asyncio
-async def test_disconnect_admin_oauth_clears_active_admin_token(
+async def test_disconnect_admin_oauth_keeps_the_admin_sign_in(
     tmp_path: Path,
 ) -> None:
-    """Take-over: bob calls disconnect on slack while alice owns the
-    slot. Alice's token must be cleared so the subsequent connect from
-    bob succeeds."""
+    """bob stops slack while alice holds its sign-in: alice's sign-in
+    is kept, and the upstream shows as stopped, not Ready."""
     client, store = make_app_and_store(tmp_path)
     await store.put_user_token(
         DEFAULT_ORG_ID, "alice@co.com", "slack", make_token(),
@@ -362,10 +360,14 @@ async def test_disconnect_admin_oauth_clears_active_admin_token(
     resp = client.post("/api/admin/upstreams/slack/disconnect")
     assert resp.status_code == 200
 
-    cleared = await store.get_user_token(
+    kept = await store.get_user_token(
         DEFAULT_ORG_ID, "alice@co.com", "slack",
     )
-    assert cleared is None
+    assert kept is not None
+    detail = client.get("/api/admin/upstreams/slack").json()
+    assert detail["ready"] is False
+    assert detail["stopped"] is True
+    assert detail["slot_owner"] == "alice@co.com"
 
 
 @pytest.mark.asyncio

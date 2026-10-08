@@ -78,9 +78,9 @@ Names must be uppercase letters, digits, and underscores, starting with a letter
 The Variables panel sits right below the JSON editor on Step 1.
 
 - Every `${NAME}` you've referenced but not yet defined shows up in an amber **undefined variables** callout with an `[+ Add]` button. Click it to define the Variable inline.
-- Each Variable has a **Treat as password** toggle (default on). Passwords render as `••••XYZ4` in the list with an eye icon to reveal, the way 1Password does it. Plain Variables render their value verbatim.
-- Password values are encrypted at rest in cloud mode and redacted from the server-logs panel at write time. Plain values are not.
-- A Variable's name is editable in **Replace** mode; the rename happens atomically on save.
+- Each Variable has a **Treat as password** toggle (default on). Passwords are write-only: once saved, the value is never shown again, and the list only says **set** or **empty**. To change one, click its pencil: leave the value blank to keep it, type a new one to replace it, or tick **Clear the saved value**. Renaming a password keeps its value. Plain Variables render their value verbatim.
+- Password values are encrypted at rest in cloud mode. In the server-logs panel, a password of 8 characters or more is replaced with `[REDACTED:NAME]` wherever it appears exactly as saved. Plain values are not hidden.
+- A Variable's name is editable from its pencil; the rename is applied when you click **Save**, together with your other changes.
 
 One built-in Variable is always available: `${HOME}` resolves to the sandbox user's home directory (`/home/user` on every shipped template). System Variables show up in the list with a "system" badge and can't be edited or deleted.
 
@@ -148,7 +148,30 @@ If a connection fails, the row shows **Couldn't connect** and a one-line error. 
 
 ## Disconnecting / stopping an MCP
 
-When the MCP is Connected, the action button becomes **Disconnect** (HTTP) or **Stop** (stdio). Use it to drop the live session without removing the MCP. The tool list, Variables, and Files are preserved; the connection is closed. (For OAuth modes, disconnecting also clears the stored tokens.)
+When the MCP is Connected, the action button becomes **Disconnect** (HTTP) or **Stop** (stdio). Use it to take the MCP offline for the whole team without removing it:
+
+- Every live connection to the MCP closes, including each member's own connection on a **Per-user** MCP.
+- Until an admin starts it again, every tool call to it fails with a message telling the member to contact an administrator. Signing in again does not get around it.
+- Nobody's sign-in is deleted: not the admin's (**Shared** and **Per-user**), not the members' (**Per-user**).
+- The tool list, Variables, and Files are kept.
+- The MCP stays stopped after a restart of MCP Hero.
+
+A stopped **Shared** or **Per-user** MCP shows **Stopped**:
+
+- If an admin sign-in was kept, the button is **Connect**. Any admin can click it: the MCP comes back with the saved sign-ins, so nobody has to sign in again. If the saved admin sign-in no longer works (for example, it was revoked at the provider), the row then asks for **Authenticate**.
+- If no admin sign-in was kept, the button is **Authenticate**: starting the MCP needs an admin to sign in.
+
+A **Shared** or **Per-user** MCP that runs without an admin sign-in (for example, after **Remove sign-in**) shows **Authenticate** and **Disconnect**, so it can still be stopped.
+
+## Handing a Shared or Per-user MCP to another admin
+
+Disconnect does not sign anyone out. To hand the MCP to another admin, click **Remove sign-in** next to **Disconnect** (or next to **Connect** when the MCP is stopped) and confirm:
+
+- It deletes the saved sign-in of the admin shown in the status, for example **Ready, by alice@company.com**. Any admin can do it.
+- Members' own sign-ins on a **Per-user** MCP stay.
+- A stopped MCP stays stopped.
+
+The row then shows **Authenticate**, and the other admin signs in with it. Until someone does, the MCP has no admin sign-in. If another admin's sign-in is shown by the time you confirm, nothing is removed and you are told whose it is now.
 
 ## Refreshing an MCP's tools
 

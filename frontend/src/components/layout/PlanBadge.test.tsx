@@ -46,6 +46,7 @@ function makeAdminViaFlagUser(roleName: string): UserInfo {
       plan: "free",
       is_admin: true,
     } as UserInfo["current_org"],
+    invitations: [],
   };
 }
 
@@ -100,6 +101,7 @@ describe("PlanBadge — admin gate routes through is_admin, not role name", () =
         plan: "free",
         is_admin: false,
       } as UserInfo["current_org"],
+      invitations: [],
     };
     render(
       <AuthContext.Provider

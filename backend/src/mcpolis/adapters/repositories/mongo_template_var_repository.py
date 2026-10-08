@@ -4,8 +4,7 @@ Only the ``value`` field is encrypted (via the existing
 :class:`mcpolis.adapters.repositories.encryption.FieldEncryptor`,
 declared in ``ENCRYPTED_FIELDS[COLL_TEMPLATE_VARS]`` so the
 :class:`OrgScopedCollection` wrapper applies it transparently). The
-``is_secret`` flag, ``last_four`` preview, and timestamps stay
-plaintext so the listing path never needs to decrypt.
+``is_secret`` flag and timestamps stay plaintext.
 
 Encryption is **uniform** — every row's value is encrypted at rest
 regardless of ``is_secret``. Cheap defence in depth: the field-level
@@ -22,28 +21,23 @@ from typing import Any
 from mcpolis.adapters.repositories.mongo_client import OrgScopedCollection
 from mcpolis.domain.model.template_var import (
     TemplateVarSummary,
-    compute_last_four,
+    make_template_var_summary,
 )
 from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
 
 
 def _summary_from_doc(doc: dict[str, Any]) -> TemplateVarSummary:
-    # Default ``is_secret=True`` for back-compat with v1 docs that
-    # pre-date the field. The list path now returns ``value`` for both
-    # kinds — the UI obfuscates password rows by default and exposes an
-    # eye toggle (1Password-style). Encryption-at-rest still applies
-    # uniformly via ``ENCRYPTED_FIELDS``; the value is decrypted by
-    # the OrgScopedCollection wrapper before this helper sees it.
+    # Default ``is_secret=True`` for docs that pre-date the field.
+    # The value is decrypted by the OrgScopedCollection wrapper before
+    # this helper sees it; the shared builder drops it for passwords.
     is_secret = bool(doc.get("is_secret", True))
     stored_value = doc.get("value")
-    value: str | None = (
-        stored_value if isinstance(stored_value, str) else None
-    )
-    return TemplateVarSummary(
+    return make_template_var_summary(
         name=doc["name"],
         is_secret=is_secret,
-        value=value,
-        last_four=doc.get("last_four"),
+        stored_value=(
+            stored_value if isinstance(stored_value, str) else None
+        ),
         created_at=doc["created_at"],
         updated_at=doc["updated_at"],
     )
@@ -97,7 +91,6 @@ class MongoTemplateVarRepository(TemplateVarRepository):
             if existing is not None
             else is_secret
         )
-        last_four = compute_last_four(value)
         await self._template_vars.replace_one(
             org_id,
             {"upstream_id": upstream_id, "name": name},
@@ -106,17 +99,15 @@ class MongoTemplateVarRepository(TemplateVarRepository):
                 "name": name,
                 "value": value,
                 "is_secret": effective_is_secret,
-                "last_four": last_four,
                 "created_at": created_at,
                 "updated_at": now,
             },
             upsert=True,
         )
-        return TemplateVarSummary(
+        return make_template_var_summary(
             name=name,
             is_secret=effective_is_secret,
-            value=value,
-            last_four=last_four,
+            stored_value=value,
             created_at=created_at,
             updated_at=now,
         )

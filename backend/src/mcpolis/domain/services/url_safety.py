@@ -31,7 +31,15 @@ import socket
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-_TEST_LOOPBACK_FLAG = "MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK"
+LOOPBACK_SWITCH_ENV = "MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK"
+
+
+def loopback_switch_on() -> bool:
+    """Whether the dev/e2e loopback switch
+    (``MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK=1``) is on. The one reader
+    of the switch: the URL check here, the outbound transport and the
+    startup check (``validate_startup_secrets``) all ask this."""
+    return os.environ.get(LOOPBACK_SWITCH_ENV) == "1"
 
 
 class UnsafeUpstreamUrl(Exception):
@@ -88,7 +96,7 @@ def _is_safe_ip(ip: str) -> tuple[bool, str | None]:
         # (test MCP servers on 127.0.0.1) can still register. The flag
         # MUST NOT be set in prod — startup-config validation in
         # ``entrypoints/config.py`` enforces this.
-        if os.environ.get(_TEST_LOOPBACK_FLAG) == "1":
+        if loopback_switch_on():
             return True, None
         return False, f"loopback address {addr}"
     if addr.is_link_local:

@@ -106,8 +106,10 @@ export function SecurityPage() {
             <h2 className="text-xl font-semibold text-zinc-900">Deletion</h2>
             <p>
               When you delete an MCP server, its variables, tokens, uploaded
-              files, and logs are deleted with it. Deleting an organization
-              removes the same data for every member. Encrypted backups exist
+              files, and server logs are deleted with it. Its audit log entries stay
+              until they are 1 year old. Deleting an organization removes all
+              of this data for every member, including the audit log entries.
+              Encrypted backups exist
               for disaster recovery and roll over on a fixed retention window;
               after that, deleted data is unrecoverable.
             </p>

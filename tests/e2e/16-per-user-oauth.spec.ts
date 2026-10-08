@@ -16,7 +16,7 @@
  */
 import { test, expect, type APIRequestContext } from "@playwright/test";
 
-import { apiLoginAs, makeMcpClient, mintMcpToken, OAUTH_TEST_MCP_URL, BACKEND_URL as BACKEND } from "./helpers";
+import { apiLoginAs, makeMcpClient, mintMcpToken, OAUTH_TEST_MCP_URL, startOAuthUpstreamSignedOut, BACKEND_URL as BACKEND } from "./helpers";
 const ORG = "acme-corp";
 const USER_A = "admin@example.com";
 const USER_B = "admin2@example.com";
@@ -96,6 +96,9 @@ test.describe("per_user_oauth: independent tokens per user", () => {
     await request.post(`${BACKEND}/api/auth/disconnect/${UPSTREAM}`);
     await userApi(request, USER_B);
     await request.post(`${BACKEND}/api/auth/disconnect/${UPSTREAM}`);
+    // The seed adds the upstream stopped, and another spec on this
+    // shard may leave it stopped: personal sign-ins need it started.
+    await startOAuthUpstreamSignedOut(request, UPSTREAM);
   });
 
   test("each user's tool call uses their own upstream token", async ({
@@ -233,7 +236,8 @@ test.describe("per_user_oauth: independent tokens per user", () => {
     // No connect — the slot is reset by beforeEach. User A's call
     // must surface a clear "you need to authenticate" signal rather
     // than silently picking another user's token.
-    const aResult = await callSecretEcho(request, USER_A, "no-token");
+    const message = `no-token-${Date.now().toString(36)}`;
+    const aResult = await callSecretEcho(request, USER_A, message);
     const lowered = aResult.text.toLowerCase();
     const surfaced =
       aResult.isError ||
@@ -245,5 +249,19 @@ test.describe("per_user_oauth: independent tokens per user", () => {
     // Defensive: must not return an "as=" line at all (no token =
     // no upstream call).
     expect(aResult.text).not.toContain("as=");
+
+    // The refused call still leaves an ``error`` audit row, and the row
+    // never carries the call's arguments.
+    await userApi(request, USER_A);
+    const auditResp = await request.get(
+      `${BACKEND}/api/admin/audit?tool=secret_echo&user_id=${encodeURIComponent(USER_A)}&limit=1`,
+    );
+    expect(auditResp.status()).toBe(200);
+    const auditText = await auditResp.text();
+    const rows = JSON.parse(auditText).entries as Array<Record<string, unknown>>;
+    expect(rows.length).toBe(1);
+    expect(rows[0].response_status).toBe("error");
+    expect(String(rows[0].error_message ?? "")).not.toBe("");
+    expect(auditText).not.toContain(message);
   });
 });

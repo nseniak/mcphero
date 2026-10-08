@@ -148,6 +148,106 @@ async function runDevStubLogin(
 }
 
 /**
+ * Accept the invitation to ``orgSlug`` as the person ``request`` is
+ * signed in as, then open the org, as the Join button does. Inviting
+ * someone doesn't make them a member: until they accept, they have no
+ * access to the org.
+ */
+export async function acceptInvitation(
+  request: APIRequestContext,
+  orgSlug: string,
+) {
+  const resp = await request.post(
+    `${BACKEND_URL}/api/invitations/${encodeURIComponent(orgSlug)}/accept`,
+  );
+  if (resp.status() !== 200) {
+    throw new Error(
+      `accept invitation failed: ${resp.status()} ${await resp.text()}`,
+    );
+  }
+  const switched = await request.post(
+    `${BACKEND_URL}/api/orgs/${encodeURIComponent(orgSlug)}/switch`,
+  );
+  if (switched.status() !== 204) {
+    throw new Error(
+      `switch after joining failed: ${switched.status()} ${await switched.text()}`,
+    );
+  }
+}
+
+/**
+ * Sign ``request`` in as ``email`` and accept their invitation to
+ * ``orgSlug``. Leaves ``request`` signed in as ``email``.
+ */
+export async function joinAs(
+  request: APIRequestContext,
+  email: string,
+  orgSlug: string,
+) {
+  await apiLoginAs(request, email);
+  await acceptInvitation(request, orgSlug);
+}
+
+/** Everyone the e2e seed lets sign in to the OAuth test upstreams. */
+const OAUTH_SIGN_IN_HOLDERS = [
+  "admin@example.com",
+  "admin2@example.com",
+  "alice@example.com",
+];
+
+/**
+ * Put an OAuth upstream back to "stopped, nobody signed in": the state
+ * that shows Authenticate. The admin Stop keeps every saved sign-in, so
+ * each possible holder signs themselves out first. Leaves ``request``
+ * logged in as admin@example.com.
+ */
+export async function resetOAuthUpstream(
+  request: APIRequestContext,
+  upstreamId: string,
+) {
+  for (const email of OAUTH_SIGN_IN_HOLDERS) {
+    await apiLoginAs(request, email);
+    await request.post(`${BACKEND_URL}/api/auth/disconnect/${upstreamId}`);
+  }
+  await apiLoginAs(request, "admin@example.com");
+  await request.post(
+    `${BACKEND_URL}/api/admin/upstreams/${upstreamId}/disconnect`,
+  );
+}
+
+/**
+ * Start an OAuth upstream with nobody signed in: admin@example.com signs
+ * in through the admin tab (an admin's first sign-in is what starts a
+ * sign-in MCP), then signs out again. Personal sign-ins on /my-tools
+ * are refused while the upstream is stopped, and the e2e seed adds it
+ * stopped. Leaves ``request`` logged in as admin@example.com.
+ */
+export async function startOAuthUpstreamSignedOut(
+  request: APIRequestContext,
+  upstreamId: string,
+) {
+  const admin = "admin@example.com";
+  await apiLoginAs(request, admin);
+  const connect = await request.post(
+    `${BACKEND_URL}/api/admin/upstreams/${upstreamId}/connect`,
+  );
+  if (connect.status() !== 200) {
+    throw new Error(`admin connect failed: ${connect.status()} ${await connect.text()}`);
+  }
+  const body = await connect.json();
+  if (!body.connected) {
+    const authorizeUrl = new URL(body.authorization_url);
+    authorizeUrl.searchParams.set("email", admin);
+    const authorize = await request.get(authorizeUrl.toString(), {
+      maxRedirects: 0,
+    });
+    await request.get(authorize.headers()["location"], { maxRedirects: 0 });
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  await request.post(`${BACKEND_URL}/api/auth/disconnect/${upstreamId}`);
+}
+
+/**
  * Mint a gateway bearer token via the test-only endpoint.
  * Requires MCPOLIS_TEST_MODE=1 on the backend (the e2e harness sets it).
  */

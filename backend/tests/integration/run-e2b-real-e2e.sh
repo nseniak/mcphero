@@ -3,8 +3,9 @@
 #
 # Prepares the project Python env (see run-in-env.sh), resolves the E2B
 # API key (from env if exported, else from ``backend/.env``), and dispatches into
-# ``e2b_real_e2e.py``. Total wall clock is ~3-5 min; the script
-# spends ~$0.05 of E2B compute per run. Integration tests must never
+# ``e2b_real_e2e.py``. Total wall clock is several minutes, mostly
+# idle time waiting for E2B to pause sandboxes; the script spends
+# ~$0.05 of E2B compute per run. Integration tests must never
 # read prod secrets — keep the dev key in ``backend/.env``.
 
 set -euo pipefail

@@ -5,6 +5,10 @@ Each upstream that advertises ``serverInfo.description`` /
 in the gateway's downstream ``instructions`` text — single-org and
 multi-org variants. Long descriptions are truncated at a clean word
 boundary so a single chatty upstream can't dominate the text.
+
+Only the upstreams the caller may use are listed: any signed-in account
+can open a session on ``/mcp/{slug}``, and an outsider (or an invited
+person who has not joined) must not read which MCPs the org runs.
 """
 from __future__ import annotations
 
@@ -12,9 +16,12 @@ from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import pytest
+from mcp.server.auth.middleware.auth_context import auth_context_var
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
 from mcpolis.domain.model.policy import AuthMode, UpstreamAuthConfig
+from mcpolis.domain.model.service_token import ServiceAccessToken
 from mcpolis.domain.model.settings import SettingsConfig
 from mcpolis.domain.model.upstream import (
     HttpTransportConfig,
@@ -28,11 +35,21 @@ from mcpolis.domain.services.org_runtime import OrgRuntime, OrgRuntimeManager
 from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.entrypoints.controllers.gateway_controller import (
+    _MULTI_ORG_INSTRUCTIONS,
     UPSTREAM_DESCRIPTION_TRUNCATION_CHARS,
     _instructions_for_org_with_upstreams,
     _instructions_with_upstreams_multi_org,
     _truncate_at_word_boundary,
+    create_mcp_server,
+    current_org_id,
+    current_user_orgs,
 )
+from tests.unit._state_seed import seed_self_description
+from tests.unit.factories import make_bearer_auth, make_full_access_config
+
+# The caller every helper call below runs as.
+USER = "user@test.com"
+OUTSIDER = "outsider@elsewhere.example"
 
 
 # ─── Builders ──────────────────────────────────────────────────────────
@@ -55,27 +72,51 @@ def make_runtime(
     upstreams_with_descriptions: list[
         tuple[str, str | None, UpstreamSelfDescription | None]
     ],
+    *,
+    config: SettingsConfig | None = None,
 ) -> OrgRuntime:
-    """Build a runtime + seed self-descriptions on its client manager."""
+    """Build a runtime + seed self-descriptions on its client manager.
+    ``config`` defaults to ``USER`` reaching every one of the upstreams."""
     upstreams = [
         make_upstream(uid, display_name=name)
         for uid, name, _ in upstreams_with_descriptions
     ]
     cm = UpstreamClientManager(upstreams)
-    from tests.unit._state_seed import seed_self_description
     for uid, _, sd in upstreams_with_descriptions:
         if sd is not None:
             seed_self_description(cm, uid, sd)
     registry = ToolRegistry(upstreams, cm)
+    if config is None:
+        config = make_full_access_config([u.id for u in upstreams], [USER])
     return OrgRuntime(
         org_id=org_id,
-        policy_engine=PolicyEngine(SettingsConfig()),
+        policy_engine=PolicyEngine(config),
         tool_registry=registry,
         client_manager=cm,
         tool_router=MagicMock(),
         config_service=MagicMock(),
         upstreams=upstreams,
     )
+
+
+def make_described(upstream_id: str, description: str) -> tuple[
+    str, str, UpstreamSelfDescription,
+]:
+    return (
+        upstream_id, upstream_id.title(),
+        UpstreamSelfDescription(
+            name=upstream_id, version="1.0", description=description,
+        ),
+    )
+
+
+def make_service_token_auth(role: str) -> AuthenticatedUser:
+    """The bearer a service token gives a request: its role rides on the
+    ``ServiceAccessToken``, its identity is not in ``config.users``."""
+    return AuthenticatedUser(ServiceAccessToken(
+        token="svct-test", client_id="svc:ci-bot", scopes=[],
+        role_name=role, org_id=DEFAULT_ORG_ID,
+    ))
 
 
 def make_manager(
@@ -125,6 +166,7 @@ def test_single_org_appends_description_for_each_upstream() -> None:
         rm, DEFAULT_ORG_ID,
         base_instructions="BASE",
         name_prefix="",
+        user_id=USER,
     )
     assert "BASE" in out
     assert "Connected upstreams:" in out
@@ -156,6 +198,7 @@ def test_single_org_omits_upstream_with_no_description() -> None:
         rm, DEFAULT_ORG_ID,
         base_instructions="BASE",
         name_prefix="",
+        user_id=USER,
     )
     assert "notion" in out
     assert "mixpanel" not in out
@@ -172,6 +215,7 @@ def test_single_org_returns_base_when_no_descriptions() -> None:
         rm, DEFAULT_ORG_ID,
         base_instructions="BASE",
         name_prefix="",
+        user_id=USER,
     )
     assert out == "BASE"
 
@@ -216,6 +260,7 @@ def test_single_org_truncates_long_descriptions() -> None:
         rm, DEFAULT_ORG_ID,
         base_instructions="BASE",
         name_prefix="",
+        user_id=USER,
     )
     # Ellipsis suffixed when truncated.
     assert "…" in out
@@ -252,7 +297,7 @@ def test_multi_org_groups_each_org_with_slug_prefix() -> None:
     )
     rm = make_manager({org_a.id: runtime_a, org_b.id: runtime_b})
     out = _instructions_with_upstreams_multi_org(
-        rm, [org_a, org_b], base_instructions="BASE",
+        rm, [org_a, org_b], base_instructions="BASE", user_id=USER,
     )
     assert "BASE" in out
     # Slug + upstream id per line.
@@ -265,7 +310,7 @@ def test_multi_org_returns_base_when_no_orgs_have_descriptions() -> None:
     runtime_a = make_runtime(org_a.id, [("notion", "Notion", None)])
     rm = make_manager({org_a.id: runtime_a})
     out = _instructions_with_upstreams_multi_org(
-        rm, [org_a], base_instructions="BASE",
+        rm, [org_a], base_instructions="BASE", user_id=USER,
     )
     assert out == "BASE"
 
@@ -275,10 +320,6 @@ def test_instructions_falls_back_to_multi_org_default_when_user_orgs_none() -> N
     never set, the gateway must fall back to ``_MULTI_ORG_INSTRUCTIONS``
     not blow up. We exercise the wiring by reading the default value.
     """
-    from mcpolis.entrypoints.controllers.gateway_controller import (
-        _MULTI_ORG_INSTRUCTIONS,
-        current_user_orgs,
-    )
     assert current_user_orgs.get() is None
     assert _MULTI_ORG_INSTRUCTIONS  # non-empty fallback
 
@@ -291,13 +332,15 @@ def test_picks_up_upstreams_added_after_runtime_construction() -> None:
     runtime never have their description folded in.
     """
     # Build a runtime with NO upstreams in the frozen list…
-    runtime = make_runtime(DEFAULT_ORG_ID, [])
+    runtime = make_runtime(
+        DEFAULT_ORG_ID, [],
+        config=make_full_access_config(["notion"], [USER]),
+    )
     # …then dynamically register one (mirroring
     # ``UpstreamConfigService.add_upstream``).
     upstream = make_upstream("notion", display_name="Notion")
     runtime.tool_registry.register_upstream(upstream)
     runtime.client_manager.register_upstream(upstream)
-    from tests.unit._state_seed import seed_self_description
     seed_self_description(
         runtime.client_manager, "notion",
         UpstreamSelfDescription(
@@ -310,6 +353,7 @@ def test_picks_up_upstreams_added_after_runtime_construction() -> None:
         rm, DEFAULT_ORG_ID,
         base_instructions="BASE",
         name_prefix="",
+        user_id=USER,
     )
     assert "Search Notion pages." in out
 
@@ -335,6 +379,7 @@ def test_uses_instructions_field_when_description_absent() -> None:
         rm, DEFAULT_ORG_ID,
         base_instructions="BASE",
         name_prefix="",
+        user_id=USER,
     )
     assert "Use this MCP wisely." in out
 
@@ -342,12 +387,8 @@ def test_uses_instructions_field_when_description_absent() -> None:
 @pytest.mark.asyncio
 async def test_init_options_pull_in_upstream_descriptions_for_single_org() -> None:
     """End-to-end: the actual ``create_initialization_options`` path on
-    the gateway server must include the upstream descriptions."""
-    from mcpolis.entrypoints.controllers.gateway_controller import (
-        create_mcp_server,
-        current_org_id,
-    )
-
+    the gateway server must include the upstream descriptions of the
+    caller (the session's bearer)."""
     runtime = make_runtime(
         DEFAULT_ORG_ID,
         [
@@ -361,15 +402,122 @@ async def test_init_options_pull_in_upstream_descriptions_for_single_org() -> No
         ],
     )
     rm = make_manager({DEFAULT_ORG_ID: runtime})
+
+    instructions = make_init_instructions(rm, make_bearer_auth(USER))
+
+    assert "Search Notion pages." in instructions
+
+
+def make_init_instructions(
+    rm: OrgRuntimeManager, auth: AuthenticatedUser,
+) -> str:
+    """The ``instructions`` the gateway's ``initialize`` answers on the
+    default org's URL, for a session opened with the bearer ``auth``."""
     rm.register_display_name(DEFAULT_ORG_ID, "Default")
     rm.register_slug(DEFAULT_ORG_ID, DEFAULT_ORG_ID)
-
     server = create_mcp_server(rm)
     org_token = current_org_id.set(DEFAULT_ORG_ID)
+    auth_token = auth_context_var.set(auth)
     try:
         opts = server.create_initialization_options()
     finally:
+        auth_context_var.reset(auth_token)
         current_org_id.reset(org_token)
-
     assert opts.instructions is not None
-    assert "Search Notion pages." in opts.instructions
+    return opts.instructions
+
+
+# ─── Only the caller's upstreams ──────────────────────────────────────
+
+
+def make_two_upstream_runtime(config: SettingsConfig) -> OrgRuntime:
+    return make_runtime(
+        DEFAULT_ORG_ID,
+        [
+            make_described("notion", "Search Notion pages."),
+            make_described("payroll", "Salaries of every employee."),
+        ],
+        config=config,
+    )
+
+
+def test_lists_only_the_upstreams_the_caller_may_use() -> None:
+    runtime = make_two_upstream_runtime(
+        make_full_access_config(["notion"], [USER]),
+    )
+    rm = make_manager({DEFAULT_ORG_ID: runtime})
+
+    out = _instructions_for_org_with_upstreams(
+        rm, DEFAULT_ORG_ID,
+        base_instructions="BASE", name_prefix="", user_id=USER,
+    )
+
+    assert "Search Notion pages." in out
+    assert "payroll" not in out and "Salaries" not in out
+
+
+def test_an_outsiders_initialize_names_no_upstream_of_the_org() -> None:
+    """Any signed-in account can open a session on the org's URL: one
+    that is not in the org gets the base text only."""
+    runtime = make_two_upstream_runtime(
+        make_full_access_config(["notion", "payroll"], [USER]),
+    )
+    rm = make_manager({DEFAULT_ORG_ID: runtime})
+
+    instructions = make_init_instructions(rm, make_bearer_auth(OUTSIDER))
+
+    assert "Connected upstreams" not in instructions
+    assert "notion" not in instructions and "payroll" not in instructions
+
+
+def test_a_pending_invitation_sees_no_upstream_of_the_org() -> None:
+    """Invited but not joined: no role yet, so no MCP of the org."""
+    config = make_full_access_config(["notion", "payroll"], [USER])
+    runtime = make_runtime(
+        DEFAULT_ORG_ID,
+        [
+            make_described("notion", "Search Notion pages."),
+            make_described("payroll", "Salaries of every employee."),
+        ],
+        config=config,
+    )
+    runtime.policy_engine.set_members([])  # USER has not accepted
+    rm = make_manager({DEFAULT_ORG_ID: runtime})
+
+    instructions = make_init_instructions(rm, make_bearer_auth(USER))
+
+    assert "Connected upstreams" not in instructions
+
+
+def test_a_service_tokens_initialize_lists_its_roles_upstreams() -> None:
+    """A service token's role comes from its bearer, not from the org's
+    users: its session lists that role's upstreams."""
+    runtime = make_two_upstream_runtime(
+        make_full_access_config(["notion"], [], role_name="ci"),
+    )
+    rm = make_manager({DEFAULT_ORG_ID: runtime})
+
+    instructions = make_init_instructions(rm, make_service_token_auth("ci"))
+
+    assert "Search Notion pages." in instructions
+    assert "payroll" not in instructions
+
+
+def test_multi_org_lists_each_org_s_upstreams_the_caller_may_use() -> None:
+    org_a = make_org("acme", "Acme")
+    org_b = make_org("beta", "Beta")
+    runtime_a = make_runtime(
+        org_a.id, [make_described("notion", "Search Notion pages.")],
+    )
+    runtime_b = make_runtime(
+        org_b.id, [make_described("slack", "Send Slack messages.")],
+        config=make_full_access_config(["slack"], ["someone@else.example"]),
+    )
+    rm = make_manager({org_a.id: runtime_a, org_b.id: runtime_b})
+
+    out = _instructions_with_upstreams_multi_org(
+        rm, [org_a, org_b], base_instructions="BASE", user_id=USER,
+    )
+
+    assert "acme__notion (Notion): Search Notion pages." in out
+    assert "slack" not in out

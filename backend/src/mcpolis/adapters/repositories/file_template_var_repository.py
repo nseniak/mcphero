@@ -8,7 +8,6 @@ Persists to ``<data_dir>/template_vars.json`` with the layout::
           "<NAME>": {
             "value": "<plaintext>",
             "is_secret": true,
-            "last_four": "wXY4" | null,
             "created_at": "<iso8601>",
             "updated_at": "<iso8601>"
           }
@@ -33,9 +32,10 @@ from typing import Any
 
 import structlog
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
 from mcpolis.domain.model.template_var import (
     TemplateVarSummary,
-    compute_last_four,
+    make_template_var_summary,
 )
 from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
 
@@ -68,10 +68,9 @@ class FileTemplateVarRepository(TemplateVarRepository):
         self,
         data: dict[str, dict[str, dict[str, dict[str, Any]]]],
     ) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-        tmp.replace(self._path)
+        write_text_atomic(
+            self._path, json.dumps(data, indent=2, sort_keys=True),
+        )
 
     @staticmethod
     def _summary_from_record(
@@ -80,19 +79,13 @@ class FileTemplateVarRepository(TemplateVarRepository):
         # Default ``is_secret=True`` for back-compat with v1 records
         # that pre-date the field.
         is_secret = bool(record.get("is_secret", True))
-        # The list response now carries ``value`` for both kinds —
-        # the UI obfuscates password rows by default and exposes an
-        # eye toggle (1Password-style); reveal stays on the dashboard
-        # API surface (admin-only, encrypted at rest in cloud mode).
         stored_value = record.get("value")
-        value: str | None = (
-            stored_value if isinstance(stored_value, str) else None
-        )
-        return TemplateVarSummary(
+        return make_template_var_summary(
             name=name,
             is_secret=is_secret,
-            value=value,
-            last_four=record.get("last_four"),
+            stored_value=(
+                stored_value if isinstance(stored_value, str) else None
+            ),
             created_at=datetime.fromisoformat(record["created_at"]),
             updated_at=datetime.fromisoformat(record["updated_at"]),
         )
@@ -151,17 +144,15 @@ class FileTemplateVarRepository(TemplateVarRepository):
             record: dict[str, Any] = {
                 "value": value,
                 "is_secret": effective_is_secret,
-                "last_four": compute_last_four(value),
                 "created_at": created_at.isoformat(),
                 "updated_at": now.isoformat(),
             }
             upstream_block[name] = record
             self._write(data)
-            return TemplateVarSummary(
+            return make_template_var_summary(
                 name=name,
                 is_secret=effective_is_secret,
-                value=value,
-                last_four=record["last_four"],
+                stored_value=value,
                 created_at=created_at,
                 updated_at=now,
             )

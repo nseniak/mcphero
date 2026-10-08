@@ -23,6 +23,7 @@ from tests.unit._loopback_mcp import (
     mcp_session_call,
     wait_for_health,
 )
+from tests.unit.factories import make_config_users_accepted
 
 
 def _write_config(tmp_path: Path, upstream_port: int) -> tuple[Path, Path]:
@@ -134,6 +135,7 @@ async def test_end_to_end_tool_discovery_and_call(tmp_path: Path) -> None:
         session_secret="integration-test-secret",
         server_url=f"http://127.0.0.1:{gateway_port}",
     )
+    make_config_users_accepted(tmp_path / "data", config_path.read_text())
     gateway_app = create_app(settings)
     gateway_config = uvicorn.Config(
         gateway_app, host="127.0.0.1", port=gateway_port,
@@ -252,6 +254,7 @@ async def _start_gateway_with_policy(
         session_secret="integration-test-secret",
         server_url=f"http://127.0.0.1:{gateway_port}",
     )
+    make_config_users_accepted(tmp_path / "data", config_path.read_text())
     gateway_app = create_app(settings)
     gateway_server = uvicorn.Server(
         uvicorn.Config(

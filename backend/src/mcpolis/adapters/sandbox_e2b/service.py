@@ -11,8 +11,16 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from enum import Enum
 from typing import TextIO
 
 import anyio
@@ -40,6 +48,11 @@ from mcpolis.adapters.sandbox_e2b.template_grid import (
 )
 from datetime import datetime, timezone
 
+from mcpolis.domain.services.background_tasks import BackgroundTaskSet
+from mcpolis.domain.services.cancel_shield import (
+    TimeLimit,
+    finish_despite_cancels,
+)
 from mcpolis.domain.services.exit_reason import ExitReason
 from mcpolis.domain.services.sandbox_path import confine_to_sandbox_home
 from mcpolis.domain.services.stdout_framing import BoundedLineBuffer
@@ -76,6 +89,144 @@ VOLUME_METADATA_KEY: str = "e2b_volume_id"
 # rather than configurable because there's no concrete user need for
 # multi-mount and the simpler API is easier to reason about.
 PERSISTENT_VOLUME_MOUNT_PATH: str = "/data"
+
+# Metadata key recording, in the persisted ref, the ``mcpolis_instance``
+# tag the sandbox was created with. E2B metadata is fixed at create time
+# and the boot reconcile lists sandboxes by the current tag only, so a
+# sandbox carrying any other tag is invisible to it. Reusing one would
+# hide it for good (see ``_try_reconnect``).
+SANDBOX_INSTANCE_METADATA_KEY: str = "e2b_sandbox_instance"
+
+# Metadata key listing (space-separated) the volumes of a removed
+# upstream whose destroy failed. Never mounted: an upstream added again
+# under the same id gets a volume of its own. The boot reconcile and a
+# later removal of the same id retry the destroys. Nothing else points
+# at those volumes (E2B has no listing we use), so the ref keeps them.
+VOLUMES_TO_DESTROY_METADATA_KEY: str = "e2b_volumes_to_destroy"
+
+# Metadata key listing (space-separated) the sandboxes whose kill failed
+# when nothing else would name them any more: a removed upstream's (an
+# org deletion's too), and the ones the fresh-sandboxes override could
+# not kill. Never reused. The boot reconcile kills them by id, whatever
+# instance tag they carry, and a later removal of the same id retries
+# them too. A sandbox made before the instance id became one value per
+# database carries a tag the reconcile does not list, so this ref is the
+# only thing that still names it.
+SANDBOXES_TO_KILL_METADATA_KEY: str = "e2b_sandboxes_to_kill"
+
+
+def volumes_to_destroy(ref: SandboxPersistedRef) -> list[str]:
+    """The volumes a removal of ``ref``'s upstream could not destroy yet."""
+    return ref.metadata.get(VOLUMES_TO_DESTROY_METADATA_KEY, "").split()
+
+
+def sandboxes_to_kill(ref: SandboxPersistedRef) -> list[str]:
+    """The sandboxes whose kill failed once nothing else would name them
+    (see ``SANDBOXES_TO_KILL_METADATA_KEY``)."""
+    return ref.metadata.get(SANDBOXES_TO_KILL_METADATA_KEY, "").split()
+
+
+def leftovers(
+    *, volumes: Sequence[str], sandboxes: Sequence[str],
+) -> dict[str, str]:
+    """The metadata a ref keeps for what is still to clean up: the
+    volumes still to destroy and the sandboxes still to kill, each once."""
+    metadata: dict[str, str] = {}
+    if volumes:
+        metadata[VOLUMES_TO_DESTROY_METADATA_KEY] = " ".join(
+            dict.fromkeys(volumes),
+        )
+    if sandboxes:
+        metadata[SANDBOXES_TO_KILL_METADATA_KEY] = " ".join(
+            dict.fromkeys(sandboxes),
+        )
+    return metadata
+
+
+def without_sandbox(
+    ref: SandboxPersistedRef, metadata: dict[str, str],
+) -> SandboxPersistedRef | None:
+    """``ref`` with no sandbox, process or cached server metadata left,
+    keeping only ``metadata``; ``None`` when that is empty: nothing is
+    left that needs a ref."""
+    if not metadata:
+        return None
+    return SandboxPersistedRef(
+        provider=ref.provider,
+        org_id=ref.org_id,
+        upstream_id=ref.upstream_id,
+        mcpolis_instance=ref.mcpolis_instance,
+        sandbox_id=None,
+        paused_snapshot_id=None,
+        pid=None,
+        metadata=metadata,
+        cached_server_info=None,
+        cached_self_description=None,
+        last_updated=datetime.now(tz=timezone.utc),
+    )
+
+
+def storage_only(
+    ref: SandboxPersistedRef, *, also_to_kill: Sequence[str] = (),
+) -> SandboxPersistedRef | None:
+    """What of ``ref`` outlives its sandbox: the persistent volume the
+    upstream mounts (its ``/data``, reattached by the next fresh create),
+    the volumes still to destroy and the sandboxes still to kill, with
+    ``also_to_kill`` added to those. ``None`` when it records none."""
+    mounted = ref.metadata.get(VOLUME_METADATA_KEY)
+    metadata = {VOLUME_METADATA_KEY: mounted} if mounted else {}
+    metadata.update(leftovers(
+        volumes=volumes_to_destroy(ref),
+        sandboxes=[*sandboxes_to_kill(ref), *also_to_kill],
+    ))
+    return without_sandbox(ref, metadata)
+
+
+def with_leftovers_gone(
+    ref: SandboxPersistedRef,
+    *,
+    volumes: Collection[str] = (),
+    sandboxes: Collection[str] = (),
+) -> SandboxPersistedRef | None:
+    """``ref`` once the ``volumes`` are destroyed and the ``sandboxes``
+    killed: no longer listed as still to clean up, the rest untouched.
+    ``None`` when nothing at all is left on it."""
+    metadata = {
+        key: value for key, value in ref.metadata.items()
+        if key not in (
+            VOLUMES_TO_DESTROY_METADATA_KEY, SANDBOXES_TO_KILL_METADATA_KEY,
+        )
+    }
+    metadata.update(leftovers(
+        volumes=[v for v in volumes_to_destroy(ref) if v not in volumes],
+        sandboxes=[s for s in sandboxes_to_kill(ref) if s not in sandboxes],
+    ))
+    if (
+        not metadata
+        and ref.sandbox_id is None
+        and ref.paused_snapshot_id is None
+        and ref.cached_server_info is None
+        and ref.cached_self_description is None
+    ):
+        return None
+    return ref.model_copy(update={
+        "metadata": metadata,
+        "last_updated": datetime.now(tz=timezone.utc),
+    })
+
+
+class _KeepRef(Enum):
+    """``_try_reconnect`` reused nothing, and the fresh sandbox must not
+    be recorded over the ref: it names an older sandbox whose kill
+    failed, which nothing else can reach."""
+
+    KEEP_REF = "keep_ref"
+
+
+# How long a session teardown, or a failed create, waits for its sandbox
+# kill, cancels or not. One E2B API call, normally well under a second;
+# the SDK's own request timeout is 60 s.
+SANDBOX_KILL_TIMEOUT_SECONDS: float = 30.0
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
@@ -120,6 +271,108 @@ _DOCKER_READY_CONSECUTIVE = 3
 # the manual fallback below still gets the full budget afterwards.
 _DOCKER_ADOPT_MAX_POLLS = 60  # 60 × 0.5 s = 30 s budget
 
+# Cap on the error text logged when a process's output stream raises.
+# SDK messages can carry a whole response body; the log line only
+# needs the type and the first words of the reason.
+_STREAM_ERROR_MAX_CHARS = 500
+# How many links of the ``__cause__`` / ``__context__`` chain to name.
+# ``_wrap_sdk_error`` keeps only the SDK class and message, and network
+# errors often have an empty message, so the useful reason is usually
+# one or two links down.
+_STREAM_ERROR_CHAIN_DEPTH = 3
+
+
+def _describe_one_error(exc: BaseException) -> str:
+    try:
+        message = str(exc)
+    except Exception:
+        message = ""
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
+def _describe_stream_error(exc: BaseException) -> str:
+    """One bounded line naming why a process's output stream raised,
+    with up to two underlying causes joined by `` <- ``. Never raises:
+    it runs inside the watcher's ``except``, ahead of the bookkeeping
+    every stream death must complete."""
+    parts: list[str] = []
+    current: BaseException | None = exc
+    while current is not None and len(parts) < _STREAM_ERROR_CHAIN_DEPTH:
+        parts.append(_describe_one_error(current))
+        current = current.__cause__ or current.__context__
+    return " <- ".join(parts)[:_STREAM_ERROR_MAX_CHARS]
+
+
+async def _clean_up_each(
+    ids: Sequence[str],
+    clean_up: Callable[[str], Awaitable[None]],
+    *,
+    id_field: str,
+    events: tuple[str, str, str],
+    org_id: str,
+    upstream_id: str,
+) -> list[str]:
+    """Run ``clean_up`` once on each of ``ids``; return the ones it
+    failed on, to retry later. One already gone (deleted in the E2B
+    dashboard, an earlier partial teardown) counts as done. ``events``
+    name the log lines: done, already gone, failed."""
+    done_event, gone_event, failed_event = events
+    left: list[str] = []
+    for item_id in dict.fromkeys(ids):
+        fields = {"org_id": org_id, "upstream_id": upstream_id, id_field: item_id}
+        try:
+            await clean_up(item_id)
+            logger.info(done_event, **fields)
+        except E2BNotFoundError:
+            logger.info(gone_event, **fields)
+        except E2BSDKError:
+            logger.warning(failed_event, exc_info=True, **fields)
+            left.append(item_id)
+    return left
+
+
+async def destroy_volumes(
+    client: E2BClient,
+    volume_ids: Sequence[str],
+    *,
+    org_id: str,
+    upstream_id: str,
+) -> list[str]:
+    """Destroy each of ``volume_ids`` (a removed upstream's); return the
+    ones whose destroy failed, to retry later."""
+    return await _clean_up_each(
+        volume_ids, client.destroy_volume,
+        id_field="volume_id",
+        events=(
+            "sandbox.e2b.volume.destroyed",
+            "sandbox.e2b.volume.destroy_not_found",
+            "sandbox.e2b.volume.destroy_failed",
+        ),
+        org_id=org_id, upstream_id=upstream_id,
+    )
+
+
+async def kill_sandboxes(
+    client: E2BClient,
+    sandbox_ids: Sequence[str],
+    *,
+    org_id: str,
+    upstream_id: str,
+) -> list[str]:
+    """Kill each of ``sandbox_ids`` by id, whatever instance tag it
+    carries (a removed upstream's, see ``SANDBOXES_TO_KILL_METADATA_KEY``);
+    return the ones whose kill failed, to retry later."""
+    return await _clean_up_each(
+        sandbox_ids, client.kill_sandbox,
+        id_field="sandbox_id",
+        events=(
+            "sandbox.e2b.leftover_sandbox.killed",
+            "sandbox.e2b.leftover_sandbox.already_gone",
+            "sandbox.e2b.leftover_sandbox.kill_failed",
+        ),
+        org_id=org_id, upstream_id=upstream_id,
+    )
+
 
 class E2BSandboxService:
     """SandboxService backed by E2B."""
@@ -136,9 +389,17 @@ class E2BSandboxService:
         persistence: SandboxPersistenceRepository | None = None,
         volumes_enabled: bool = False,
         reuse_sandboxes_on_restart: bool = False,
+        kill_timeout_seconds: float = SANDBOX_KILL_TIMEOUT_SECONDS,
     ) -> None:
         self._client = client
         self._mcpolis_instance = mcpolis_instance
+        self._kill_timeout_seconds = kill_timeout_seconds
+        # Kills still running when their wait gave up: held until they
+        # end, so Python cannot collect one halfway.
+        self._overdue_kills = BackgroundTaskSet()
+        # Set by the first ``_session_cm``. After that the instance id
+        # is on sandboxes and refs, so it may no longer change.
+        self._sessions_started = False
         self._grid = template_grid or E2BTemplateGrid()
         self._on_timeout_seconds = on_timeout_seconds
         # Persistence handles two pieces of provider-side state per
@@ -197,6 +458,13 @@ class E2BSandboxService:
         # :meth:`mark_all_active_sessions_preserve_on_close`); cleared
         # in the ``_session_cm`` finally block as the session exits.
         self._preserve_on_close: dict[str, bool] = {}
+        # Set once by ``mark_all_active_sessions_preserve_on_close``
+        # (the shutdown cleanup) and never cleared: every session that
+        # closes afterwards is preserved, including one a connect still
+        # in flight registers after the mark. Without it that late
+        # session was killed and its ref deleted, where the old
+        # SIGKILL-on-deploy left both alone.
+        self._shutting_down = False
         # session_id → (org_id, upstream_id) for sessions that wrote a
         # persistence ref via ``_persist_live_ref``. Lets the finally
         # block delete the now-stale ref when killing the sandbox so
@@ -324,6 +592,7 @@ class E2BSandboxService:
         extra_env: dict[str, str] | None,
         materialize_files: Sequence[MaterializeFile] | None = None,
     ) -> AsyncIterator[SandboxSession]:
+        self._sessions_started = True
         cfg = upstream.stdio
         if cfg is None:
             raise ValueError(
@@ -483,8 +752,9 @@ class E2BSandboxService:
         argv = [cfg.command, *list(cfg.args)]
         # Acquire the (sandbox, process) pair: reuse a persisted
         # sandbox if reuse-on-restart is enabled, else fresh-create.
-        # Either way the process is new and its pid is persisted below.
-        sandbox, process = await self._acquire_session_handles(
+        # Either way the process is new and its pid is persisted below,
+        # unless the ref must keep naming an older sandbox (``record``).
+        sandbox, process, record = await self._acquire_session_handles(
             session_id=session_id,
             org_id=org_id,
             upstream=upstream,
@@ -507,11 +777,17 @@ class E2BSandboxService:
         # this isn't an explicit-pause/resume flow (resume_from gets
         # its own persistence path on pause()). Always written: every
         # path yields a new pid, so a skipped write would leave the ref
-        # pointing at a process that no longer exists.
+        # pointing at a process that no longer exists. The one exception
+        # (``record`` False): the ref names an older sandbox only it can
+        # reach, whose kill failed (see ``_try_reconnect``). This session
+        # then goes unrecorded: a reopen does not keep its sandbox
+        # (``preserve_sessions_for_upstream`` goes by the recorded owner),
+        # and one a shutdown keeps is an orphan the next boot reconciles.
         if (
             self._reuse_sandboxes_on_restart
             and resume_from is None
             and self._persistence is not None
+            and record
         ):
             try:
                 await self._persist_live_ref(
@@ -563,6 +839,11 @@ class E2BSandboxService:
             # an operator cannot tell "sandboxes are pausing more" from
             # "sessions are being restarted more".
             cause = "severed"
+            # Why the stream ended when it RAISED rather than returned.
+            # Sentry MCPOLIS-BACKEND-1E: a fresh process on a woken
+            # sandbox lost its stream 5 ms after start, and with this
+            # swallowed nothing said why.
+            stream_error: str | None = None
             try:
                 exit_code = await p.wait()
             except asyncio.CancelledError:
@@ -570,14 +851,14 @@ class E2BSandboxService:
                 # purpose. Re-raised below after the bookkeeping.
                 cause = "closed"
                 raise
-            except BaseException:
+            except BaseException as exc:
                 # Any exception out of wait() also means the events
                 # stream is no longer delivering — fold it into the
                 # same dead-stream signal so the pump retires the
                 # process and hands off to a session rebuild.
                 # ``exit_code`` stays ``None``; the snapshot will
                 # report "exited (code unknown)".
-                pass
+                stream_error = _describe_stream_error(exc)
             finally:
                 # ``mark_exited`` is no-op after the first call, so
                 # a later observation can't overwrite a real
@@ -592,6 +873,7 @@ class E2BSandboxService:
                     session_id=session_id,
                     exit_code=exit_code,
                     cause=cause,
+                    stream_error=stream_error,
                 )
                 # Declare the transport dead HERE, not when something
                 # next tries to write. E2B's pause severs the streaming
@@ -766,7 +1048,13 @@ class E2BSandboxService:
             self._live_sandboxes.pop(session_id, None)
             was_paused = session_id in self._paused_sessions
             self._paused_sessions.discard(session_id)
-            preserve = self._preserve_on_close.pop(session_id, False)
+            # A shutdown keeps the sandbox for the next boot to reuse.
+            # With reuse off nothing would ever look for it again, so it
+            # is killed like on any other close.
+            preserve = (
+                self._preserve_on_close.pop(session_id, False)
+                or (self._shutting_down and self._reuse_sandboxes_on_restart)
+            )
             owner = self._session_owners.pop(session_id, None)
 
             await write_stream.aclose()
@@ -795,8 +1083,7 @@ class E2BSandboxService:
             except (asyncio.CancelledError, Exception):
                 pass
 
-            # Skip the destructive cleanup (process.kill +
-            # sandbox.kill) in two cases:
+            # Skip the sandbox kill in two cases:
             #
             # 1. ``was_paused`` — the session called ``pause()``
             #    explicitly. The snapshot is the new state; killing
@@ -815,51 +1102,30 @@ class E2BSandboxService:
             # don't leave them lingering once the user signals
             # they're done.
             #
-            # Always release the streaming RPC even when skipping
-            # kill — the underlying httpx generator needs a
-            # controlled close (see the post-reattach release
-            # comment block in the stdin pump for the
-            # GC-vs-__aexit__ race rationale).
-            try:
-                await process.release()
-            except E2BSDKError:
-                logger.warning(
-                    "sandbox.e2b.process.release_failed", exc_info=True,
-                )
+            # The streaming RPC is released either way, the kill first:
+            # the underlying httpx generator needs a controlled close
+            # (see the post-reattach release comment block in the
+            # stdin pump for the GC-vs-__aexit__ race rationale).
             should_kill = not was_paused and not preserve
-            if should_kill:
-                # Drop the now-stale persistence ref BEFORE the kill
-                # so a crash mid-teardown can't leave a ref pointing
-                # at a dead sandbox id (which the next boot reconnect
-                # would waste an E2B API call on before falling
-                # through to fresh-create).
-                if owner is not None and self._persistence is not None:
-                    owner_org_id, owner_upstream_id = owner
-                    try:
-                        await self._persistence.delete(
-                            org_id=owner_org_id,
-                            upstream_id=owner_upstream_id,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "sandbox.e2b.persistence.delete_on_kill_failed",
-                            org_id=owner_org_id,
-                            upstream_id=owner_upstream_id,
-                            exc_info=True,
-                        )
-                try:
-                    await process.kill()
-                except E2BSDKError:
-                    logger.warning(
-                        "sandbox.e2b.process.kill_failed", exc_info=True,
+            try:
+                if should_kill:
+                    # ``close()`` cancels this task once CLOSE_TIMEOUT
+                    # (10 s) has passed, and a wedged MCP, whose close
+                    # is slow, is exactly what an admin stops. The kill
+                    # is carried through that cancel, which then goes on.
+                    await self._finish_despite_cancels(
+                        self._kill_closed_session_sandbox(
+                            session_id=session_id,
+                            sandbox=sandbox,
+                            process=process,
+                            owner=owner,
+                        ),
+                        sandbox_id=sandbox.sandbox_id,
                     )
-                try:
-                    await sandbox.kill()
-                except E2BSDKError:
-                    logger.warning(
-                        "sandbox.e2b.sandbox.kill_failed", exc_info=True,
-                    )
-            await read_stream.aclose()
+                else:
+                    await self._release_process(process)
+            finally:
+                await read_stream.aclose()
 
     async def _acquire_session_handles(
         self,
@@ -875,8 +1141,8 @@ class E2BSandboxService:
         on_stdout: "Callable[[bytes], Awaitable[None] | None]",
         on_stderr: "Callable[[bytes], Awaitable[None] | None]",
         materialize_files: Sequence[MaterializeFile] | None = None,
-    ) -> tuple[E2BSandboxHandle, E2BProcessHandle]:
-        """Return ``(sandbox, process)`` for a session.
+    ) -> tuple[E2BSandboxHandle, E2BProcessHandle, bool]:
+        """Return ``(sandbox, process, record)`` for a session.
 
         Three paths:
 
@@ -904,10 +1170,10 @@ class E2BSandboxService:
         downloading the MCP's package (7-22 s in production) and that
         cache lives on the sandbox filesystem, which survives.
 
-        Returns ``(sandbox, process)``. The old third element,
-        ``was_reconnect``, is gone: it existed so the caller could skip
-        re-persisting the ref on a reattach, and every path now yields
-        a new pid that must be persisted.
+        Every path yields a new pid that must be persisted. ``record``
+        is False only when (2) left the ref naming an older sandbox whose
+        kill failed (``_KeepRef``): the fresh sandbox of (3) must not be
+        recorded over it.
         """
         # Path 1: explicit-pause resume. Existing flow, unchanged.
         if resume_from is not None:
@@ -924,11 +1190,12 @@ class E2BSandboxService:
                 argv, env=merged_env,
                 on_stdout=on_stdout, on_stderr=on_stderr,
             )
-            return sandbox, process
+            return sandbox, process, True
 
         # Path 2: reuse-on-restart — try reconnect to a persisted
         # live ref. Only fires when the operator has opted in AND
         # persistence is wired AND a recoverable ref exists.
+        record = True
         if (
             self._reuse_sandboxes_on_restart
             and self._persistence is not None
@@ -943,7 +1210,7 @@ class E2BSandboxService:
                 on_stderr=on_stderr,
                 materialize_files=materialize_files,
             )
-            if reconnect is not None:
+            if isinstance(reconnect, tuple):
                 logger.info(
                     "sandbox.e2b.reconnect.ok",
                     session_id=session_id,
@@ -952,27 +1219,19 @@ class E2BSandboxService:
                     sandbox_id=reconnect[0].sandbox_id,
                     pid=reconnect[1].pid,
                 )
-                return reconnect[0], reconnect[1]
+                return reconnect[0], reconnect[1], True
+            record = reconnect is not _KeepRef.KEEP_REF
 
         # Path 3: fresh create. The default flow.
         #
-        # Persist a "creating" marker BEFORE create_sandbox makes the
-        # sandbox provider-visible, so a reconcile racing into the
-        # create/persist window recognizes the sandbox as actively-managed
-        # and leaves it alone (SBX-CONC-4). The marker only matters when
-        # persistence + reuse is wired (the reconciler runs only then);
-        # ``session()`` overwrites it with the real ref via
-        # ``_persist_live_ref`` once create succeeds. On any failure here
-        # we restore the prior ref / drop the marker so a later reconcile
-        # can reap the leaked sandbox.
-        write_marker = (
-            self._reuse_sandboxes_on_restart and self._persistence is not None
-        )
-        prior_ref: SandboxPersistedRef | None = None
-        if write_marker:
-            prior_ref = await self._persist_creating_marker(
-                org_id=org_id, upstream=upstream,
-            )
+        # Nothing is persisted until the create succeeds (``session()``
+        # then writes the live ref). A start cut short by a crash leaves
+        # a sandbox no ref points at, which the next boot's reconcile
+        # kills. A "creating" marker used to be written here to stop a
+        # reconcile from killing the sandbox of a start in flight; the
+        # reconcile only runs at boot, before any start, so every marker
+        # it found was a dead process's and kept that process's sandbox
+        # alive for good.
         created: E2BSandboxHandle | None = None
         try:
             sandbox = await self._open_sandbox(
@@ -1007,26 +1266,21 @@ class E2BSandboxService:
                 on_stdout=on_stdout, on_stderr=on_stderr,
             )
         except BaseException:
-            try:
+            if created is not None:
                 # The sandbox exists but the MCP never started in it (a
                 # file failed to copy, the docker daemon or the command
-                # failed to start). Nothing else knows its id, so kill it
-                # here, or it runs, then sits paused, until the next
+                # failed to start, or this start was cancelled). Nothing
+                # else knows its id, so kill it here, through a cancel
+                # too, or it runs, then sits paused, until the next
                 # boot's reconcile.
-                if created is not None:
-                    await self._kill_stranded_sandbox(
+                await self._finish_despite_cancels(
+                    self._kill_stranded_sandbox(
                         created, upstream_id=upstream.id,
-                    )
-            finally:
-                # Even if the kill is cut short (a shutdown cancels
-                # everything): a leftover "creating" marker would hide the
-                # sandbox from the reconcile and lose the ref it replaced.
-                if write_marker:
-                    await self._restore_or_clear_creating_marker(
-                        org_id=org_id, upstream=upstream, prior=prior_ref,
-                    )
+                    ),
+                    sandbox_id=created.sandbox_id,
+                )
             raise
-        return sandbox, process
+        return sandbox, process, record
 
     async def _kill_stranded_sandbox(
         self, sandbox: E2BSandboxHandle, *, upstream_id: str,
@@ -1048,6 +1302,166 @@ class E2BSandboxService:
                 upstream_id=upstream_id,
                 sandbox_id=sandbox.sandbox_id,
             )
+
+    async def _kill_closed_session_sandbox(
+        self,
+        *,
+        session_id: str,
+        sandbox: E2BSandboxHandle,
+        process: E2BProcessHandle,
+        owner: tuple[str, str] | None,
+    ) -> None:
+        """Kill a closed session's sandbox, then forget its ref.
+
+        The sandbox kill ends every process in it, so the MCP process is
+        not killed on its own. That kill went through envd first, which
+        is exactly what hangs (60 s SDK timeout) when an admin stops a
+        wedged MCP, and the sandbox kill behind it was then cut short.
+
+        The ref is deleted only once the kill went through. Deleted
+        first, a kill that failed or was cut short left a sandbox nothing
+        pointed at: Stop's second chance (``kill_persisted_session``)
+        found no ref, and the sandbox paused and stayed. Kept, the ref
+        lets that second chance retry the kill.
+        """
+        try:
+            await sandbox.kill()
+        except E2BNotFoundError:
+            pass  # Already gone: the end state wanted.
+        except (E2BSDKError, OSError):
+            logger.warning(
+                "sandbox.e2b.sandbox.kill_failed",
+                session_id=session_id,
+                sandbox_id=sandbox.sandbox_id,
+                exc_info=True,
+            )
+            await self._release_process(process)
+            return
+        if owner is not None:
+            owner_org_id, owner_upstream_id = owner
+            await self._forget_ref(
+                org_id=owner_org_id,
+                upstream_id=owner_upstream_id,
+                sandbox_id=sandbox.sandbox_id,
+            )
+        await self._release_process(process)
+
+    async def _release_process(self, process: E2BProcessHandle) -> None:
+        """Close the streaming RPC behind ``process`` without killing
+        the process (see ``E2BProcessHandle.release``)."""
+        try:
+            await process.release()
+        except E2BSDKError:
+            logger.warning(
+                "sandbox.e2b.process.release_failed", exc_info=True,
+            )
+
+    async def _forget_ref(
+        self, *, org_id: str, upstream_id: str, sandbox_id: str,
+    ) -> None:
+        """Forget ``sandbox_id`` in the ref of ``(org, upstream)`` if the
+        ref still points at it. A newer session may have written its own
+        ref while this one was being killed; that ref must stay.
+
+        The upstream's persistent volume is kept (``storage_only``): the
+        whole ref used to go, so the next Start provisioned a new, empty
+        volume and the old one was never destroyed, not even when the
+        upstream was removed."""
+        if self._persistence is None:
+            return
+        try:
+            ref = await self._persistence.get(
+                org_id=org_id, upstream_id=upstream_id,
+            )
+        except Exception:
+            logger.warning(
+                "sandbox.e2b.persistence.delete_on_kill_failed",
+                org_id=org_id,
+                upstream_id=upstream_id,
+                exc_info=True,
+            )
+            return
+        if ref is not None and ref.sandbox_id == sandbox_id:
+            await self._keep_only_storage(
+                ref, failure_event="sandbox.e2b.persistence.delete_on_kill_failed",
+            )
+
+    async def _keep_only_storage(
+        self,
+        ref: SandboxPersistedRef,
+        *,
+        failure_event: str,
+        also_to_kill: Sequence[str] = (),
+    ) -> bool:
+        """Rewrite ``ref`` once its sandbox is gone, or listed in
+        ``also_to_kill`` as one still to kill: only what outlives the
+        sandbox stays (``storage_only``), or the ref goes when that is
+        nothing. Returns whether the write went through; a failure is
+        logged as ``failure_event``."""
+        assert self._persistence is not None  # every caller read ``ref`` there
+        kept = storage_only(ref, also_to_kill=also_to_kill)
+        try:
+            if kept is not None:
+                await self._persistence.upsert(kept)
+            else:
+                await self._persistence.delete(
+                    org_id=ref.org_id, upstream_id=ref.upstream_id,
+                )
+        except Exception:
+            logger.warning(
+                failure_event,
+                org_id=ref.org_id,
+                upstream_id=ref.upstream_id,
+                exc_info=True,
+            )
+            return False
+        return True
+
+    async def _finish_despite_cancels(
+        self, work: Coroutine[object, object, None], *, sandbox_id: str,
+    ) -> None:
+        """Await ``work``, a sandbox kill and what follows it, to its
+        end even if this task is cancelled meanwhile; then re-raise the
+        first cancel that arrived.
+
+        A kill cut half-way leaves a sandbox running that nothing else
+        knows about. ``work`` runs in a task of its own
+        (``finish_despite_cancels``), which neither a native
+        ``Task.cancel()`` (``close()`` giving up after ``CLOSE_TIMEOUT``,
+        a shutdown) nor an anyio cancel scope reaches. Only this call
+        holds it, so a shutdown that refuses new jobs still lets it run.
+
+        Bounded by ``kill_timeout_seconds``, cancelled or not: a kill
+        still running then is cancelled and left to unwind on its own
+        (held by ``_overdue_kills``), so a hung E2B API cannot hold the
+        caller forever. A failure is logged, never raised: the caller is
+        already closing or failing.
+        """
+
+        def report_timeout() -> None:
+            logger.warning(
+                "sandbox.e2b.kill_timed_out",
+                sandbox_id=sandbox_id,
+                timeout_seconds=self._kill_timeout_seconds,
+            )
+
+        def report_failure(failure: BaseException) -> None:
+            logger.warning(
+                "sandbox.e2b.kill_cleanup_failed",
+                sandbox_id=sandbox_id,
+                exc_info=failure,
+            )
+
+        await finish_despite_cancels(
+            work,
+            held_by=None,
+            time_limit=TimeLimit(
+                self._kill_timeout_seconds,
+                on_cut=report_timeout,
+                cut_work_held_by=self._overdue_kills,
+            ),
+            on_failure=report_failure,
+        )
 
     def _resolve_template(
         self,
@@ -1092,13 +1506,14 @@ class E2BSandboxService:
         on_stdout: "Callable[[bytes], Awaitable[None] | None]",
         on_stderr: "Callable[[bytes], Awaitable[None] | None]",
         materialize_files: Sequence[MaterializeFile] | None = None,
-    ) -> tuple[E2BSandboxHandle, E2BProcessHandle] | None:
+    ) -> tuple[E2BSandboxHandle, E2BProcessHandle] | _KeepRef | None:
         """Reuse a persisted sandbox, but never its MCP process.
 
         Returns ``(sandbox, process)`` on success, ``None`` on any
-        miss/failure (caller falls back to fresh create). Logs the
-        specific reason for the miss so operators can diagnose
-        unexpected fresh-creates.
+        miss/failure (caller falls back to fresh create), and
+        ``_KeepRef.KEEP_REF`` for the one miss whose ref the fresh
+        create must not overwrite. Logs the specific reason for the
+        miss so operators can diagnose unexpected fresh-creates.
 
         The sandbox is reconnected (keeping its warm filesystem and
         package cache, which is where nearly all of a cold start's
@@ -1141,6 +1556,39 @@ class E2BSandboxService:
                 paused_snapshot_id=ref.paused_snapshot_id,
             )
             return None
+        # Only a sandbox carrying the current instance tag is reused.
+        # The boot reconcile lists sandboxes by that tag, and E2B fixes a
+        # sandbox's metadata at create, so one carrying any other tag
+        # (created before the tag became one value per database) stays
+        # invisible to it: reused, it would leak for good the day its ref
+        # goes. A ref that does not record the tag predates this check
+        # and is not reused either.
+        sandbox_instance = ref.metadata.get(SANDBOX_INSTANCE_METADATA_KEY)
+        if sandbox_instance != self._mcpolis_instance:
+            logger.info(
+                "sandbox.e2b.reconnect.other_instance",
+                org_id=org_id, upstream_id=upstream.id,
+                sandbox_id=ref.sandbox_id,
+                sandbox_instance=sandbox_instance,
+                mcpolis_instance=self._mcpolis_instance,
+                fallback="fresh_create",
+            )
+            # The fresh create overwrites this ref, after which nothing
+            # points at that sandbox and no reconcile can see it.
+            if await self._kill_stale_sandbox(sandbox_id=ref.sandbox_id):
+                return None
+            # The kill failed. Overwritten, the ref would lose that
+            # sandbox for good (paused, on the account), so the ref keeps
+            # naming it and the fresh sandbox goes unrecorded: the next
+            # reopen, Stop or removal retries the kill from the ref. The
+            # other misses below kill a sandbox carrying the current tag,
+            # which the next boot's reconcile finds if its kill failed.
+            logger.warning(
+                "sandbox.e2b.reconnect.other_instance_kept",
+                org_id=org_id, upstream_id=upstream.id,
+                sandbox_id=ref.sandbox_id,
+            )
+            return _KeepRef.KEEP_REF
         # Sandbox reuse is unconditional: we reuse whatever sandbox is
         # alive regardless of whether the live config changed since it
         # was created. The old config-hash gate was removed because it
@@ -1177,6 +1625,9 @@ class E2BSandboxService:
                 to_template=wanted_template,
                 fallback="fresh_create",
             )
+            # The fresh create overwrites this ref, after which nothing
+            # points at the old-size sandbox: kill it now or it leaks.
+            await self._kill_stale_sandbox(sandbox_id=ref.sandbox_id)
             return None
 
         # Try the actual reconnect.
@@ -1188,6 +1639,10 @@ class E2BSandboxService:
                 org_id=org_id, upstream_id=upstream.id,
                 sandbox_id=ref.sandbox_id, error=str(exc),
             )
+            # Usually the sandbox is already gone (a no-op kill). If it
+            # is only unreachable, the fresh create is about to
+            # overwrite the ref that points at it, so kill it too.
+            await self._kill_stale_sandbox(sandbox_id=ref.sandbox_id)
             return None
         # Re-apply our configured idle timeout — connect_sandbox
         # implicitly sets the SDK default (300 s) on auto_resume,
@@ -1290,7 +1745,7 @@ class E2BSandboxService:
         *,
         sandbox_id: str,
         sandbox: E2BSandboxHandle | None = None,
-    ) -> None:
+    ) -> bool:
         """Best-effort kill of a stale sandbox during reconnect recovery.
 
         Used by :meth:`_try_reconnect` when the respawn fails: we
@@ -1300,18 +1755,28 @@ class E2BSandboxService:
 
         Always best-effort — a failure here can't block the caller's
         fresh-create path. The reconciler is the eventual-consistency
-        net for any sandbox that survives the kill attempt.
+        net for any sandbox that survives the kill attempt and carries
+        the current instance tag. Returns whether the sandbox is gone
+        (killed, or already gone).
         """
         try:
             if sandbox is not None:
                 await sandbox.kill()
             else:
                 await self._client.kill_sandbox(sandbox_id)
+        except E2BNotFoundError:
+            # Usual after a failed reconnect: the sandbox is gone.
+            logger.info(
+                "sandbox.e2b.reconnect.stale_already_gone",
+                sandbox_id=sandbox_id,
+            )
         except E2BSDKError:
             logger.warning(
                 "sandbox.e2b.reconnect.stale_kill_failed",
                 sandbox_id=sandbox_id, exc_info=True,
             )
+            return False
+        return True
 
     async def _persist_live_ref(
         self,
@@ -1343,6 +1808,9 @@ class E2BSandboxService:
         )
         if template is not None:
             merged_metadata["e2b_template"] = template
+        # The sandbox carries the current tag: a fresh create tags it so,
+        # and ``_try_reconnect`` reuses no other.
+        merged_metadata[SANDBOX_INSTANCE_METADATA_KEY] = self._mcpolis_instance
         ref = SandboxPersistedRef(
             provider="e2b",
             org_id=org_id,
@@ -1366,78 +1834,6 @@ class E2BSandboxService:
             last_updated=datetime.now(tz=timezone.utc),
         )
         await self._persistence.upsert(ref)
-
-    async def _persist_creating_marker(
-        self, *, org_id: str, upstream: UpstreamDefinition,
-    ) -> SandboxPersistedRef | None:
-        """Write a "creating" marker for ``(org, upstream)`` BEFORE a
-        fresh ``create_sandbox`` makes the sandbox provider-visible.
-
-        The marker is a ref with BOTH ``sandbox_id`` and
-        ``paused_snapshot_id`` ``None`` — a state the normal lifecycle
-        never produces (a ref always carries one or the other), so the
-        reconciler can recognize it unambiguously. A boot/periodic
-        reconcile that races into the create/persist window then sees an
-        actively-managed ``(org, upstream)`` and skips the running
-        sandbox (matched by its ``mcpolis_org`` / ``mcpolis_upstream``
-        metadata) instead of killing it as an orphan.
-
-        Returns the PRIOR ref (if any) so the caller can restore it if
-        the create then fails — the marker upsert clobbers a prior
-        paused-snapshot ref, and a failed create must not lose it. On a
-        successful session ``_persist_live_ref`` overwrites the marker
-        with the real live identity tuple.
-        """
-        assert self._persistence is not None
-        existing = await self._persistence.get(
-            org_id=org_id, upstream_id=upstream.id,
-        )
-        marker = SandboxPersistedRef(
-            provider="e2b",
-            org_id=org_id,
-            upstream_id=upstream.id,
-            mcpolis_instance=self._mcpolis_instance,
-            sandbox_id=None,
-            paused_snapshot_id=None,
-            pid=None,
-            metadata=dict(existing.metadata) if existing is not None else {},
-            cached_server_info=(
-                existing.cached_server_info if existing is not None else None
-            ),
-            cached_self_description=(
-                existing.cached_self_description
-                if existing is not None else None
-            ),
-            last_updated=datetime.now(tz=timezone.utc),
-        )
-        await self._persistence.upsert(marker)
-        return existing
-
-    async def _restore_or_clear_creating_marker(
-        self,
-        *,
-        org_id: str,
-        upstream: UpstreamDefinition,
-        prior: SandboxPersistedRef | None,
-    ) -> None:
-        """Undo a creating marker after a failed fresh create: restore
-        the prior ref if there was one (so a clobbered paused-snapshot
-        ref survives), else delete the marker so a later reconcile can
-        reap the leaked sandbox."""
-        if self._persistence is None:
-            return
-        try:
-            if prior is not None:
-                await self._persistence.upsert(prior)
-            else:
-                await self._persistence.delete(
-                    org_id=org_id, upstream_id=upstream.id,
-                )
-        except Exception:
-            logger.warning(
-                "sandbox.e2b.creating_marker.cleanup_failed",
-                org_id=org_id, upstream_id=upstream.id, exc_info=True,
-            )
 
     async def _start_docker_daemon(self, sandbox: E2BSandboxHandle) -> None:
         """Ensure a usable dockerd inside a docker-language sandbox.
@@ -1476,9 +1872,9 @@ class E2BSandboxService:
             pass
 
         # chmod the socket if it already exists. This handles the case
-        # where a template set_start_cmd started dockerd but left the
-        # socket root-only (a race between the ready probe and chmod).
-        # If the socket doesn't exist yet this is a no-op.
+        # where the image's systemd-managed dockerd is already up but
+        # left the socket root-only. If the socket doesn't exist yet
+        # this is a no-op.
         chmod_early = await sandbox.run_command(
             [
                 "sudo", "sh", "-c",
@@ -1913,7 +2309,19 @@ class E2BSandboxService:
         every currently-live session. Returns the count marked so the
         lifespan handler can log a single "preserved N sandboxes for
         reconnect" line.
+
+        Also latches the service into shutdown: sessions that register
+        after this call (a connect that was still in flight) are
+        preserved too when they close. Only the shutdown cleanup calls
+        it; the service is not used afterwards.
+
+        With reuse on restart off it marks nothing: the next boot would
+        never look for a kept sandbox, so each one is killed as it
+        closes, like on any other close.
         """
+        self._shutting_down = True
+        if not self._reuse_sandboxes_on_restart:
+            return 0
         for sid in list(self._live_sandboxes):
             self._preserve_on_close[sid] = True
         return len(self._live_sandboxes)
@@ -1956,6 +2364,25 @@ class E2BSandboxService:
             )
         return marked
 
+    def adopt_instance_id(self, instance_id: str) -> None:
+        """Replace the provisional per-process instance id with the
+        store's stable one (``get_or_create_instance_id``).
+
+        The app is built synchronously, before the store can be read,
+        so the lifespan calls this once at boot, before any MCP
+        connects. Refuses once a session has started: that session's
+        sandbox and ref already carry the old id, and the reconciler
+        would treat it as another environment's.
+        """
+        if not instance_id:
+            raise ValueError("instance_id must be non-empty")
+        if self._sessions_started:
+            raise RuntimeError(
+                "cannot change the sandbox instance id after a session"
+                " has started",
+            )
+        self._mcpolis_instance = instance_id
+
     def active_session_ids(self) -> list[str]:
         """Snapshot of session ids with a live sandbox right now.
 
@@ -1977,10 +2404,19 @@ class E2BSandboxService:
 
         1. Reads every ``SandboxPersistedRef`` (cross-org).
         2. For each ref with a live ``sandbox_id``, calls
-           ``Sandbox.kill(sandbox_id)`` (best-effort; 404s are
-           swallowed since the sandbox may already be gone).
-        3. Deletes the ref so the next ``_try_reconnect`` finds
-           nothing and falls through to fresh-create.
+           ``Sandbox.kill(sandbox_id)`` (a sandbox already gone counts
+           as killed).
+        3. Clears the ref so the next ``_try_reconnect`` finds
+           nothing and falls through to fresh-create. A persistent
+           volume is not a sandbox: it stays on the ref
+           (``storage_only``), for the fresh create to mount; deleting
+           the ref used to lose the upstream's ``/data`` and leave its
+           volume on the account for good. A sandbox whose kill failed
+           stays on it too, as one still to kill
+           (``SANDBOXES_TO_KILL_METADATA_KEY``), never to reuse: the boot
+           reconcile right after retries the kill, whatever instance tag
+           the sandbox carries. Cleared, the ref was the last thing that
+           named a sandbox made with an older tag.
 
         Returns the count of refs cleared. Idempotent — running it
         twice with no refs left is a no-op.
@@ -1999,34 +2435,23 @@ class E2BSandboxService:
         for ref in refs:
             if ref.provider != "e2b":
                 continue
-            if ref.sandbox_id is not None:
-                try:
-                    await self._client.kill_sandbox(ref.sandbox_id)
-                    logger.info(
-                        "sandbox.e2b.fresh_restart.killed",
-                        org_id=ref.org_id, upstream_id=ref.upstream_id,
-                        sandbox_id=ref.sandbox_id,
-                    )
-                except E2BNotFoundError:
-                    # Already gone (24h cap, manual delete in
-                    # dashboard, etc.). No-op for the wipe.
-                    pass
-                except E2BSDKError:
-                    logger.warning(
-                        "sandbox.e2b.fresh_restart.kill_failed",
-                        sandbox_id=ref.sandbox_id, exc_info=True,
-                    )
-            try:
-                await self._persistence.delete(
-                    org_id=ref.org_id, upstream_id=ref.upstream_id,
-                )
+            not_killed = await _clean_up_each(
+                [ref.sandbox_id] if ref.sandbox_id is not None else [],
+                self._client.kill_sandbox,
+                id_field="sandbox_id",
+                events=(
+                    "sandbox.e2b.fresh_restart.killed",
+                    "sandbox.e2b.fresh_restart.already_gone",
+                    "sandbox.e2b.fresh_restart.kill_failed",
+                ),
+                org_id=ref.org_id, upstream_id=ref.upstream_id,
+            )
+            if await self._keep_only_storage(
+                ref,
+                failure_event="sandbox.e2b.fresh_restart.persistence_delete_failed",
+                also_to_kill=not_killed,
+            ):
                 cleared += 1
-            except Exception:
-                logger.warning(
-                    "sandbox.e2b.fresh_restart.persistence_delete_failed",
-                    org_id=ref.org_id, upstream_id=ref.upstream_id,
-                    exc_info=True,
-                )
         logger.info(
             "sandbox.e2b.fresh_restart.done",
             cleared=cleared,
@@ -2077,61 +2502,67 @@ class E2BSandboxService:
 
     async def on_upstream_removed(
         self, *, org_id: str, upstream_id: str,
-    ) -> None:
-        """Destroy the E2B volume for ``(org, upstream)`` when the
-        operator deletes the upstream.
+    ) -> bool:
+        """Clean up what E2B holds for ``(org, upstream)`` when the
+        operator deletes the upstream (or its org): kill the sandbox the
+        ref still names (one a Stop could not kill), destroy the volume
+        it mounts, and retry what an earlier removal of the same id
+        could not clean up. Then delete the persistence ref, so the
+        reconciler doesn't see a phantom mapping.
 
-        Idempotent: a missing persistence ref, a missing volume id in
-        the metadata, or an :class:`E2BNotFoundError` from the SDK
-        all resolve to "nothing to clean up." After successful
-        teardown, the persistence ref is deleted so the reconciler
-        doesn't see a phantom mapping.
+        What fails stays on the ref, which keeps nothing else: a sandbox
+        as one still to kill (``SANDBOXES_TO_KILL_METADATA_KEY``), a
+        volume as one still to destroy (``VOLUMES_TO_DESTROY_METADATA_KEY``),
+        never as the sandbox to reuse or the volume to mount. The boot
+        reconcile retries them, a sandbox whatever instance tag it
+        carries, and an upstream added again under the same id gets a
+        sandbox and a volume of its own. Dropped, the ref was the last
+        thing that named such a sandbox, and one made before the instance
+        id became one value per database stayed on the account for good.
+
+        Returns whether the ref was kept that way, for the boot reconcile
+        to finish. Idempotent: a missing persistence ref, nothing to clean
+        up, or an :class:`E2BNotFoundError` from the SDK all resolve to
+        "nothing to clean up."
         """
         if self._persistence is None:
-            return
+            return False
         existing = await self._persistence.get(
             org_id=org_id, upstream_id=upstream_id,
         )
         if existing is None:
-            return
-        volume_id = existing.metadata.get(VOLUME_METADATA_KEY)
-        if volume_id:
-            try:
-                await self._client.destroy_volume(volume_id)
-                logger.info(
-                    "sandbox.e2b.volume.destroyed",
-                    org_id=org_id, upstream_id=upstream_id,
-                    volume_id=volume_id,
-                )
-            except E2BNotFoundError:
-                # Volume already gone (manual delete in dashboard,
-                # or a prior partial teardown). Treat as success so
-                # the persistence ref still gets cleared and a retry
-                # of the operator action is a no-op.
-                logger.info(
-                    "sandbox.e2b.volume.destroy_not_found",
-                    org_id=org_id, upstream_id=upstream_id,
-                    volume_id=volume_id,
-                )
-            except E2BSDKError:
-                logger.warning(
-                    "sandbox.e2b.volume.destroy_failed",
-                    org_id=org_id, upstream_id=upstream_id,
-                    volume_id=volume_id, exc_info=True,
-                )
-                # Don't clear the ref — leave the volume id behind so
-                # a retry can complete teardown. The operator will
-                # see the volume in their E2B dashboard until then.
-                return
+            return False
+        sandboxes_left = await kill_sandboxes(
+            self._client,
+            [
+                *([existing.sandbox_id] if existing.sandbox_id else []),
+                *sandboxes_to_kill(existing),
+            ],
+            org_id=org_id, upstream_id=upstream_id,
+        )
+        mounted = existing.metadata.get(VOLUME_METADATA_KEY)
+        volumes_left = await destroy_volumes(
+            self._client,
+            [*([mounted] if mounted else []), *volumes_to_destroy(existing)],
+            org_id=org_id, upstream_id=upstream_id,
+        )
+        tombstone = without_sandbox(
+            existing, leftovers(volumes=volumes_left, sandboxes=sandboxes_left),
+        )
         try:
-            await self._persistence.delete(
-                org_id=org_id, upstream_id=upstream_id,
-            )
+            if tombstone is not None:
+                await self._persistence.upsert(tombstone)
+            else:
+                await self._persistence.delete(
+                    org_id=org_id, upstream_id=upstream_id,
+                )
         except Exception:
             logger.warning(
                 "sandbox.e2b.persistence.delete_failed",
                 org_id=org_id, upstream_id=upstream_id, exc_info=True,
             )
+            return False
+        return tombstone is not None
 
     async def kill_persisted_session(
         self, *, org_id: str, upstream_id: str,
@@ -2139,15 +2570,18 @@ class E2BSandboxService:
         """Kill the live E2B sandbox for ``(org, upstream)`` and clear
         the session-scoped fields of the persistence ref.
 
-        Volume metadata (``VOLUME_METADATA_KEY``) is preserved so the
-        next ``_session_cm`` fresh-create path can still reattach the
-        operator's persistent ``/data`` disk. When no volume metadata
-        is stored on the ref the whole record is deleted.
+        What outlives the sandbox is kept (``storage_only``): the
+        persistent volume, so the next ``_session_cm`` fresh-create
+        reattaches the operator's ``/data`` disk, and what is still to
+        clean up. When the ref records none of it, it is deleted.
 
-        Best-effort throughout: a missing ref, a sandbox already gone
-        from the E2B side, and any SDK error all resolve to "no-op,
-        proceed." The boot reconciler is the eventual-consistency net
-        for anything that survives this call.
+        A kill that fails keeps the ref as it is: a later Stop, the next
+        boot's (``boot_skip_disabled``) or a removal retries it from
+        there. Cleared, the sandbox waited for a boot reconcile, and one
+        tagged with another instance (made before the tag became one
+        value per database) was never seen again. A missing ref and a
+        sandbox already gone (24h cap, manual delete, prior partial
+        teardown) resolve to "no-op, proceed".
         """
         if self._persistence is None:
             return
@@ -2156,61 +2590,25 @@ class E2BSandboxService:
         )
         if existing is None:
             return
-        sandbox_id = existing.sandbox_id
-        if sandbox_id:
-            try:
-                await self._client.kill_sandbox(sandbox_id)
-                logger.info(
-                    "sandbox.e2b.persisted_session.killed",
-                    org_id=org_id, upstream_id=upstream_id,
-                    sandbox_id=sandbox_id,
-                )
-            except E2BNotFoundError:
-                # Sandbox already gone (24h cap, manual delete, prior
-                # partial teardown). Log and continue — the persistence
-                # ref still gets reconciled below.
-                logger.info(
-                    "sandbox.e2b.persisted_session.kill_not_found",
-                    org_id=org_id, upstream_id=upstream_id,
-                    sandbox_id=sandbox_id,
-                )
-            except E2BSDKError:
-                logger.warning(
-                    "sandbox.e2b.persisted_session.kill_failed",
-                    org_id=org_id, upstream_id=upstream_id,
-                    sandbox_id=sandbox_id, exc_info=True,
-                )
-        # Preserve volume metadata so the next Start's fresh-create
-        # reattaches the same persistent disk; clear sandbox / pid /
-        # paused-snapshot so the next ``_try_reconnect`` finds nothing
-        # and falls through to fresh-create. When no volume is
-        # configured, just drop the whole record — there is no state
-        # worth preserving.
-        volume_id = existing.metadata.get(VOLUME_METADATA_KEY)
-        try:
-            if volume_id:
-                await self._persistence.upsert(SandboxPersistedRef(
-                    provider=existing.provider,
-                    org_id=existing.org_id,
-                    upstream_id=existing.upstream_id,
-                    mcpolis_instance=existing.mcpolis_instance,
-                    sandbox_id=None,
-                    paused_snapshot_id=None,
-                    pid=None,
-                    metadata={VOLUME_METADATA_KEY: volume_id},
-                    cached_server_info=existing.cached_server_info,
-                    cached_self_description=existing.cached_self_description,
-                    last_updated=datetime.now(tz=timezone.utc),
-                ))
-            else:
-                await self._persistence.delete(
-                    org_id=org_id, upstream_id=upstream_id,
-                )
-        except Exception:
-            logger.warning(
-                "sandbox.e2b.persisted_session.persistence_clear_failed",
-                org_id=org_id, upstream_id=upstream_id, exc_info=True,
-            )
+        if await _clean_up_each(
+            [existing.sandbox_id] if existing.sandbox_id else [],
+            self._client.kill_sandbox,
+            id_field="sandbox_id",
+            events=(
+                "sandbox.e2b.persisted_session.killed",
+                "sandbox.e2b.persisted_session.kill_not_found",
+                "sandbox.e2b.persisted_session.kill_failed",
+            ),
+            org_id=org_id, upstream_id=upstream_id,
+        ):
+            return
+        # Clear sandbox / pid / paused-snapshot so the next
+        # ``_try_reconnect`` finds nothing and falls through to
+        # fresh-create.
+        await self._keep_only_storage(
+            existing,
+            failure_event="sandbox.e2b.persisted_session.persistence_clear_failed",
+        )
 
     def map_exit(
         self, raw: ProviderExitInfo,
@@ -2249,5 +2647,15 @@ _E2BQuotaError = E2BQuotaError
 __all__ = [
     "E2BSandboxService",
     "PERSISTENT_VOLUME_MOUNT_PATH",
+    "SANDBOXES_TO_KILL_METADATA_KEY",
     "VOLUME_METADATA_KEY",
+    "VOLUMES_TO_DESTROY_METADATA_KEY",
+    "destroy_volumes",
+    "kill_sandboxes",
+    "leftovers",
+    "sandboxes_to_kill",
+    "storage_only",
+    "volumes_to_destroy",
+    "with_leftovers_gone",
+    "without_sandbox",
 ]

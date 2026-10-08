@@ -35,7 +35,9 @@ npm test           # vitest (jsdom)  — or: bash run-unit-tests.sh
 ```
 
 `bash run-unit-tests.sh` is the wrapper used in CI: it runs vitest with
-JUnit/JSON reporters written to `/tmp/mcpolis-vitest-*`.
+JUnit/JSON reporters written to a results folder of its own under
+`/tmp/mcpolis-test-runs/` (printed at the start and the end;
+`/tmp/mcpolis-test-runs/latest-vitest` points at the newest).
 
 ## Layout
 

@@ -32,7 +32,7 @@ export const softwareApplicationSchema = {
     "@type": "AggregateOffer",
     priceCurrency: "USD",
     lowPrice: "0",
-    highPrice: "4.99",
+    highPrice: "19",
     offerCount: "2",
   },
 } as const;
@@ -43,7 +43,7 @@ export const productSchema = {
   name: SITE_NAME,
   url: `${SITE_URL}/pricing`,
   description:
-    "MCP Hero pricing — free for Remote HTTP MCPs, paid plan for Hosted stdio MCPs.",
+    "MCP Hero pricing: a Free plan, and a Team plan at $19/month for up to 10 teammates.",
   brand: {
     "@type": "Brand",
     name: SITE_NAME,
@@ -51,27 +51,27 @@ export const productSchema = {
   offers: [
     {
       "@type": "Offer",
-      name: "Remote HTTP MCPs",
+      name: "Free",
       price: "0",
       priceCurrency: "USD",
       url: `${SITE_URL}/pricing`,
       description:
-        "MCPs you connect by URL. The vendor hosts them; your team just signs in.",
+        "Up to 3 teammates, 5 remote HTTP MCPs and 1 hosted stdio MCP. 30-day audit log.",
     },
     {
       "@type": "Offer",
-      name: "Hosted stdio MCPs",
-      price: "4.99",
+      name: "Team",
+      price: "19",
       priceCurrency: "USD",
       url: `${SITE_URL}/pricing`,
       priceSpecification: {
         "@type": "UnitPriceSpecification",
-        price: "4.99",
+        price: "19",
         priceCurrency: "USD",
-        unitText: "user/month",
+        unitText: "month",
       },
       description:
-        "MCPs you'd normally run as an executable on your machine. We run them for you — no infrastructure to manage.",
+        "Up to 10 teammates included, $5 per seat per month above 10. Unlimited MCPs, custom roles, MCP tool argument checks, 1-year audit retention.",
     },
   ],
 } as const;

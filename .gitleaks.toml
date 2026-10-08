@@ -39,7 +39,6 @@ paths = [
   '''^frontend/src/lib/secret-detection\.test\.ts$''',
   '''^backend/tests/unit/test_secret_scanner\.py$''',
   '''^backend/tests/unit/test_mcp_token_storage\.py$''',
-  '''^backend/tests/unit/test_template_var_last_four\.py$''',
   '''^backend/tests/unit/test_upstream_config_service_template_vars\.py$''',
   '''^backend/tests/integration/test_e2b_sandbox_service_real_sdk\.py$''',
   '''^backend/tests/integration/e2b_real_e2e\.py$''',

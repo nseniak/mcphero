@@ -28,6 +28,7 @@ from typing import Any
 
 import structlog
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
 from mcpolis.domain.model.service_token import ServiceTokenRecord
 from mcpolis.domain.ports.service_token_repository import (
     DuplicateServiceTokenLabelError,
@@ -89,10 +90,9 @@ class FileServiceTokenRepository(ServiceTokenRepository):
             return {}
 
     def _write(self, data: dict[str, dict[str, dict[str, Any]]]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-        tmp.replace(self._path)
+        write_text_atomic(
+            self._path, json.dumps(data, indent=2, sort_keys=True),
+        )
 
     async def create(self, record: ServiceTokenRecord) -> None:
         async with self._lock:
@@ -144,6 +144,20 @@ class FileServiceTokenRepository(ServiceTokenRepository):
                 data.pop(org_id, None)
             self._write(data)
             return True
+
+    async def rename_role(
+        self, org_id: str, old_name: str, new_name: str
+    ) -> int:
+        async with self._lock:
+            data = self._read()
+            moved = 0
+            for raw in data.get(org_id, {}).values():
+                if raw.get("role_name") == old_name:
+                    raw["role_name"] = new_name
+                    moved += 1
+            if moved:
+                self._write(data)
+            return moved
 
     async def delete_for_org(self, org_id: str) -> int:
         async with self._lock:

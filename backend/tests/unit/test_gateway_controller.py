@@ -10,9 +10,7 @@ import pytest
 
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
 from mcpolis.domain.model.service_token import (
-    SCOPE_ORG_PREFIX,
-    SCOPE_ROLE_PREFIX,
-    SCOPE_SVC,
+    ServiceAccessToken,
     service_identity,
 )
 from mcpolis.domain.model.settings import (
@@ -28,8 +26,10 @@ from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.services.tool_router import ToolRouter
 from mcpolis.entrypoints.controllers.gateway_controller import (
+    _check_upstream_and_tool_policy,  # pyright: ignore[reportPrivateUsage]
     create_mcp_server,
 )
+from tests.unit._state_seed import seed_shared_session
 from tests.unit.factories import (
     make_discovered_tool,
     make_full_access_config,
@@ -53,7 +53,6 @@ def make_gateway_components(
             isError=False,
         )
     )
-    from tests.unit._state_seed import seed_shared_session
     seed_shared_session(client_manager, "github", session=mock_session)
     seed_shared_session(client_manager, "slack", session=mock_session)
 
@@ -296,8 +295,8 @@ async def test_allowed_call_writes_single_audit_entry(tmp_path: Path) -> None:
 # EXPO-1 / EXPO-2 — exposure under a service-token boundary role.
 #
 # A service token's ``svc:<label>`` identity has no ``config.users`` entry
-# by design; its role is carried in the auth scopes
-# (``[SCOPE_SVC, mcpolis:role:<role>, mcpolis:org:<org>]``) and read back
+# by design; its role is carried on a ``ServiceAccessToken`` (never in
+# scopes, which are client input on the OAuth path) and read back
 # by ``_get_boundary_role`` → handed to the PolicyEngine. These tests pin
 # that the gateway controller honors that boundary role on every exposure
 # surface — tools/list, tools/call (allowed + denied), and the bare-name /
@@ -329,20 +328,17 @@ def _svc_scoped_config() -> SettingsConfig:
 
 def _set_svc_auth(role: str = "reader", org: str = "default") -> Any:
     """Set request-scoped auth context for the service-token identity,
-    carrying the boundary role in the SDK ``AccessToken.scopes`` channel."""
+    carrying the boundary role on a ``ServiceAccessToken``."""
     from mcp.server.auth.middleware.auth_context import auth_context_var
     from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
-    from mcp.server.auth.provider import AccessToken
 
     auth_user = AuthenticatedUser(
-        AccessToken(
+        ServiceAccessToken(
             token="svct_fake",
             client_id=SVC_IDENTITY,  # → AuthenticatedUser.display_name
-            scopes=[
-                SCOPE_SVC,
-                SCOPE_ROLE_PREFIX + role,
-                SCOPE_ORG_PREFIX + org,
-            ],
+            scopes=[],
+            role_name=role,
+            org_id=org,
             expires_at=int(time.time()) + 3600,
         )
     )
@@ -480,3 +476,137 @@ async def test_bare_tool_name_resolution_honors_boundary_role(
     assert denied.isError
     denied_text = cast(mcp_types.TextContent, denied.content[0]).text
     assert "Unknown tool 'send_message'" in denied_text
+
+
+# ---------------------------------------------------------------------------
+# Argument checks run on what is actually sent: the caller's arguments
+# with the upstream's stored default arguments merged on top.
+# ---------------------------------------------------------------------------
+
+
+def make_upstream_session(router: ToolRouter, upstream_id: str) -> AsyncMock:
+    """Seed a fresh mocked live session on *upstream_id* and return it,
+    so a test can assert whether (and with what) the upstream was called."""
+    session = AsyncMock()
+    session.call_tool = AsyncMock(
+        return_value=mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text="done")],
+            isError=False,
+        )
+    )
+    seed_shared_session(
+        router._client_manager, upstream_id, session=session,  # pyright: ignore[reportPrivateUsage]
+    )
+    return session
+
+
+def make_router_with_github_defaults(
+    router: ToolRouter, defaults: dict[str, Any],
+) -> AsyncMock:
+    """Re-register ``github`` with stored default arguments for
+    ``create_issue`` (the router merges them into every call) and
+    return its mocked upstream session."""
+    router.register_upstream(make_upstream_definition(
+        id="github", default_arguments={"create_issue": defaults},
+    ))
+    return make_upstream_session(router, "github")
+
+
+@pytest.mark.asyncio
+async def test_stored_default_argument_is_checked_against_forbid_pattern(
+    tmp_path: Path,
+) -> None:
+    """A stored default overrides the caller's value, so the role's
+    argument check must see the default. Caller sends an allowed
+    title; the stored default title is forbidden → denied, and the
+    upstream is never called."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    session = make_router_with_github_defaults(
+        router, {"title": "blocked by default"},
+    )
+    rm = make_runtime_manager(
+        PolicyEngine(_forbidden_arg_config()),
+        tool_registry=registry, tool_router=router,
+    )
+    server = create_mcp_server(rm)
+    handler = server.request_handlers[mcp_types.CallToolRequest]
+
+    call_result = await _call(handler, "github__create_issue", {"title": "fine"})
+
+    assert call_result.isError
+    text = cast(mcp_types.TextContent, call_result.content[0]).text
+    assert "forbidden pattern" in text
+    session.call_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stored_default_replaces_a_forbidden_caller_value(
+    tmp_path: Path,
+) -> None:
+    """The caller's forbidden value is replaced by an allowed stored
+    default before sending, so the call is allowed and the upstream
+    receives the default."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    session = make_router_with_github_defaults(
+        router, {"title": "safe default"},
+    )
+    rm = make_runtime_manager(
+        PolicyEngine(_forbidden_arg_config()),
+        tool_registry=registry, tool_router=router,
+    )
+    server = create_mcp_server(rm)
+    handler = server.request_handlers[mcp_types.CallToolRequest]
+
+    call_result = await _call(
+        handler, "github__create_issue", {"title": "blocked by caller"},
+    )
+
+    assert not call_result.isError
+    sent = session.call_tool.await_args
+    assert sent is not None
+    assert "safe default" in repr(sent)
+    assert "blocked by caller" not in repr(sent)
+
+
+@pytest.mark.asyncio
+async def test_tool_name_without_separator_never_reaches_an_upstream(
+    tmp_path: Path,
+) -> None:
+    """A name with no ``__`` that no upstream owns is refused before
+    any upstream is called (single-org path). This held before the
+    access check itself started refusing such names; it pins the
+    behavior, not that change (see the next test)."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    sessions = [make_upstream_session(router, u) for u in ("github", "slack")]
+    rm = make_runtime_manager(
+        PolicyEngine(make_full_access_config(["github", "slack"], ["anonymous"])),
+        tool_registry=registry, tool_router=router,
+    )
+    server = create_mcp_server(rm)
+    handler = server.request_handlers[mcp_types.CallToolRequest]
+
+    call_result = await _call(handler, "githubcreate_issue", {"title": "x"})
+
+    assert call_result.isError
+    for session in sessions:
+        session.call_tool.assert_not_awaited()
+
+
+def test_policy_check_denies_a_name_without_separator(tmp_path: Path) -> None:
+    """The access check itself fails closed on a name it cannot split,
+    instead of reporting "no denial"."""
+    registry, router, _ = make_gateway_components(tmp_path)
+    rm = make_runtime_manager(
+        PolicyEngine(make_full_access_config(["github", "slack"], ["anonymous"])),
+        tool_registry=registry, tool_router=router,
+    )
+    runtime = rm.get_cached("default")
+    assert runtime is not None
+
+    denial = _check_upstream_and_tool_policy(
+        runtime, user_id="anonymous", prefixed_name="create_issue",
+        arguments={},
+    )
+
+    assert denial is not None
+    assert denial.policy_rule == "unknown_tool"

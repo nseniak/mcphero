@@ -4,10 +4,10 @@ Implementations:
 - ``InProcessRateLimiter`` (standalone mode): dict of per-key timestamp
   deques. Zero dependencies, single-process semantics.
 - ``RedisRateLimiter`` (cloud mode): sliding window via ZSET (ZADD +
-  ZREMRANGEBYSCORE + ZCARD). Shares state across every backend hitting
-  the same Redis.
+  ZREMRANGEBYSCORE + ZCARD) inside one Lua script. Shares state across
+  every backend hitting the same Redis.
 
-Both follow the exact same contract so the FastAPI middleware doesn't
+Both follow the exact same contract so ``RateLimitService`` doesn't
 care which one it was handed.
 """
 from __future__ import annotations
@@ -17,33 +17,50 @@ from typing import Protocol
 
 
 @dataclass(frozen=True)
+class RateLimitBucket:
+    """One counter a request is charged against.
+
+    ``key`` names the counter (e.g. ``tool_call:org:<org_id>``);
+    ``limit`` hits are allowed inside any ``window_seconds`` span.
+    """
+
+    key: str
+    limit: int
+    window_seconds: float
+
+
+@dataclass(frozen=True)
 class RateLimitResult:
     """Outcome of a single ``check`` call.
 
-    ``allowed`` — whether the caller is under the limit and may proceed.
-    ``retry_after`` — seconds until the oldest hit inside the current
-    window expires. Populated on deny so the middleware can set the
-    ``Retry-After`` HTTP header; ``None`` on allow.
+    ``allowed`` — whether the caller is under every limit and may proceed.
+    ``retry_after`` — on deny, seconds until the refusing bucket has room
+    again (its oldest hit ages out); ``None`` on allow.
+    ``exceeded`` — on deny, the bucket that refused. When several are
+    full, the one with the longest wait, so ``retry_after`` is honest.
     """
 
     allowed: bool
     retry_after: float | None = None
+    exceeded: RateLimitBucket | None = None
 
 
 class RateLimiter(Protocol):
-    """Sliding-window counter keyed by an arbitrary string."""
+    """Sliding-window counters keyed by arbitrary strings."""
 
-    async def check(
-        self, key: str, *, limit: int, window_seconds: float,
-    ) -> RateLimitResult:
-        """Record a hit on ``key`` and return whether it's within limit.
+    async def check(self, *buckets: RateLimitBucket) -> RateLimitResult:
+        """Charge one hit to every bucket, all or nothing.
 
-        Sliding semantics: a hit at time ``t`` counts toward the limit
-        for every window that includes ``t``. If the latest hit would
-        put the total count strictly above ``limit`` within the last
-        ``window_seconds``, the call is denied *and not recorded* —
-        denied calls must not consume quota, otherwise a client hammering
-        a blocked endpoint could indefinitely extend its own lockout.
+        The hit is admitted only when every bucket is under its limit;
+        it is then recorded in every bucket. A refused hit is recorded
+        in *none* of them. Two reasons:
+
+        * A client hammering a blocked endpoint must not extend its own
+          lockout indefinitely.
+        * When one request is charged to two buckets (a caller and its
+          whole org), a refusal by one must not eat quota from the
+          other — otherwise one runaway caller refused by its own limit
+          would keep draining its teammates' shared org quota.
         """
         ...
 

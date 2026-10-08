@@ -47,6 +47,17 @@ class StallClientManagerFake:
         del upstream_id, user_id
         return self.session
 
+    def is_stopped(self, upstream_id: str) -> bool:
+        """These upstreams are never stopped by an admin."""
+        del upstream_id
+        return False
+
+    def get_self_description(self, upstream_id: str) -> None:
+        """No upstream describes itself: what the gateway's
+        ``initialize`` reads, for tests that drive a whole session."""
+        del upstream_id
+        return None
+
     async def reconnect_shared_fresh(
         self, upstream: Any, *, stale: Any = None,
     ) -> Any:

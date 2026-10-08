@@ -7,8 +7,8 @@ from mcpolis.adapters.repositories.mongo_client import (
     COLL_AUDIT,
     COLL_CONFIG,
     COLL_CONNECTIONS,
+    COLL_GATEWAY_OAUTH,
     COLL_MEMBERSHIPS,
-    COLL_OAUTH_STATE,
     COLL_ORGANIZATIONS,
     COLL_UPSTREAMS,
     create_indexes,
@@ -37,7 +37,7 @@ async def test_create_indexes_is_idempotent() -> None:
             COLL_UPSTREAMS,
             COLL_CONNECTIONS,
             COLL_AUDIT,
-            COLL_OAUTH_STATE,
+            COLL_GATEWAY_OAUTH,
         ]:
             idx_info = await db[coll_name].index_information()
             assert len(idx_info) >= 1  # _id plus at least one named index
@@ -107,7 +107,9 @@ async def test_ensure_default_org_is_idempotent() -> None:
 def test_cloud_mode_refuses_start_without_secrets() -> None:
     """``validate_startup_secrets`` surfaces cloud-mode config errors."""
     settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         session_secret="",
         encryption_key="",
         mongo_uri="",

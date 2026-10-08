@@ -104,18 +104,24 @@ class FakeRuntime:
 
 
 class FakeRuntimeManager:
-    """Single-runtime manager — every org_id resolves to the same one."""
+    """Single-runtime manager — every org_id resolves to the same one.
 
-    def __init__(self, runtime: FakeRuntime) -> None:
+    ``cached=False`` models a process that has not loaded the org yet
+    (the boot window, or an org another backend created): the sync
+    ``get_cached`` misses, while ``get`` loads it."""
+
+    def __init__(self, runtime: FakeRuntime, *, cached: bool = True) -> None:
         self._runtime = runtime
+        self._cached = cached
 
     async def get(self, org_id: str) -> FakeRuntime:
         del org_id
+        self._cached = True
         return self._runtime
 
-    def get_cached(self, org_id: str) -> FakeRuntime:
+    def get_cached(self, org_id: str) -> FakeRuntime | None:
         del org_id
-        return self._runtime
+        return self._runtime if self._cached else None
 
 
 def make_dashboard_auth(
@@ -124,6 +130,7 @@ def make_dashboard_auth(
     admins: set[str],
     roles: dict[str, list[str]],
     session_secret: str = "test-session-secret",
+    runtime_cached: bool = True,
 ):
     """Build a DashboardAuth with fake org runtime + DI'd settings.
 
@@ -136,7 +143,7 @@ def make_dashboard_auth(
         session_secret=session_secret, superadmin_emails=superadmin_emails,
     )
     runtime = FakeRuntime(FakePolicyEngine(admins, roles))
-    runtime_manager = FakeRuntimeManager(runtime)
+    runtime_manager = FakeRuntimeManager(runtime, cached=runtime_cached)
     return settings, create_dashboard_auth(
         settings,
         runtime_manager,  # type: ignore[arg-type]
@@ -229,6 +236,36 @@ async def test_get_current_user_rejects_removed_non_superadmin() -> None:
         superadmin_emails="super@admin.com",
         admins=set(),
         roles={},  # bob has no role here either
+    )
+    cookie = build_session_cookie(
+        settings, email="bob@acme.com", org_slug="acme",
+    )
+    id_tok = current_org_id.set("acme-org-id")
+    slug_tok = current_org_slug.set("acme")
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await auth.get_current_user(
+                request=None, mcpolis_session=cookie,
+            )
+    finally:
+        current_org_id.reset(id_tok)
+        current_org_slug.reset(slug_tok)
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.parametrize("runtime_cached", [True, False])
+@pytest.mark.asyncio
+async def test_get_current_user_rejects_removed_user_whether_or_not_org_is_loaded(
+    runtime_cached: bool,
+) -> None:
+    """A removed member's cookie is refused even when this process has
+    not loaded the org yet. The check used to read only the loaded
+    copy, so in that window it let the request through."""
+    settings, auth = make_dashboard_auth(
+        superadmin_emails="",
+        admins=set(),
+        roles={},  # bob was removed from the org
+        runtime_cached=runtime_cached,
     )
     cookie = build_session_cookie(
         settings, email="bob@acme.com", org_slug="acme",

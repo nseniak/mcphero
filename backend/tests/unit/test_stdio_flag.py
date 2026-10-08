@@ -9,6 +9,9 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from mcpolis.adapters.repositories.file_template_var_repository import (
+    FileTemplateVarRepository,
+)
 from mcpolis.adapters.repositories.upstream_config_loader import (
     build_upstream,
     load_merged_config,
@@ -16,6 +19,7 @@ from mcpolis.adapters.repositories.upstream_config_loader import (
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
 from tests.unit._dev_stub_login import login_as
+from tests.unit.factories import make_config_users_accepted
 
 
 MCP_JSON_STDIO = {
@@ -54,6 +58,7 @@ def make_test_client(
     config.write_text(json.dumps(CONFIG_JSON))
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
+    make_config_users_accepted(data_dir, json.dumps(CONFIG_JSON))
     # Stdio-flag suite predates the Free/Team plan gates; flip the
     # standalone org to Team so the plan-level seat / MCP-count caps
     # don't compete with the import_confirm tests under audit.
@@ -200,7 +205,8 @@ async def test_stdio_flag_blocks_admin_mcp_tool(tmp_path: Path) -> None:
     tool_registry = ToolRegistry([], client_manager)
     connection_store = FileConnectionStore(tmp_path)
     config_service = UpstreamConfigService(
-        upstream_store, client_manager, tool_registry, connection_store
+        upstream_store, client_manager, tool_registry, connection_store,
+        config_repo=config_store, policy_engine=policy_engine,
     )
     audit_repo = FileAuditRepository(
         tmp_path / "data2" / "audit.jsonl"
@@ -216,6 +222,7 @@ async def test_stdio_flag_blocks_admin_mcp_tool(tmp_path: Path) -> None:
         runtime_manager=rm,
         audit_repo=audit_repo,
         policy_store=config_store,
+        template_var_repo=FileTemplateVarRepository(tmp_path),
         allow_stdio_mcp=False
     )
 

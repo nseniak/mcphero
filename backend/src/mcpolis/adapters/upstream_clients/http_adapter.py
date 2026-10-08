@@ -77,11 +77,11 @@ class HttpConnectionTask(ConnectionTaskBase):
         assert self._upstream.http is not None
         cfg: HttpTransportConfig = self._upstream.http
 
+        # A service-account token is already in ``cfg.headers``, with
+        # any ``${NAME}`` substituted; only a per-session token adds one.
         headers = dict(cfg.headers)
-        if self._auth is None:
-            token = self._bearer_token or self._upstream.auth.token
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
+        if self._auth is None and self._bearer_token:
+            headers["Authorization"] = f"Bearer {self._bearer_token}"
 
         try:
             http_client = httpx.AsyncClient(

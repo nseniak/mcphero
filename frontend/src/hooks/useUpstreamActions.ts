@@ -3,10 +3,16 @@ import {
   connectUpstream,
   disconnectUpstream,
   reconnectUpstream,
+  signOutUpstream,
 } from "../api/admin";
 import { useOAuthPopup } from "./useOAuthPopup";
 
-export type BusyAction = "connect" | "disconnect" | "reconnect" | null;
+export type BusyAction =
+  | "connect"
+  | "disconnect"
+  | "reconnect"
+  | "signout"
+  | null;
 
 const MIN_DELAY = 1000;
 
@@ -86,6 +92,23 @@ export function useUpstreamActions({
     }
   };
 
+  /** Remove ``email``'s sign-in. Resolves to the error message when the
+   *  backend refused (for example, another admin's sign-in is shown by
+   *  now), else null. Reloads either way. */
+  const handleSignOut = async (email: string): Promise<string | null> => {
+    setBusyAction("signout");
+    const minDelay = new Promise((r) => setTimeout(r, MIN_DELAY));
+    try {
+      await Promise.all([signOutUpstream(id, email), minDelay]);
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : "Remove sign-in failed";
+    } finally {
+      reload();
+      setBusyAction(null);
+    }
+  };
+
   const handleReconnect = async () => {
     setBusyAction("reconnect");
     setConnectError(null);
@@ -128,5 +151,6 @@ export function useUpstreamActions({
     handleConnect,
     handleDisconnect,
     handleReconnect,
+    handleSignOut,
   };
 }

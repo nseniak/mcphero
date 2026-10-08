@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
 from tests.unit._dev_stub_login import login_as
+from tests.unit.factories import make_config_users_accepted
 
 MCP_JSON = json.dumps({
     "mcpServers": {
@@ -60,6 +61,7 @@ def make_test_client(
     mcp_json.write_text(MCP_JSON)
     config = tmp_path / "config.json"
     config.write_text(CONFIG_JSON)
+    make_config_users_accepted(tmp_path / "data", CONFIG_JSON)
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         mcp_json_path=mcp_json,

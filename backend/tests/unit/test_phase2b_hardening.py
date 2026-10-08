@@ -311,6 +311,11 @@ async def test_refresh_token_within_ttl_is_still_valid(
 
 
 # ── Startup secret validation ─────────────────────────────────────
+#
+# Cloud-mode Settings below pass ``_env_file=None`` and a Google client
+# id: ``Settings`` otherwise loads ``.env`` from the cwd, so these
+# tests would pass or fail depending on the developer's own env file
+# (and always fail in a checkout without one).
 
 
 def test_validate_startup_secrets_standalone_is_noop() -> None:
@@ -321,7 +326,11 @@ def test_validate_startup_secrets_standalone_is_noop() -> None:
 
 def test_validate_startup_secrets_cloud_rejects_all_defaults() -> None:
     """Cloud mode refuses to start if every required secret is missing."""
-    s = Settings(mode="cloud")
+    s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        mode="cloud",
+        google_client_id="gci-test",
+    )
     with pytest.raises(StartupConfigError) as exc_info:
         validate_startup_secrets(s)
     msg = str(exc_info.value)
@@ -334,7 +343,9 @@ def test_validate_startup_secrets_cloud_rejects_all_defaults() -> None:
 def test_validate_startup_secrets_cloud_rejects_dev_session_secret() -> None:
     """The sentinel dev value must not slip past the check."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         session_secret="mcpolis-dev-secret",
         encryption_key="real-key",
         mongo_uri="mongodb://user:pw@mongo",
@@ -348,11 +359,15 @@ def test_validate_startup_secrets_cloud_rejects_dev_session_secret() -> None:
 def test_validate_startup_secrets_cloud_accepts_full_config() -> None:
     """Cloud mode with every required var set must pass validation."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         session_secret="real-session-secret-abc123",
         encryption_key="real-encryption-key-xyz",
         mongo_uri="mongodb://user:pw@mongo:27017",
         redis_url="redis://redis:6379",
+        sandbox_provider="e2b",
+        e2b_api_key="e2b_test_key_xyz",
     )
     validate_startup_secrets(s)  # must not raise
 
@@ -362,12 +377,16 @@ def test_validate_startup_secrets_email_flag_without_smtp_rejected() -> None:
     transport would silently no-op through the logging stub. The
     validator must refuse to boot and name the missing keys."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         session_secret="real-session-secret-abc123",
         encryption_key="real-encryption-key-xyz",
         mongo_uri="mongodb://user:pw@mongo:27017",
         redis_url="redis://redis:6379",
         upstream_health_email_enabled=True,
+        sandbox_provider="e2b",
+        e2b_api_key="e2b_test_key_xyz",
     )
     with pytest.raises(StartupConfigError) as exc_info:
         validate_startup_secrets(s)
@@ -381,7 +400,9 @@ def test_validate_startup_secrets_email_flag_without_smtp_rejected() -> None:
 def test_validate_startup_secrets_email_flag_with_smtp_ok() -> None:
     """Flag on + a fully configured SMTP transport must pass."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         session_secret="real-session-secret-abc123",
         encryption_key="real-encryption-key-xyz",
         mongo_uri="mongodb://user:pw@mongo:27017",
@@ -391,6 +412,8 @@ def test_validate_startup_secrets_email_flag_with_smtp_ok() -> None:
         smtp_username="robot@mcphero.io",
         smtp_password="app-password",
         smtp_from="info@mcphero.io",
+        sandbox_provider="e2b",
+        e2b_api_key="e2b_test_key_xyz",
     )
     validate_startup_secrets(s)  # must not raise
 
@@ -398,7 +421,9 @@ def test_validate_startup_secrets_email_flag_with_smtp_ok() -> None:
 def test_validate_startup_secrets_cloud_rejects_test_mode_on_public_bind() -> None:
     """test_mode + cloud + non-loopback host must refuse to boot."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         test_mode=True,
         host="0.0.0.0",
         session_secret="real-session-secret-abc123",
@@ -416,7 +441,9 @@ def test_validate_startup_secrets_cloud_rejects_dev_stub_provider() -> None:
     must never be wired up against a cloud deployment, regardless of
     other secrets being correct."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         oauth_provider="dev_stub",
         session_secret="real-session-secret-abc123",
         encryption_key="real-encryption-key-xyz",
@@ -441,7 +468,9 @@ def test_validate_startup_secrets_cloud_dev_stub_with_test_mode_loopback_ok() ->
     is what ``run-e2e-tests.sh`` relies on to exercise Mongo/Redis-
     backed flows without real Google credentials."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         oauth_provider="dev_stub",
         test_mode=True,
         host="127.0.0.1",
@@ -449,6 +478,8 @@ def test_validate_startup_secrets_cloud_dev_stub_with_test_mode_loopback_ok() ->
         encryption_key="real-encryption-key-xyz",
         mongo_uri="mongodb://user:pw@mongo:27017",
         redis_url="redis://redis:6379",
+        sandbox_provider="local-subprocess",
+        e2b_api_key="",
     )
     validate_startup_secrets(s)  # must not raise
 
@@ -458,7 +489,9 @@ def test_validate_startup_secrets_cloud_dev_stub_off_loopback_still_rejected() -
     second half of the gate. A cloud deployment with test_mode=true
     but bound to 0.0.0.0 must still refuse dev_stub."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         oauth_provider="dev_stub",
         test_mode=True,
         host="0.0.0.0",
@@ -475,7 +508,9 @@ def test_validate_startup_secrets_cloud_dev_stub_off_loopback_still_rejected() -
 def test_validate_startup_secrets_cloud_rejects_test_mode_with_hostname_bind() -> None:
     """'localhost' resolves via /etc/hosts — the guard requires a literal IP."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         test_mode=True,
         host="localhost",
         session_secret="real-session-secret-abc123",
@@ -490,13 +525,17 @@ def test_validate_startup_secrets_cloud_rejects_test_mode_with_hostname_bind() -
 def test_validate_startup_secrets_cloud_allows_test_mode_on_loopback_ipv4() -> None:
     """test_mode is allowed in cloud mode when bound to 127.0.0.1 — e2e rig."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         test_mode=True,
         host="127.0.0.1",
         session_secret="real-session-secret-abc123",
         encryption_key="real-encryption-key-xyz",
         mongo_uri="mongodb://user:pw@mongo:27017",
         redis_url="redis://redis:6379",
+        sandbox_provider="local-subprocess",
+        e2b_api_key="",
     )
     validate_startup_secrets(s)  # must not raise
 
@@ -504,13 +543,17 @@ def test_validate_startup_secrets_cloud_allows_test_mode_on_loopback_ipv4() -> N
 def test_validate_startup_secrets_cloud_allows_test_mode_on_loopback_ipv6() -> None:
     """::1 is loopback too."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         test_mode=True,
         host="::1",
         session_secret="real-session-secret-abc123",
         encryption_key="real-encryption-key-xyz",
         mongo_uri="mongodb://user:pw@mongo:27017",
         redis_url="redis://redis:6379",
+        sandbox_provider="local-subprocess",
+        e2b_api_key="",
     )
     validate_startup_secrets(s)  # must not raise
 
@@ -518,7 +561,9 @@ def test_validate_startup_secrets_cloud_allows_test_mode_on_loopback_ipv6() -> N
 def test_validate_startup_secrets_cloud_test_mode_loopback_still_checks_secrets() -> None:
     """Allowing test_mode on loopback must not bypass the missing-secret check."""
     s = Settings(
+        _env_file=None,  # type: ignore[call-arg]
         mode="cloud",
+        google_client_id="gci-test",
         test_mode=True,
         host="127.0.0.1",
     )
@@ -546,7 +591,9 @@ def make_cloud_settings(**overrides: object) -> Settings:
     """Builder for cloud-mode Settings with every required secret
     pre-filled. Specific tests override the bits they care about."""
     base: dict[str, object] = {
+        "_env_file": None,
         "mode": "cloud",
+        "google_client_id": "gci-test",
         "session_secret": "real-session-secret-abc123",
         "encryption_key": "real-encryption-key-xyz",
         "mongo_uri": "mongodb://user:pw@mongo:27017",
@@ -556,11 +603,12 @@ def make_cloud_settings(**overrides: object) -> Settings:
     return Settings(**base)  # type: ignore[arg-type]
 
 
-def test_validate_startup_secrets_cloud_accepts_unset_sandbox_provider() -> None:
-    """Empty sandbox_provider ⇔ legacy auto-selection. Cloud mode
-    must still accept this so existing deployments don't break on
-    upgrade."""
-    s = make_cloud_settings(sandbox_provider="")
+def test_validate_startup_secrets_cloud_accepts_unset_sandbox_provider_with_key() -> None:
+    """Empty sandbox_provider + an E2B key auto-selects ``e2b``, so
+    cloud mode accepts it. Without a key it is refused (no silent
+    fallback to the unsandboxed runner); see
+    ``test_startup_secrets_sandbox.py``."""
+    s = make_cloud_settings(sandbox_provider="", e2b_api_key="e2b_test_key_xyz")
     validate_startup_secrets(s)
 
 
@@ -595,12 +643,17 @@ def test_validate_startup_secrets_cloud_rejects_own_runner() -> None:
     assert "no longer supported" in str(exc.value)
 
 
-def test_validate_startup_secrets_cloud_rejects_local_subprocess() -> None:
+def test_validate_startup_secrets_cloud_rejects_local_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The no-isolation path runs every stdio MCP unsandboxed on the
-    backend host. Cloud mode refuses it outright — operator typo
-    becomes a clear startup error rather than a silent
-    security-posture downgrade."""
-    s = make_cloud_settings(sandbox_provider="local-subprocess")
+    backend host. Cloud mode refuses it off-loopback (the production
+    bind) — operator typo becomes a clear startup error rather than a
+    silent security-posture downgrade."""
+    # run-unit-tests.sh exports this loopback-only switch; the
+    # validator would refuse it on 0.0.0.0 before the sandbox check.
+    monkeypatch.delenv("MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK", raising=False)
+    s = make_cloud_settings(sandbox_provider="local-subprocess", host="0.0.0.0")
     with pytest.raises(StartupConfigError) as exc:
         validate_startup_secrets(s)
     assert "local-subprocess" in str(exc.value)

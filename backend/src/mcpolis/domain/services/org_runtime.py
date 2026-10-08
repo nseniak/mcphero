@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import structlog
 
@@ -20,6 +20,7 @@ from mcpolis.adapters.repositories.audit_repository import (
 from mcpolis.adapters.repositories.connection_store import ConnectionStore
 from mcpolis.adapters.repositories.upstream_config_store import UpstreamConfigStore
 from mcpolis.adapters.upstream_clients.client_manager import (
+    STOP_ALL_WAIT_SECONDS,
     UpstreamClientManager,
 )
 from mcpolis.adapters.upstream_clients.session_single_flight import (
@@ -33,6 +34,7 @@ from mcpolis.domain.model.policy import AuthMode
 from mcpolis.domain.model.settings import SettingsConfig
 from mcpolis.domain.model.upstream import TransportType, UpstreamDefinition
 from mcpolis.domain.ports import ConfigRepository, ToolCatalogRepository
+from mcpolis.domain.ports.organization_repository import OrganizationRepository
 from mcpolis.domain.ports.sandbox_file_repository import SandboxFileRepository
 from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
 from mcpolis.domain.ports.sandbox_persistence_repository import (
@@ -44,12 +46,14 @@ from mcpolis.domain.services.sandbox_service import (
     SandboxProviderName,
     SandboxService,
 )
+from mcpolis.domain.services.sign_in_refresh_lock import SignInRefreshLock
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.services.tool_router import ToolRouter
 from mcpolis.domain.services.upstream_config_service import UpstreamConfigService
 from mcpolis.domain.services.upstream_connection_service import (
     reconnect_all_oauth_upstreams,
 )
+from mcpolis.domain.services.upstream_health_check import SignInWarner
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
@@ -69,6 +73,16 @@ class OrgRuntime:
     # time — it ignores every add/remove/update since boot. Use
     # ``live_upstreams()`` instead.
     upstreams: list[UpstreamDefinition]
+    # Held while a role is renamed or deleted, and while a service token
+    # is minted (from the role check to the insert). Tokens hold their
+    # role by name in their own registry, so without it a mint or a
+    # delete can interleave with a rename and leave a token on a role
+    # that no longer exists, which gets zero tools. It lives here because
+    # every door that changes roles or mints tokens already shares this
+    # runtime. One per process, like the config stores' locks.
+    roles_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, compare=False, repr=False,
+    )
 
     def live_upstreams(self) -> list[UpstreamDefinition]:
         """Upstream definitions as they are *now* — reflecting every
@@ -117,8 +131,14 @@ class OrgRuntimeManager:
         mcpolis_instance: str | None = None,
         template_var_repo: TemplateVarRepository | None = None,
         sandbox_file_repo: SandboxFileRepository | None = None,
+        org_repo: OrganizationRepository | None = None,
     ) -> None:
         self._config_repo = config_repo
+        # Source of each org's accepted members (its membership rows),
+        # mirrored into the org's policy engine when the runtime is
+        # built. ``None`` (tests) leaves membership untracked: everyone
+        # in ``config.users`` counts as a member.
+        self._org_repo = org_repo
         self._upstream_config_repo = upstream_config_repo
         self._connection_repo = connection_repo
         self._audit_repo = audit_repo
@@ -147,6 +167,8 @@ class OrgRuntimeManager:
         self._on_upstream_tools_changed: OnUpstreamToolsChanged | None = None
         self._on_upstream_resources_changed: OnUpstreamResourcesChanged | None = None
         self._on_upstream_prompts_changed: OnUpstreamPromptsChanged | None = None
+        self._sign_in_warner: SignInWarner | None = None
+        self._sign_in_refresh_lock: SignInRefreshLock | None = None
         # Sync-accessible cache of org_id → display_name so request-time
         # consumers (e.g. MCP ``initialize`` instructions) can build
         # org-scoped text without an async repository lookup. Populated
@@ -203,6 +225,23 @@ class OrgRuntimeManager:
                 self._wrap_prompts_for_org(runtime.org_id),
             )
 
+    def set_sign_in_warner(self, warner: SignInWarner | None) -> None:
+        """Register who to email when a reconnect deletes a sign-in the
+        upstream refused (§5.2); None while health emails are off.
+        Propagates to every existing and future runtime's client_manager.
+        """
+        self._sign_in_warner = warner
+        for runtime in self._runtimes.values():
+            runtime.client_manager.set_sign_in_warner(warner)
+
+    def set_sign_in_refresh_lock(self, lock: SignInRefreshLock) -> None:
+        """Share the app's one-refresh-per-sign-in lock (the periodic
+        refresh holds it too) with every existing and future runtime's
+        client_manager."""
+        self._sign_in_refresh_lock = lock
+        for runtime in self._runtimes.values():
+            runtime.client_manager.set_sign_in_refresh_lock(lock)
+
     def _wrap_for_org(
         self, org_id: str,
     ) -> Callable[[str], None] | None:
@@ -249,20 +288,49 @@ class OrgRuntimeManager:
         org_id: str,
         config: SettingsConfig,
         upstreams: list[UpstreamDefinition],
+        members: Iterable[str] | None = None,
     ) -> OrgRuntime:
         """Synchronously create a runtime from pre-loaded parts.
 
         Used during ``create_app`` (before the event loop) for
-        standalone mode where config and upstreams are already loaded
-        from files.
+        standalone mode where config, upstreams and the accepted members
+        are already loaded from files.
         """
-        return self._build_runtime(org_id, config, upstreams)
+        return self._build_runtime(org_id, config, upstreams, members=members)
 
-    async def teardown(self, org_id: str) -> None:
-        """Stop and remove a runtime (e.g. org deletion)."""
+    def note_member_joined(self, org_id: str, email: str) -> None:
+        """``email`` accepted its invitation (its membership row was just
+        saved): let the org's running policy treat it as a member. A
+        runtime built later reads the row itself."""
+        runtime = self._runtimes.get(org_id)
+        if runtime is not None:
+            runtime.policy_engine.add_member(email)
+
+    def note_member_left(self, org_id: str, email: str) -> None:
+        """``email``'s membership row was just deleted: a new invitation
+        to the same address must be accepted again."""
+        runtime = self._runtimes.get(org_id)
+        if runtime is not None:
+            runtime.policy_engine.discard_member(email)
+
+    def adopt_instance_id(self, instance_id: str) -> None:
+        """Use the store's stable sandbox instance id for runtimes built
+        from now on (see ``E2BSandboxService.adopt_instance_id``)."""
+        if self._runtimes:
+            logger.warning(
+                "org.runtime.instance_id.adopted_late",
+                runtimes=sorted(self._runtimes),
+            )
+        self._mcpolis_instance = instance_id
+
+    async def teardown(
+        self, org_id: str, *, wait: float = STOP_ALL_WAIT_SECONDS,
+    ) -> None:
+        """Stop and remove a runtime (e.g. org deletion). ``wait``: see
+        ``UpstreamClientManager.stop_all``."""
         runtime = self._runtimes.pop(org_id, None)
         if runtime is not None:
-            await runtime.client_manager.stop_all()
+            await runtime.client_manager.stop_all(wait=wait)
             self._startup_status.pop(org_id, None)
             logger.info(
                 "org.runtime.torn_down",
@@ -301,6 +369,25 @@ class OrgRuntimeManager:
             async def _connect_one_phase1(
                 upstream: UpstreamDefinition,
             ) -> None:
+                if runtime.client_manager.is_in_use(upstream.id):
+                    # A request reached this org before boot did (any
+                    # request builds the org's runtime): a member's tool
+                    # call opened the MCP, or an admin's Start (which
+                    # lifted any saved Stop) is opening it. Leave it: the
+                    # steps below would close its session, killing the
+                    # sandbox its calls run in, or cancel the Start. The
+                    # hosted-MCP steps read the cached sandbox ref first,
+                    # so they check again as they write
+                    # (``unless_in_use``); a remote MCP's connect reuses
+                    # or joins what a request opened meanwhile.
+                    if runtime.client_manager.is_connected(upstream.id):
+                        status.connected.add(upstream.id)
+                    logger.info(
+                        "upstream.connect.skipped.in_use",
+                        upstream_id=upstream.id,
+                        org_id=org_id,
+                    )
+                    return
                 if upstream.id in disabled_ids:
                     # Mirror persistence's ``enabled:False`` into the
                     # in-memory state machine so the dashboard renders
@@ -335,6 +422,16 @@ class OrgRuntimeManager:
                                 upstream,
                             )
                         )
+                        if runtime.client_manager.is_stopped(upstream.id):
+                            # An admin stopped (or removed) it while boot
+                            # read its sandbox ref: the Stop stands (the
+                            # transitions keep it, see ``_keeps_stop``).
+                            logger.info(
+                                "upstream.connect.skipped.stopped_during_boot",
+                                upstream_id=upstream.id,
+                                org_id=org_id,
+                            )
+                            return
                         if cached:
                             status.connected.add(upstream.id)
                             logger.info(
@@ -342,17 +439,17 @@ class OrgRuntimeManager:
                                 upstream_id=upstream.id,
                                 org_id=org_id,
                             )
-                        else:
+                        elif await runtime.client_manager.transition_to_failed(
+                            upstream.id,
+                            last_failure=None,
+                            reason="boot_skip_never_ready",
+                            unless_in_use=True,
+                        ):
                             # No cache → never_ready. The constructor
                             # initialised state to FAILED with
                             # last_failure=None, which is the right
                             # phase. Re-emit the transition log so
                             # operators can grep for it on every boot.
-                            await runtime.client_manager.transition_to_failed(
-                                upstream.id,
-                                last_failure=None,
-                                reason="boot_skip_never_ready",
-                            )
                             logger.info(
                                 "upstream.connect.skipped.never_ready",
                                 upstream_id=upstream.id,
@@ -488,10 +585,22 @@ class OrgRuntimeManager:
                     org_id=org_id,
                 )
 
-    async def shutdown_all(self) -> None:
-        """Lifespan teardown: stop all runtimes."""
-        for org_id in list(self._runtimes):
-            await self.teardown(org_id)
+    async def shutdown_all(self, *, wait: float = STOP_ALL_WAIT_SECONDS) -> None:
+        """Lifespan teardown: stop all runtimes, all at once (one by one,
+        each up to its close timeouts, a few orgs outlasted the shutdown).
+        A runtime whose teardown fails is logged; the others still stop."""
+        org_ids = list(self._runtimes)
+        outcomes = await asyncio.gather(
+            *(self.teardown(org_id, wait=wait) for org_id in org_ids),
+            return_exceptions=True,
+        )
+        for org_id, outcome in zip(org_ids, outcomes, strict=True):
+            if isinstance(outcome, Exception):
+                logger.error(
+                    "org.runtime.teardown_failed",
+                    org_id=org_id,
+                    exc_info=outcome,
+                )
 
     def get_startup_status(self, org_id: str) -> StartupStatus:
         """Return startup status for an org (for the /api/startup endpoint)."""
@@ -527,11 +636,17 @@ class OrgRuntimeManager:
         org_id: str,
         config: SettingsConfig,
         upstreams: list[UpstreamDefinition],
+        saved_stops: set[str] | None = None,
+        *,
+        members: Iterable[str] | None = None,
     ) -> OrgRuntime:
         """Build a runtime from pre-loaded config and upstreams.
 
         Sync — does not touch the database. Used by both the sync
-        and async creation paths.
+        and async creation paths. ``saved_stops`` (the upstreams an admin
+        stopped) are marked stopped before the runtime is registered, so
+        no request ever sees them running. ``members`` are the addresses
+        that accepted their invitation (``None``: not tracked).
         """
         client_manager = UpstreamClientManager(
             upstreams,
@@ -550,6 +665,7 @@ class OrgRuntimeManager:
             # purely token-based.
             connection_store=self._connection_repo,
         )
+        client_manager.mark_saved_stops(saved_stops or set())
         client_manager.set_on_upstream_tools_changed(
             self._wrap_for_org(org_id),
         )
@@ -559,13 +675,16 @@ class OrgRuntimeManager:
         client_manager.set_on_upstream_prompts_changed(
             self._wrap_prompts_for_org(org_id),
         )
+        client_manager.set_sign_in_warner(self._sign_in_warner)
+        if self._sign_in_refresh_lock is not None:
+            client_manager.set_sign_in_refresh_lock(self._sign_in_refresh_lock)
         tool_registry = ToolRegistry(
             upstreams,
             client_manager,
             catalog_repo=self._tool_catalog_repo,
             org_id=org_id,
         )
-        policy_engine = PolicyEngine(config)
+        policy_engine = PolicyEngine(config, members)
         config_service = UpstreamConfigService(
             self._upstream_config_repo,
             client_manager,
@@ -573,6 +692,8 @@ class OrgRuntimeManager:
             self._connection_repo,
             template_var_repo=self._template_var_repo,
             sandbox_file_repo=self._sandbox_file_repo,
+            config_repo=self._config_repo,
+            policy_engine=policy_engine,
         )
         tool_router = ToolRouter(
             tool_registry,
@@ -621,4 +742,23 @@ class OrgRuntimeManager:
         """
         config = await self._config_repo.load(org_id)
         upstreams = await self._upstream_config_repo.get_all(org_id)
-        return self._build_runtime(org_id, config, upstreams)
+        # The first request can build an org's runtime before startup
+        # reaches the org: a saved Stop must already hold for it.
+        saved_stops = await self._connection_repo.get_disabled_ids(org_id)
+        members = (
+            [m.email for m in await self._org_repo.list_memberships(org_id)]
+            if self._org_repo is not None else None
+        )
+        return self._build_runtime(
+            org_id, config, upstreams, saved_stops, members=members,
+        )
+
+    async def apply_saved_stops(self, org_id: str) -> None:
+        """Mark stopped the upstreams an admin stopped, on a runtime built
+        before the event loop ran (standalone's ``create_runtime_sync``).
+        Call before the app serves requests."""
+        runtime = self._runtimes.get(org_id)
+        if runtime is None:
+            return
+        saved_stops = await self._connection_repo.get_disabled_ids(org_id)
+        runtime.client_manager.mark_saved_stops(saved_stops)

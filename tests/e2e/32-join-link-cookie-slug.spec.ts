@@ -3,7 +3,7 @@ import {
   expect,
   type APIRequestContext,
 } from "@playwright/test";
-import { BACKEND_URL, createOrg } from "./helpers";
+import { BACKEND_URL, acceptInvitation, createOrg, joinAs } from "./helpers";
 
 /**
  * Sign-in via ``/api/auth/login?join={slug}`` must stamp the session
@@ -78,6 +78,15 @@ test("?join={slug} on sign-in lands the cookie on that org for a multi-org user"
     data: { email: USER, role: "user" },
   });
   expect([200, 201]).toContain(resp.status());
+
+  // user@ accepts both invitations: a member of both orgs.
+  const joiner = await playwright.request.newContext();
+  try {
+    await joinAs(joiner, USER, ORG_A);
+    await acceptInvitation(joiner, ORG_B);
+  } finally {
+    await joiner.dispose();
+  }
 
   // ── Sign in twice from independent contexts, once per direction.
   // Asserting both directions proves the join slug is honored

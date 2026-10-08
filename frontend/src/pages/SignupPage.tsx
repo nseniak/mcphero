@@ -2,31 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate } from "react-router";
 import { checkSlug, createOrg, switchOrg } from "../api/orgs";
 import { FieldHint } from "../components/ui/field-hint";
+import { PendingInvitations } from "../components/PendingInvitations";
 import { useAuth } from "../hooks/useAuth";
+import { sanitizeSlugInput, suggestSlug, validateSlug } from "../lib/org-slug";
 import { track } from "../lib/analytics";
 import { reportClientError } from "../lib/clientErrorReporter";
-
-function suggestSlug(name: string): string {
-  return name
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 40);
-}
-
-const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/;
-const SLUG_CHARS = /[^a-z0-9-]/g;
-
-function validateSlug(value: string): string | null {
-  if (!value) return null; // don't show error on empty
-  if (SLUG_CHARS.test(value)) return "Only lowercase letters, numbers, and hyphens allowed";
-  if (value.startsWith("-") || value.endsWith("-")) return "Cannot start or end with a hyphen";
-  if (value.length < 3) return "Must be at least 3 characters";
-  if (value.length > 40) return "Must be at most 40 characters";
-  if (!SLUG_REGEX.test(value)) return "Invalid format";
-  return null;
-}
 
 export function SignupPage() {
   const { user, loading: authLoading } = useAuth();
@@ -167,6 +147,9 @@ export function SignupPage() {
   return (
     <section className="px-6 pt-16 pb-20 md:pt-20 md:pb-24">
       <div className="max-w-xl mx-auto space-y-8">
+        {/* Invited to an organization: join it here, or create your own
+            below. Signing in never joins one by itself. */}
+        <PendingInvitations invitations={user.invitations} />
         <div className="text-center space-y-3">
           <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
             One last step
@@ -208,7 +191,7 @@ export function SignupPage() {
               value={slug}
               onFocus={() => setSlugTouched(true)}
               onChange={(e) => {
-                const raw = e.target.value.toLowerCase().replace(SLUG_CHARS, "");
+                const raw = sanitizeSlugInput(e.target.value);
                 setSlug(raw);
                 setSlugEdited(true);
                 checkSlugAvailability(raw);

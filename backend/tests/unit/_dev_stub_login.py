@@ -48,3 +48,14 @@ def logout(client: TestClient) -> None:
     resp = client.post("/api/auth/logout")
     assert resp.status_code == 204, resp.text
     client.cookies.clear()
+
+
+def accept_invitation(
+    client: TestClient, email: str, *, slug: str = "default",
+) -> None:
+    """Sign in as ``email`` and accept their invitation to the org at
+    ``slug`` (the Join button), the only way an invited person becomes a
+    member. Leaves ``email`` signed in."""
+    login_as(client, email)
+    resp = client.post(f"/api/invitations/{slug}/accept")
+    assert resp.status_code == 200, resp.text

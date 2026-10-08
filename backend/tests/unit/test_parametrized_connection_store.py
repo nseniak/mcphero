@@ -7,6 +7,7 @@ not change observable behavior. When Mongo is not reachable the
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -191,6 +192,24 @@ async def test_pending_code(backend: str, tmp_path: Path) -> None:
         assert await store.pop_pending_code(
             DEFAULT_ORG_ID, "slack", "alice@co.com",
         ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_pending_code_concurrent_pops_hand_it_out_once(
+    backend: str, tmp_path: Path,
+) -> None:
+    """Parallel pops of one pending sign-in code: exactly one caller
+    gets the code. A read-then-delete pop hands it to several."""
+    async with _make_store(backend, tmp_path) as store:
+        await store.put_pending_code(
+            DEFAULT_ORG_ID, "slack", "alice@co.com", "code-1", "state-1",
+        )
+        results = await asyncio.gather(*(
+            store.pop_pending_code(DEFAULT_ORG_ID, "slack", "alice@co.com")
+            for _ in range(10)
+        ))
+        assert [r for r in results if r is not None] == [("code-1", "state-1")]
 
 
 # ── oauth_metadata: round-trip across backends (§3.8 / §5.4) ─────
@@ -886,7 +905,7 @@ async def _save_older_row(
         "updated_at": datetime.now(UTC).isoformat(),
     }
     for field in missing:
-        del doc[field]
+        doc.pop(field, None)
     await store._coll.replace_one(  # pyright: ignore[reportPrivateUsage]
         DEFAULT_ORG_ID, {"key": "user:notion:alice"}, doc, upsert=True,
     )
@@ -934,6 +953,66 @@ async def test_every_refresh_of_the_stored_sign_in_is_saved(
         assert (stored.access_token, stored.sign_in, stored.revision) == (
             "refreshed-2", signed_in.sign_in, second,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_a_refresh_keeps_the_time_of_the_sign_in(
+    backend: str, tmp_path: Path,
+) -> None:
+    """The admin sign-in slot goes to the admin who signed in last
+    (``slot_owner_of``). A refresh is a save, not a sign-in: it keeps the
+    sign-in's time, which a new sign-in replaces."""
+    async with _make_store(backend, tmp_path) as store:
+        signed_in = await store.put_user_token(
+            DEFAULT_ORG_ID, "alice", "notion", _token("old"),
+        )
+        first = await _stored(store)
+        assert first is not None and first.signed_in_at is not None
+
+        await asyncio.sleep(0.01)
+        await store.put_user_token_if_same_sign_in(
+            DEFAULT_ORG_ID, "alice", "notion", _token("refreshed"),
+            expected_sign_in=signed_in.sign_in,
+        )
+        refreshed = await _stored(store)
+        await asyncio.sleep(0.01)
+        await store.put_user_token(DEFAULT_ORG_ID, "alice", "notion", _token("new"))
+        new = await _stored(store)
+
+        assert refreshed is not None and refreshed.signed_in_at == first.signed_in_at
+        assert new is not None and new.signed_in_at is not None
+        assert new.signed_in_at > first.signed_in_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_a_row_saved_before_sign_in_times_keeps_its_last_save_as_one(
+    backend: str, tmp_path: Path,
+) -> None:
+    """A row saved before ``signed_in_at`` existed counts its last save as
+    its sign-in time (``sign_in_time``), the time the admin sign-in slot
+    was ordered by until then. Its first refresh saves that time as its
+    ``signed_in_at``: the refresh's own time would move the slot to
+    whichever admin was refreshed last."""
+    async with _make_store(backend, tmp_path) as store:
+        await _save_older_row(store, _token("older"), missing=("signed_in_at",))
+        older = await _stored(store)
+        assert older is not None and older.signed_in_at is None
+        assert older.updated_at is not None
+        assert older.sign_in_time == older.updated_at
+
+        await asyncio.sleep(0.01)
+        assert await store.put_user_token_if_same_sign_in(
+            DEFAULT_ORG_ID, "alice", "notion", _token("refreshed"),
+            expected_sign_in=older.sign_in,
+        ) is not None
+        refreshed = await _stored(store)
+
+        assert refreshed is not None and refreshed.updated_at is not None
+        assert refreshed.updated_at > older.updated_at
+        assert refreshed.signed_in_at == older.updated_at
+        assert refreshed.sign_in_time == older.updated_at
 
 
 @pytest.mark.asyncio

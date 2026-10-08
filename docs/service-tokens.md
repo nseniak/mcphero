@@ -56,6 +56,8 @@ curl -s https://mcphero.io/mcp/your-org/ \
 
 Use the organization-scoped URL (`/mcp/your-org`) from the dashboard. The token only works for its own organization — pointing it at another organization's URL is rejected.
 
+> **Rate limits.** Each token has its own tool-call limit, counted over the last minute. A call over the limit returns a tool error that starts with `Rate limit reached` and says how many seconds to wait. Have your agent wait that long and retry, rather than retrying at once. See [Rate limits](concepts.md) on the Concepts page.
+
 > **Gateway URL by mode.** The examples above are cloud (`mcphero.io`), where the gateway is org-scoped: `/mcp/<org-slug>`. In **standalone** mode there's a single `default` org and the gateway is served at the bare `/mcp` (e.g. `http://localhost:8080/mcp`) — no slug. Whichever mode you run, copy the exact URL shown on the dashboard's **Gateway MCP** / **Connect AI Assistant** page rather than hand-building it.
 
 ## Tokens in the audit log

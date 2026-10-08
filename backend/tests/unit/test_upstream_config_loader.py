@@ -66,7 +66,9 @@ def test_load_with_bearer_token(tmp_path: Path) -> None:
 
     result = load_merged_config(mcp_json)
     assert result[0].auth.mode == AuthMode.service_account
-    assert result[0].auth.token == "sk-secret"
+    # The header is the token's only home.
+    assert result[0].http is not None
+    assert result[0].http.headers == {"Authorization": "Bearer sk-secret"}
 
 
 def test_options_override_display_name_and_auth(tmp_path: Path) -> None:

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
+from mcpolis.domain.model.email_address import email_key, find_address
 from mcpolis.domain.model.settings import (
     ArgumentConstraint,
     SettingsConfig,
     ToolAccessConfig,
 )
 from mcpolis.domain.services.settings_resolver import (
+    NO_ROLE as _NO_ROLE,
     ResolvedSettings,
     resolve_settings,
     resolve_settings_for_role,
@@ -21,6 +24,8 @@ class PolicyDecision:
     reason: str
     matched_role: str | None = None
     matched_rule: str | None = None
+    # The argument whose value broke an argument pattern, on such a denial.
+    matched_argument: str | None = None
 
 
 def _resolve_tool_access(
@@ -33,7 +38,7 @@ def _resolve_tool_access(
     Resolution order:
     1. Category defaults (deny wins if multiple match)
     2. Explicit per-tool override
-    3. Catch-all fallback_enabled (True if None)
+    3. Catch-all fallback_enabled (None = deny tools not listed)
 
     Category defaults represent category-level policy and take
     precedence over per-tool overrides (including inherited ones).
@@ -59,16 +64,80 @@ def _resolve_tool_access(
 
 
 class PolicyEngine:
-    def __init__(self, config: SettingsConfig) -> None:
+    """Who may do what in one org.
+
+    ``config.users`` holds the org's members AND its pending invitations:
+    an admin adds an address there when they invite it. An invitation
+    becomes a membership only when the invited person accepts it, which
+    saves their membership row. ``members`` mirrors those rows: an
+    address in ``config.users`` that is not in it is only invited, and
+    gets no role here (no tools, no admin rights) until it accepts.
+
+    ``members=None`` means membership is not tracked (engines built
+    straight from a config, as many tests do): everyone in
+    ``config.users`` is then a member.
+
+    Addresses compare ignoring letter case: an invitation typed as
+    ``Bob@Acme.com`` is accepted, and used, by ``bob@acme.com``. A
+    member's own spelling (the address they accepted with, which their
+    sign-ins are kept under) is what ``get_admin_emails`` and
+    ``address_of`` give back.
+    """
+
+    def __init__(
+        self,
+        config: SettingsConfig,
+        members: Iterable[str] | None = None,
+    ) -> None:
         self._config = config
+        # email_key -> the member's own spelling of their address.
+        self._members: dict[str, str] | None = (
+            {email_key(email): email for email in members}
+            if members is not None else None
+        )
 
     def reload(self, config: SettingsConfig) -> None:
-        """Hot-reload with a new config."""
+        """Hot-reload with a new config. The members are kept."""
         self._config = config
 
     @property
     def config(self) -> SettingsConfig:
         return self._config
+
+    def set_members(self, members: Iterable[str]) -> None:
+        """Replace the accepted members (the org's membership rows)."""
+        self._members = {email_key(email): email for email in members}
+
+    def add_member(self, email: str) -> None:
+        """``email`` accepted its invitation. No-op while membership is
+        not tracked."""
+        if self._members is not None:
+            self._members[email_key(email)] = email
+
+    def discard_member(self, email: str) -> None:
+        """``email`` is no longer a member (removed from the org)."""
+        if self._members is not None:
+            self._members.pop(email_key(email), None)
+
+    def _user_key(self, user_id: str) -> str | None:
+        """``user_id``'s key in ``config.users``, letter case ignored."""
+        return find_address(self._config.users, user_id)
+
+    def is_member(self, user_id: str) -> bool:
+        """Whether ``user_id`` is in the org's users AND accepted its
+        invitation. A pending invitation is not a membership."""
+        if self._user_key(user_id) is None:
+            return False
+        return self._members is None or email_key(user_id) in self._members
+
+    def address_of(self, user_key: str) -> str:
+        """The address the person at ``user_key`` (a key of
+        ``config.users``) signs in with: their own spelling once they
+        accepted, else the key itself. Their sign-ins, sessions and
+        tokens are kept under it."""
+        if self._members is None:
+            return user_key
+        return self._members.get(email_key(user_key), user_key)
 
     @property
     def is_empty(self) -> bool:
@@ -81,32 +150,31 @@ class PolicyEngine:
         return len(self._config.roles) == 0
 
     def get_user_roles(self, user_id: str) -> list[str]:
-        """Return role names for the given user."""
-        user = self._config.users.get(user_id)
-        if user is None:
+        """Return role names for the given member ([] for anyone else,
+        a pending invitation included)."""
+        key = self._user_key(user_id)
+        if key is None or not self.is_member(user_id):
             return []
-        return [user.role]
+        return [self._config.users[key].role]
 
     def has_role(self, user_id: str, role_name: str) -> bool:
-        """Check if a user is assigned to a role with the given name.
+        """Check if a member is assigned to a role with the given name.
 
         Strict role-name equality. Use :meth:`is_admin` for the
         "is this user an admin?" check — admin-ness is determined
         by ``RoleDefinition.is_admin``, not by the role's name.
         """
-        user = self._config.users.get(user_id)
-        if user is None:
-            return False
-        return user.role == role_name
+        return role_name in self.get_user_roles(user_id)
 
     def is_admin(self, user_id: str) -> bool:
         """Whether the user is admin in this org.
 
-        Resolves the user's role and returns its ``is_admin`` flag.
+        Resolves the member's role and returns its ``is_admin`` flag.
         Any role flagged ``is_admin=True`` grants admin, regardless
-        of the role's name. Unknown users → False.
+        of the role's name. Unknown users and pending invitations →
+        False.
         """
-        return resolve_settings(self._config, user_id).is_admin
+        return self._resolve(user_id, None).is_admin
 
     def admin_role_names(self) -> set[str]:
         """Names of every role flagged ``is_admin=True`` in this config."""
@@ -131,9 +199,12 @@ class PolicyEngine:
         return min(names)
 
     def get_admin_emails(self) -> list[str]:
-        """Return sorted list of emails of users who have admin privileges."""
+        """Return sorted list of emails of members who have admin
+        privileges (a pending admin invitation is not one), each as the
+        member signs in with it (``address_of``): callers look up the
+        admins' upstream sign-ins with them."""
         return sorted(
-            email
+            self.address_of(email)
             for email in self._config.users
             if self.is_admin(email)
         )
@@ -153,10 +224,13 @@ class PolicyEngine:
         ``boundary_role`` carries a role established at the auth
         boundary (service tokens); when present it wins over the
         ``config.users`` lookup — the identity (``svc:<label>``) has
-        no users entry by design.
+        no users entry by design. A pending invitation resolves to
+        no role at all.
         """
         if boundary_role is not None:
             return resolve_settings_for_role(self._config, boundary_role)
+        if not self.is_member(user_id):
+            return _NO_ROLE
         return resolve_settings(self._config, user_id)
 
     def get_allowed_upstreams(
@@ -320,6 +394,7 @@ class PolicyEngine:
                     allowed=False,
                     reason=f"argument '{arg_name}' matches forbidden pattern",
                     matched_role=role_name,
+                    matched_argument=arg_name,
                 )
         else:
             if not matches:
@@ -327,6 +402,7 @@ class PolicyEngine:
                     allowed=False,
                     reason=f"argument '{arg_name}' does not match required pattern",
                     matched_role=role_name,
+                    matched_argument=arg_name,
                 )
         return PolicyDecision(
             allowed=True,

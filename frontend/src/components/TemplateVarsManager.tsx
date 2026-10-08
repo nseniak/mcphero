@@ -17,10 +17,10 @@
  * Two flavours of variable coexist in the same list, distinguished
  * by ``is_secret``:
  *   - **Password** (``is_secret=true``, the default at create time):
- *     value is obfuscated by default in the UI as ``••••XYZ4`` with
- *     an eye toggle to reveal it (1Password-style). The plaintext
- *     IS returned by the API — encryption-at-rest in cloud mode is
- *     the security boundary, not "never echo back".
+ *     write-only. The API never returns a saved password; the row
+ *     shows only "set" or "empty". Replace starts with a blank value
+ *     box: blank keeps the saved value (sent as ``value: null``), a
+ *     typed value replaces it, and "Clear" saves the empty string.
  *   - **Plain** (``is_secret=false``): value rendered verbatim,
  *     useful for non-sensitive config like feature flags.
  *
@@ -31,7 +31,10 @@
  *
  * **Renames**: in Replace mode the name field is editable. If the
  * user changes the name, the buffer treats the save as
- * delete-old + set-new, atomically on the SETTINGS Save click.
+ * delete-old + set-new, atomically on the SETTINGS Save click. A
+ * password renamed without a new value is sent as
+ * ``{value: null, rename_from: OLD}`` so the backend moves the saved
+ * value it alone holds.
  */
 import type { JSX } from "react";
 import { useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
@@ -42,6 +45,7 @@ import { listSystemVariables as apiListSystemVariables } from "../api/sandbox-fi
 import type {
   SystemVariable,
   TemplateVarSummary,
+  UpdateUpstreamTemplateVarSpec,
 } from "../api/types";
 import { ConfirmDialog, useConfirm } from "./ConfirmDialog";
 import { FieldHint } from "./ui/field-hint";
@@ -67,14 +71,21 @@ export interface BufferedTemplateVar {
  * payload on SETTINGS Save. Cancel discards.
  *
  * Invariants kept by the manager:
- *   - A name in ``deletes`` is never also in ``sets`` (an Add after
- *     a Delete moves the name from ``deletes`` back into ``sets``).
+ *   - A name in both ``deletes`` and ``sets`` is a server row the
+ *     user deleted and then used again (Add, or a rename onto it).
+ *     The save deletes the old row first and creates a new one, so
+ *     the new row gets the pending ``is_secret``. (Taking the name
+ *     out of ``deletes`` would replace the old row in place, where
+ *     the old row's flag wins: a password typed onto a deleted plain
+ *     name would be saved as plain and shown.)
  *   - A buffered-only Add followed by Delete in the same session
  *     drops the name from ``sets`` without touching ``deletes`` —
  *     server has nothing to delete.
  */
 export interface PendingTemplateVarChanges {
-  sets: Record<string, BufferedTemplateVar>;
+  /** ``value: null`` = keep the saved value of ``rename_from`` (or of
+   *  the same name); the dashboard never holds a saved password. */
+  sets: Record<string, UpdateUpstreamTemplateVarSpec>;
   deletes: string[];
 }
 
@@ -125,14 +136,8 @@ interface TemplateVarsManagerProps {
   isStdio?: boolean;
 }
 
-function computeLastFourClient(value: string): string | null {
-  return value.length > 16 ? value.slice(-4) : null;
-}
-
-function maskedDisplay(lastFour: string | null): string {
-  return lastFour ? `••••${lastFour}` : "••••";
-}
-
+/** Row for a locally-held value. A password row drops its value so
+ *  buffered and server rows render the same way. */
 function summaryFromBuffered(
   name: string,
   spec: BufferedTemplateVar,
@@ -141,10 +146,8 @@ function summaryFromBuffered(
   return {
     name,
     is_secret: spec.is_secret,
-    // The list path now carries plaintext for password rows too —
-    // the SPA obfuscates them by default with an eye toggle.
-    value: spec.value,
-    last_four: spec.is_secret ? computeLastFourClient(spec.value) : null,
+    value: spec.is_secret ? null : spec.value,
+    has_value: spec.value !== "",
     created_at: isoZero,
     updated_at: isoZero,
   };
@@ -152,39 +155,50 @@ function summaryFromBuffered(
 
 /** Overlay deferred-mode pending mutations on top of the server list.
  *
- * Server rows queued for delete drop out. Server rows in ``sets``
- * keep their ``is_secret`` (the repository preserves the flag on
- * replace) but get the new value rendered optimistically. Names
- * only in ``sets`` (no server row) render as fresh additions.
+ * Server rows queued for delete drop out. A server row in ``sets``
+ * that is not deleted is replaced in place: it keeps its
+ * ``is_secret`` (the repository preserves the flag on replace) and
+ * shows the new value. Any other name in ``sets`` is a new row,
+ * including a deleted server row the save will recreate.
  */
 function mergePendingWithServer(
   server: TemplateVarSummary[],
   pending: PendingTemplateVarChanges,
 ): TemplateVarSummary[] {
   const deleteSet = new Set(pending.deletes);
+  const serverByName = new Map(server.map((s) => [s.name, s]));
   const result: TemplateVarSummary[] = [];
-  const serverNames = new Set<string>();
   for (const s of server) {
-    serverNames.add(s.name);
     if (deleteSet.has(s.name)) continue;
     const override = pending.sets[s.name];
-    if (override) {
-      // Replace: server's is_secret wins (repository contract).
-      result.push({
-        ...s,
-        value: override.value,
-        last_four: s.is_secret
-          ? computeLastFourClient(override.value)
-          : null,
-        updated_at: new Date().toISOString(),
-      });
-    } else {
+    if (!override) {
       result.push(s);
+      continue;
     }
+    // Replace in place: server's is_secret wins (repository contract).
+    result.push({
+      ...s,
+      value: s.is_secret ? null : (override.value ?? s.value),
+      has_value: override.value === null ? s.has_value : override.value !== "",
+      updated_at: new Date().toISOString(),
+    });
   }
   for (const [name, spec] of Object.entries(pending.sets)) {
-    if (serverNames.has(name)) continue;
-    result.push(summaryFromBuffered(name, spec));
+    if (serverByName.has(name) && !deleteSet.has(name)) continue;
+    if (spec.value === null) {
+      // A rename that keeps the saved value: show the source row under
+      // its new name. If the source is gone (another admin deleted
+      // it), still show the row, as empty, so it can be fixed: the
+      // save would fail on it.
+      const source = serverByName.get(spec.rename_from ?? name);
+      result.push(
+        source
+          ? { ...source, name }
+          : summaryFromBuffered(name, { value: "", is_secret: spec.is_secret }),
+      );
+      continue;
+    }
+    result.push(summaryFromBuffered(name, { value: spec.value, is_secret: spec.is_secret }));
   }
   result.sort((a, b) => a.name.localeCompare(b.name));
   return result;
@@ -202,7 +216,13 @@ export function TemplateVarsManager({
   isStdio = false,
 }: TemplateVarsManagerProps): JSX.Element {
   const isBuffered = upstreamId === "";
-  const isDeferred = !isBuffered && pendingChanges !== undefined;
+  const isDeferred =
+    !isBuffered && pendingChanges !== undefined && onPendingChange !== undefined;
+  // Edits need somewhere to land: the local buffer or the parent's
+  // pending-changes buffer. With an ``upstreamId`` but no buffer, a
+  // Save would close the modal and store nothing, so show no edit
+  // affordances at all, the same as ``readOnly``.
+  const editable = !readOnly && (isBuffered || isDeferred);
 
   // Buffered-mode local store (kept aligned with ``envVars`` by name).
   const bufferRef = useRef<Map<string, BufferedTemplateVar>>(
@@ -285,6 +305,9 @@ export function TemplateVarsManager({
   const [modalValue, setModalValue] = useState("");
   const [modalIsSecret, setModalIsSecret] = useState(true);
   const [modalReveal, setModalReveal] = useState(false);
+  // Replace on a password row: the blank value box means "keep the
+  // saved value"; this flag means "save it as empty" instead.
+  const [modalClear, setModalClear] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
   // The is_secret of the row being replaced — drives the input
   // masking + which copy renders below.
@@ -298,6 +321,7 @@ export function TemplateVarsManager({
     setModalValue("");
     setModalIsSecret(true);
     setModalReveal(false);
+    setModalClear(false);
     setModalError(null);
     setModalReplacingSecret(true);
     setModalOpen(true);
@@ -312,16 +336,16 @@ export function TemplateVarsManager({
       // without delete + re-add. The buffer logic in handleSave
       // handles delete-old + set-new when the name changes.
       setModalNameLocked(false);
-      // Prefill the value from the list so editing feels like a
-      // normal text field. Both kinds carry the plaintext now — the
-      // SPA obfuscates password rows by default and exposes an eye
-      // toggle to reveal.
-      setModalValue(currentValue ?? "");
+      // Plain rows prefill their value. A password row starts blank:
+      // the dashboard never holds a saved password, and blank means
+      // "keep the saved value".
+      setModalValue(isSecret ? "" : (currentValue ?? ""));
       setModalIsSecret(isSecret);
       setModalReplacingSecret(isSecret);
       // Plain rows show the value while typing; password rows start
-      // obfuscated (eye toggle reveals).
+      // hidden (eye toggle shows what you type).
       setModalReveal(!isSecret);
+      setModalClear(false);
       setModalError(null);
       setModalOpen(true);
     },
@@ -339,6 +363,7 @@ export function TemplateVarsManager({
     setModalValue("");
     setModalIsSecret(true);
     setModalReveal(false);
+    setModalClear(false);
     setModalError(null);
     setModalReplacingSecret(true);
     setModalOpen(true);
@@ -392,11 +417,25 @@ export function TemplateVarsManager({
     // we mirror so the buffered/deferred paths agree with the bound path).
     const effectiveIsSecret =
       modalMode === "replace" ? modalReplacingSecret : modalIsSecret;
-    const spec: BufferedTemplateVar = {
-      value: modalValue,
-      is_secret: effectiveIsSecret,
-    };
+    // Password Replace with a blank box (and Clear off) keeps the
+    // saved value instead of overwriting it.
+    const keepValue =
+      modalMode === "replace" && modalReplacingSecret
+      && modalValue === "" && !modalClear;
+    const typedValue = modalClear ? "" : modalValue;
     if (isBuffered) {
+      let value = typedValue;
+      if (keepValue) {
+        const kept = bufferRef.current.get(modalOriginalName);
+        if (kept === undefined) {
+          // Unreachable while bufferRef and the list stay in step.
+          // Fail loudly rather than save an empty password.
+          setModalError(`No value found for ${modalOriginalName}. Enter one.`);
+          return;
+        }
+        value = kept.value;
+      }
+      const spec: BufferedTemplateVar = { value, is_secret: effectiveIsSecret };
       // Rename support: drop the old key first when the user edits
       // the name on Replace. Same dict shape post-write either way.
       if (isRename) {
@@ -420,37 +459,54 @@ export function TemplateVarsManager({
       });
       onBufferedChange?.(Object.fromEntries(bufferRef.current));
     } else if (isDeferred && pendingChanges && onPendingChange) {
-      // Deferred: write to parent-owned buffer. Three sub-cases:
-      //
-      // 1. Replace without rename — ``sets[modalName] = spec``;
-      //    drop modalName from deletes (un-delete on re-add).
-      // 2. Add (or unrelated to rename) — same shape as (1).
-      // 3. Rename — drop the OLD name from sets; if the OLD name is
-      //    on the server (i.e. has a server-side row to remove on
-      //    flush), add it to deletes; then set the NEW name. The
-      //    repository contract preserves is_secret on the original
-      //    row, but a renamed variable is a brand-new record on the
-      //    server, so we send the spec's flag through.
+      // Deferred: write to the parent-owned buffer.
+      //   - A rename drops the OLD name from sets and, when the old
+      //     name has a server row, queues that row for delete.
+      //   - A NEW name that is a deleted server row stays in deletes,
+      //     so the save recreates it (see PendingTemplateVarChanges).
+      const prior = pendingChanges.sets[modalOriginalName];
+      if (keepValue && !prior && !isRename) {
+        // Blank password box on a saved row: nothing changed.
+        closeModal();
+        return;
+      }
       const oldName = isRename ? modalOriginalName : null;
       const oldOnServer =
         oldName !== null && serverList.some((s) => s.name === oldName);
-
       const nextSets = { ...pendingChanges.sets };
       if (oldName !== null) delete nextSets[oldName];
-      nextSets[modalName] = spec;
-
-      let nextDeletes = pendingChanges.deletes.filter(
-        (n) => n !== modalName,
-      );
+      let nextDeletes = pendingChanges.deletes;
       if (oldName !== null && oldOnServer && !nextDeletes.includes(oldName)) {
         nextDeletes = [...nextDeletes, oldName];
+      }
+
+      if (!keepValue) {
+        nextSets[modalName] = { value: typedValue, is_secret: effectiveIsSecret };
+      } else if (prior && prior.value !== null) {
+        // Carry an earlier unsaved typed value over.
+        nextSets[modalName] = { ...prior, is_secret: effectiveIsSecret };
+      } else {
+        // The saved value lives in a server row: an earlier rename's
+        // source, or the row being edited.
+        const source = prior?.rename_from ?? modalOriginalName;
+        if (source === modalName) {
+          // Renamed back to the saved row itself: restore that row and
+          // queue nothing for it. Rewriting it would bump updated_at
+          // and raise the restart banner for nothing.
+          delete nextSets[modalName];
+          nextDeletes = nextDeletes.filter((n) => n !== modalName);
+        } else {
+          nextSets[modalName] = {
+            value: null, is_secret: effectiveIsSecret, rename_from: source,
+          };
+        }
       }
       onPendingChange({ sets: nextSets, deletes: nextDeletes });
     }
     closeModal();
   }, [
     closeModal, existingNames, isBuffered, isDeferred,
-    modalIsSecret, modalMode, modalName, modalOriginalName,
+    modalClear, modalIsSecret, modalMode, modalName, modalOriginalName,
     modalReplacingSecret, modalValue, onBufferedChange,
     onPendingChange, pendingChanges, serverList,
   ]);
@@ -540,7 +596,7 @@ export function TemplateVarsManager({
               : "Placeholders expanded into the config JSON."}
           </p>
         </div>
-        {!readOnly && (
+        {editable && (
           <button
             type="button"
             onClick={openAdd}
@@ -555,7 +611,7 @@ export function TemplateVarsManager({
         <p className="text-sm text-red-600">{error}</p>
       )}
 
-      {!readOnly && unresolvedNames.length > 0 && (
+      {editable && unresolvedNames.length > 0 && (
         <div className="border border-amber-200 rounded p-2 bg-amber-50 text-xs">
           <div className="flex items-center gap-1.5 text-amber-800 mb-1.5">
             <AlertTriangle size={12} />
@@ -641,15 +697,10 @@ export function TemplateVarsManager({
                   <span className="font-mono text-xs text-zinc-900 shrink-0">
                     {envVar.name}
                   </span>
-                  {envVar.value !== null ? (
-                    envVar.is_secret ? (
-                      <PasswordValueCell
-                        value={envVar.value}
-                        lastFour={envVar.last_four}
-                      />
-                    ) : (
-                      <PlainValueCell value={envVar.value} />
-                    )
+                  {envVar.is_secret ? (
+                    <PasswordStatusCell hasValue={envVar.has_value} />
+                  ) : envVar.value !== null ? (
+                    <PlainValueCell value={envVar.value} />
                   ) : (
                     <span className="font-mono text-xs text-zinc-400 italic">
                       (no value)
@@ -670,7 +721,7 @@ export function TemplateVarsManager({
                     </span>
                   )}
                 </div>
-                {!readOnly && (
+                {editable && (
                   <div className="flex items-center gap-1 shrink-0">
                     <button
                       type="button"
@@ -757,8 +808,8 @@ export function TemplateVarsManager({
                   <span className="font-medium">Treat as password</span>
                 </label>
                 <FieldHint>
-                  When on: value is obfuscated by default in the list;
-                  click the eye icon on the row to reveal it.
+                  When on: once saved, the value is never shown again,
+                  to you or anyone. You can replace or clear it.
                 </FieldHint>
               </div>
             )}
@@ -779,8 +830,13 @@ export function TemplateVarsManager({
                   }
                   value={modalValue}
                   onChange={(e) => setModalValue(e.target.value)}
-                  placeholder="Paste value"
-                  className="w-full px-2 py-1.5 pr-9 border border-zinc-300 rounded text-sm font-mono"
+                  placeholder={
+                    modalMode === "replace" && modalReplacingSecret
+                      ? "Leave blank to keep the saved value"
+                      : "Paste value"
+                  }
+                  disabled={modalClear}
+                  className="w-full px-2 py-1.5 pr-9 border border-zinc-300 rounded text-sm font-mono disabled:bg-zinc-100"
                   autoFocus={modalNameLocked}
                 />
                 {(modalMode === "add" ? modalIsSecret : modalReplacingSecret) && (
@@ -794,6 +850,19 @@ export function TemplateVarsManager({
                   </button>
                 )}
               </div>
+              {modalMode === "replace" && modalReplacingSecret && (
+                <label className="mt-2 flex items-center gap-2 text-xs text-zinc-700">
+                  <input
+                    type="checkbox"
+                    checked={modalClear}
+                    onChange={(e) => {
+                      setModalClear(e.target.checked);
+                      if (e.target.checked) setModalValue("");
+                    }}
+                  />
+                  <span>Clear the saved value (save it as empty)</span>
+                </label>
+              )}
             </div>
             {modalError && (
               <p className="text-sm text-red-600">{modalError}</p>
@@ -878,80 +947,14 @@ function PlainValueCell({ value }: { value: string }): JSX.Element {
   );
 }
 
-/** Password row body: 1Password-style obfuscated-by-default display
- *  with an eye toggle to reveal the value, plus a one-click copy
- *  button that always copies the plaintext (no reveal needed).
+/** Password row body: "set" or "empty", never the value.
  *
- *  - Default: ``••••XYZ4`` (or ``••••`` if the value is too short for
- *    a last-4 preview).
- *  - Revealed: full value rendered the same way ``PlainValueCell``
- *    does — truncated with a hover tooltip when long.
- *  - Copy: same affordance as the plain cell. Distinct from "reveal"
- *    so the operator can paste a secret without putting it on screen.
- */
-function PasswordValueCell({
-  value, lastFour,
-}: { value: string; lastFour: string | null }): JSX.Element {
-  const [revealed, setRevealed] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1200);
-    } catch {
-      // Clipboard write can fail in non-secure contexts; ignore so
-      // the UI doesn't error out.
-    }
-  }, [value]);
-  const truncated = value.length > PLAIN_VALUE_TRUNCATE_AT;
-  const revealedDisplay = truncated
-    ? value.slice(0, PLAIN_VALUE_TRUNCATE_AT) + "…"
-    : value;
+ *  Passwords are write-only, so the API never returns one and there
+ *  is nothing to reveal or copy. */
+function PasswordStatusCell({ hasValue }: { hasValue: boolean }): JSX.Element {
   return (
-    <span className="flex items-center gap-1 min-w-0">
-      {revealed ? (
-        truncated ? (
-          <Tooltip>
-            <TooltipTrigger
-              render={(props) => (
-                <span {...props}>
-                  <span className="font-mono text-xs text-zinc-700 truncate">
-                    {revealedDisplay}
-                  </span>
-                </span>
-              )}
-            />
-            <TooltipContent className="font-mono">{value}</TooltipContent>
-          </Tooltip>
-        ) : (
-          <span className="font-mono text-xs text-zinc-700 truncate">
-            {revealedDisplay}
-          </span>
-        )
-      ) : (
-        <span className="font-mono text-xs text-zinc-500 shrink-0">
-          {maskedDisplay(lastFour)}
-        </span>
-      )}
-      <button
-        type="button"
-        onClick={() => setRevealed((r) => !r)}
-        className="p-0.5 text-zinc-400 hover:text-zinc-700 shrink-0"
-        title={revealed ? "Hide value" : "Reveal value"}
-        aria-label={revealed ? "Hide value" : "Reveal value"}
-      >
-        {revealed ? <EyeOff size={11} /> : <Eye size={11} />}
-      </button>
-      <button
-        type="button"
-        onClick={() => void handleCopy()}
-        className="p-0.5 text-zinc-400 hover:text-zinc-700 shrink-0"
-        title={copied ? "Copied" : "Copy value"}
-        aria-label={copied ? "Copied" : "Copy value"}
-      >
-        {copied ? <Check size={11} /> : <Copy size={11} />}
-      </button>
+    <span className="font-mono text-xs text-zinc-500 shrink-0">
+      {hasValue ? "•••• set" : "empty"}
     </span>
   );
 }

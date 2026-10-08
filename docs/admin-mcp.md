@@ -23,18 +23,27 @@ Open the **Admin MCP** page in the sidebar.
 
 Once connected, your AI client sees the Admin MCP's management tools alongside its other MCP tools. Ask it `what admin tools do you have?` to confirm.
 
+Admin MCP calls have a per-person rate limit. If you go over it, the call returns an error that says how many seconds to wait. See [Rate limits](concepts.md) on the Concepts page.
+
 ## What you can do
 
 The Admin MCP exposes management tools across six areas. Open the Admin MCP page in the dashboard for the full, current list — every tool's name, description, and annotations are shown there, and that page stays in sync as MCP Hero ships new tools.
 
 The categories at time of writing:
 
-- **Upstream management** — list, add, remove, connect, disconnect, refresh tools.
+- **Upstream management** — list, add, remove, start, connect, disconnect, refresh tools. Like on the dashboard, a newly added MCP starts stopped until you start it.
 - **Tool customization** — view/set/remove default arguments per upstream tool.
 - **Audit** — search the audit log with filters, including arguments and policy decisions that aren't shown in the dashboard table.
 - **User management** — list members, add or remove members, change a member's role.
 - **Role management** — list, create, delete, rename roles.
 - **Access policies** — set or clear every access rule a role can have: per-MCP, per-tool, annotation-based, argument checks.
+
+Your AI client is not shown an MCP's credentials. Reading an MCP's settings says whether a token or an OAuth client secret is set, not what it is:
+
+- Every header and environment variable value reads `[hidden]`, unless it is made only of Variables you reference as `${NAME}`, such as `${GITHUB_TOKEN}` or `Bearer ${API_TOKEN}`. Those show as written.
+- In the URL, the command and its arguments, what may hold a credential reads `[hidden]`: the part before `@` in a URL (user name and password), a password-like parameter or flag value, an environment variable set on the command line, a header passed as an argument, and anything shaped like a key.
+
+A credential typed in clear into a URL or an argument is hidden only when it looks like one. Keep credentials in Variables: reading an MCP's settings never shows a Variable's value.
 
 ## Authentication
 

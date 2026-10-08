@@ -13,7 +13,10 @@ and fails the build if any slip in.
 """
 from __future__ import annotations
 
-from typing import Any
+import uuid
+from collections.abc import Callable
+from typing import Any, cast
+from urllib.parse import parse_qsl, urlsplit
 
 import structlog
 from motor.motor_asyncio import (
@@ -21,7 +24,8 @@ from motor.motor_asyncio import (
     AsyncIOMotorCollection,
     AsyncIOMotorDatabase,
 )
-from pymongo import ASCENDING, DESCENDING
+from pymongo import ASCENDING, DESCENDING, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 # Motor is generic over the document type. We always store regular
 # ``dict[str, Any]`` BSON documents, so alias the parameterized types
@@ -31,6 +35,7 @@ MotorCollection = AsyncIOMotorCollection[dict[str, Any]]
 MotorClient = AsyncIOMotorClient[dict[str, Any]]
 
 from mcpolis.adapters.repositories.encryption import (
+    DECRYPTION_ERRORS,
     FieldEncryptor,
     decrypt_fields,
     encrypt_fields,
@@ -47,10 +52,20 @@ COLL_CONFIG = "config"
 COLL_UPSTREAMS = "upstreams"
 COLL_CONNECTIONS = "connections"
 COLL_AUDIT = "audit"
+# Gateway OAuth state: one document per registered client, access
+# token, refresh token and client approval (see
+# ``mongo_oauth_state_repository``).
+COLL_GATEWAY_OAUTH = "gateway_oauth"
+# The older layout of the same state: ONE document holding all of it.
+# Read at startup until it has been converted once; then kept as it was,
+# for a rollback to an older build (see ``mongo_oauth_state_repository``).
 COLL_OAUTH_STATE = "oauth_state"
 COLL_LOCKS = "locks"
 COLL_TOOL_CATALOG = "tool_catalog"
 COLL_SANDBOX_REFS = "sandbox_refs"
+# One doc: the sandbox instance id of this database (see
+# ``SandboxPersistenceRepository.get_or_create_instance_id``).
+COLL_SANDBOX_INSTANCE = "sandbox_instance"
 COLL_TEMPLATE_VARS = "mcp_template_vars"
 COLL_SANDBOX_FILES = "mcp_sandbox_files"
 # No ENCRYPTED_FIELDS entry: only the sha256 hash of the token is
@@ -71,16 +86,22 @@ ENCRYPTED_FIELDS: dict[str, list[str]] = {
         "client_info.client_secret",
         "client_info.registration_access_token",
     ],
+    COLL_GATEWAY_OAUTH: [
+        # Each item (client, token, approval) is serialized to JSON in
+        # ``payload``, so every sensitive field (client secrets, tokens,
+        # emails) is encrypted without enumerating them. ``kind`` and
+        # ``key`` (a keyed hash) stay plaintext for lookups.
+        "payload",
+    ],
     COLL_OAUTH_STATE: [
-        # Gateway OAuth state is stored as a single snapshot doc per
-        # org with an ``encrypted_payload`` field. The whole payload is
-        # encrypted as one blob (see ``mongo_oauth_state_repository``).
+        # The older single snapshot document: its ``encrypted_payload``
+        # was encrypted by the repository AND again here, so reading it
+        # takes both layers (see ``mongo_oauth_state_repository``).
         "encrypted_payload",
     ],
     COLL_TEMPLATE_VARS: [
-        # Per-MCP secrets — the plaintext value is encrypted at rest.
-        # ``last_four`` and timestamps stay plaintext so the listing
-        # path never needs to decrypt.
+        # Per-MCP Variables — the value is encrypted at rest; the
+        # ``is_secret`` flag and timestamps stay plaintext.
         "value",
     ],
     COLL_SANDBOX_FILES: [
@@ -139,6 +160,13 @@ class OrgScopedCollection:
         self._encryptor = encryptor
         self._enc_fields = ENCRYPTED_FIELDS.get(collection_name, [])
 
+    @property
+    def database(self) -> MotorDatabase:
+        """The database this collection lives in, for the rare
+        non-org-scoped sibling a repository needs."""
+        # motor's stubs type ``Collection.database`` as a collection.
+        return cast(MotorDatabase, self._raw.database)
+
     # --- Internal helpers ---
 
     def _scope(self, org_id: str, filter_: dict[str, Any] | None) -> dict[str, Any]:
@@ -174,7 +202,12 @@ class OrgScopedCollection:
         sort: list[tuple[str, int]] | None = None,
         limit: int = 0,
         skip: int = 0,
+        on_unreadable: Callable[[dict[str, Any], Exception], None] | None = None,
     ) -> list[dict[str, Any]]:
+        """The matching documents, decrypted. A document that does not
+        decrypt raises, unless ``on_unreadable`` is given: it is then
+        handed the raw document and the error, and the document is left
+        out (one bad document need not cost every other)."""
         cursor = self._raw.find(self._scope(org_id, filter_))
         if sort:
             cursor = cursor.sort(sort)
@@ -183,7 +216,15 @@ class OrgScopedCollection:
         if limit:
             cursor = cursor.limit(limit)
         docs: list[dict[str, Any]] = await cursor.to_list(length=None)
-        return [self._decrypt(d) for d in docs]
+        if on_unreadable is None:
+            return [self._decrypt(d) for d in docs]
+        readable: list[dict[str, Any]] = []
+        for doc in docs:
+            try:
+                readable.append(self._decrypt(doc))
+            except DECRYPTION_ERRORS as error:
+                on_unreadable(doc, error)
+        return readable
 
     async def find_many_cross_org(
         self,
@@ -258,6 +299,17 @@ class OrgScopedCollection:
                     )
         await self._raw.update_one(scoped_filter, update, upsert=upsert)
 
+    async def find_one_and_delete(
+        self, org_id: str, filter_: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Read and remove one document as a single atomic step, so two
+        parallel callers can never both receive it (single-use values
+        such as pending sign-in codes)."""
+        doc = await self._raw.find_one_and_delete(self._scope(org_id, filter_))
+        if doc is None:  # pyright: ignore[reportUnnecessaryComparison]
+            return None
+        return self._decrypt(doc)
+
     async def delete_one(
         self, org_id: str, filter_: dict[str, Any]
     ) -> int:
@@ -309,6 +361,30 @@ class OrgScopedCollection:
 # ---------------------------------------------------------------------------
 
 
+# How long an operation waits for Mongo's answer on an open connection
+# before it fails, when the URI does not say (``socketTimeoutMS``).
+# pymongo's own default is to wait forever: an answer lost on a
+# connection that stays open (a network fault, a stuck server) would hold
+# the operation, and any lock its caller holds (an admin action's roles
+# lock, an MCP's Stop/Start lock), for good. pymongo bounds the other
+# waits itself, at 20 s to connect and 30 s to find a server; 30 s here
+# too. Every operation of this app is a small indexed read or write, or
+# an index creation on a small collection at startup, answered in
+# milliseconds, so only a hung connection reaches it.
+SOCKET_TIMEOUT_MS = 30_000
+
+
+def _client_options(uri: str, socket_timeout_ms: int) -> dict[str, Any]:
+    """The keyword options the client gets on top of the URI's: the
+    socket timeout, unless the URI bounds the wait itself
+    (``socketTimeoutMS``, or ``timeoutMS``, which replaces it). An option
+    given here would override the URI's."""
+    named = {name.lower() for name, _value in parse_qsl(urlsplit(uri).query)}
+    if named & {"sockettimeoutms", "timeoutms"}:
+        return {}
+    return {"socketTimeoutMS": socket_timeout_ms}
+
+
 class MongoConnection:
     """Owns the motor client and exposes the database handle.
 
@@ -317,8 +393,16 @@ class MongoConnection:
     they only see ``OrgScopedCollection`` instances.
     """
 
-    def __init__(self, uri: str, db_name: str) -> None:
-        self._client: MotorClient = AsyncIOMotorClient(uri)
+    def __init__(
+        self,
+        uri: str,
+        db_name: str,
+        *,
+        socket_timeout_ms: int = SOCKET_TIMEOUT_MS,
+    ) -> None:
+        self._client: MotorClient = AsyncIOMotorClient(
+            uri, **_client_options(uri, socket_timeout_ms),
+        )
         self._db_name = db_name
 
     @property
@@ -327,6 +411,34 @@ class MongoConnection:
 
     def close(self) -> None:
         self._client.close()
+
+
+async def get_or_create_sandbox_instance_id(db: MotorDatabase) -> str:
+    """Return this database's sandbox instance id, minting it once.
+
+    Not org-scoped (one value per database), so it lives here with the
+    other raw motor calls. Atomic insert-if-absent: every process on
+    this database gets the first id ever written. Two first boots
+    racing on the upsert can make the loser hit the unique ``_id``; it
+    then reads the winner's value.
+    """
+    coll = db[COLL_SANDBOX_INSTANCE]
+    query = {"_id": "instance"}
+    try:
+        doc = await coll.find_one_and_update(
+            query,
+            {"$setOnInsert": {"value": uuid.uuid4().hex}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        doc = await coll.find_one(query)
+    value = doc.get("value") if doc is not None else None
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(
+            f"{COLL_SANDBOX_INSTANCE} holds no usable instance id: {doc!r}",
+        )
+    return value
 
 
 async def create_indexes(
@@ -397,9 +509,13 @@ async def create_indexes(
         expire_after_seconds=audit_retention_days * 86400,
     )
 
-    # OAuth state: one snapshot doc per org.
-    await db[COLL_OAUTH_STATE].create_index(
-        [("org_id", ASCENDING)], unique=True, name="uniq_org"
+    # Gateway OAuth state: one doc per item. The unique key also makes
+    # the one-time conversion of the older single document unable to
+    # store an item twice.
+    await db[COLL_GATEWAY_OAUTH].create_index(
+        [("org_id", ASCENDING), ("kind", ASCENDING), ("key", ASCENDING)],
+        unique=True,
+        name="uniq_org_kind_key",
     )
 
     # Tool catalog: one doc per (org, upstream_id), persisted so the

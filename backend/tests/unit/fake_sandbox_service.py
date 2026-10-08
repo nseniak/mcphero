@@ -487,8 +487,9 @@ class FakeSandboxService:
 
     async def on_upstream_removed(
         self, *, org_id: str, upstream_id: str,
-    ) -> None:
+    ) -> bool:
         _ = org_id, upstream_id
+        return False
 
     async def kill_persisted_session(
         self, *, org_id: str, upstream_id: str,

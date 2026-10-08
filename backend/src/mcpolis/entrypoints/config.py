@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ipaddress
-import os
 from pathlib import Path
 from typing import Any, Literal, Self, cast
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from mcpolis.domain.model.email_allowlist import EmailAllowlist
+from mcpolis.domain.services.url_safety import loopback_switch_on
 
 Mode = Literal["standalone", "cloud"]
 
@@ -94,16 +96,36 @@ class Settings(BaseSettings):
     # Comma-separated list of emails that can access /admin-mcp/system.
     superadmin_emails: str = Field(default="")
 
-    # Rate limits (per-minute). Applied by the Phase 2d
-    # ``RateLimitMiddleware`` in both modes — in-memory counter in
-    # standalone, Redis sliding-window ZSET in cloud.
-    rate_limit_auth_per_min: int = Field(default=10)
-    rate_limit_tool_per_min: int = Field(default=100)
-    rate_limit_admin_per_min: int = Field(default=50)
+    # Request rate limits, per sliding minute (``RateLimitService``):
+    # in-memory counters in standalone, Redis in cloud. Gateway
+    # tool-call limits depend on the plan and live in
+    # ``plan_policy.PlanLimits``; these are the plan-independent ones.
+    # ``rate_limit_enabled=false`` switches every limit off (operator
+    # lever: ``make mcpolis-restart`` picks it up without a deploy).
+    rate_limit_enabled: bool = Field(default=True)
+    # Per client IP: gateway + dashboard sign-in, public org lookup,
+    # browser error reports.
+    rate_limit_sign_in_per_min: int = Field(default=30, ge=1)
+    # Per signed-in user (per client IP when anonymous): ``/api/*``.
+    rate_limit_dashboard_per_min: int = Field(default=300, ge=1)
+    # Per user: Admin MCP tool calls.
+    rate_limit_admin_mcp_per_min: int = Field(default=60, ge=1)
+
+    # How many reverse proxies sit in front of the backend and append
+    # to ``X-Forwarded-For``. The client IP is the entry that many
+    # places from the right; anything further left was written by the
+    # client and is ignored. 0 = use the TCP peer (no proxy, or dev).
+    # Production is 2: Caddy, then the nginx container.
+    trusted_proxy_hops: int = Field(default=0, ge=0)
 
     # Graceful drain timeout in seconds. On SIGTERM the backend stops
     # accepting new requests and waits this long for in-flight ones.
     drain_timeout: float = Field(default=30.0)
+    # After the drain, how long uvicorn lets open connections (event
+    # streams, MCP streams, slow responses) finish before cutting them
+    # and running the shutdown cleanup. ``drain_timeout`` plus this plus
+    # the cleanup must fit in the container's ``stop_grace_period``.
+    graceful_shutdown_timeout: int = Field(default=5)
 
     # PolicyNotifier debounce window in seconds. Rapid admin edits
     # collapse to one ``tools/list_changed`` push per burst; this sets
@@ -197,13 +219,15 @@ class Settings(BaseSettings):
     # Picks which SandboxService backend handles every stdio MCP. One
     # of: ``e2b``, ``local-subprocess``. Empty ⇔ ``e2b`` when an API
     # key is configured, else ``local-subprocess`` (the unsafe dev
-    # path with a startup warning). The own-runner backend was deleted
-    # in plan ``serene-beaming-tulip.md`` §Phase 5; rejecting that
-    # value at startup keeps stale env files honest.
+    # path with a startup warning) — standalone only: cloud mode
+    # refuses an empty value without a key at startup, so the
+    # unsandboxed path must be named explicitly there. The own-runner
+    # backend was deleted in plan ``serene-beaming-tulip.md`` §Phase 5;
+    # rejecting that value at startup keeps stale env files honest.
     sandbox_provider: str = Field(default="")
-    # E2B API key. Required (and validated at startup) only when
-    # ``sandbox_provider=e2b`` in cloud mode. Standalone runs may set
-    # the value but it's never enforced.
+    # E2B API key. Required (and validated at startup) in cloud mode
+    # when ``sandbox_provider`` is ``e2b`` or empty. Standalone runs
+    # may set the value but it's never enforced.
     e2b_api_key: str = Field(default="")
     # Operator switch for E2B Volumes (the persistent-disk feature
     # behind ``UpstreamDefinition.stdio.persistent_disk_enabled``).
@@ -290,8 +314,9 @@ class Settings(BaseSettings):
             self.oauth_provider = "google"
         return self
 
-    def parsed_superadmin_emails(self) -> set[str]:
-        """Parse ``superadmin_emails`` (comma-separated) into a set.
+    def parsed_superadmin_emails(self) -> EmailAllowlist:
+        """Parse ``superadmin_emails`` (comma-separated) into an
+        allowlist that matches ignoring letter case.
 
         Single source of truth for the instance-level superadmin
         allowlist — used by the dashboard auth dependencies, the
@@ -299,11 +324,7 @@ class Settings(BaseSettings):
         org-context middleware's super-admin org override. Empty in
         standalone mode (the feature is cloud-only).
         """
-        return {
-            e.strip()
-            for e in self.superadmin_emails.split(",")
-            if e.strip()
-        }
+        return EmailAllowlist(self.superadmin_emails.split(","))
 
 
 class StartupConfigError(RuntimeError):
@@ -353,8 +374,9 @@ def _is_loopback_bind(host: str) -> bool:
 def validate_startup_secrets(settings: Settings) -> None:
     """Fail fast if the running mode is missing required secrets.
 
-    Standalone mode accepts dev defaults (nothing to validate here — the
-    app is running on the user's own machine). Cloud mode refuses to start
+    Standalone mode accepts dev defaults (the app is running on the
+    user's own machine); its one check is the loopback switch, refused
+    off a loopback bind in both modes. Cloud mode refuses to start
     without ``SESSION_SECRET``, ``ENCRYPTION_KEY``, ``MONGO_URI`` and
     ``REDIS_URL``; the latter three aren't consumed yet (Phase 2c), but
     we surface the requirement now so a misconfigured cloud deploy fails
@@ -383,6 +405,22 @@ def validate_startup_secrets(settings: Settings) -> None:
                 "a loopback MCPOLIS_HOST to exercise this path.)"
             )
 
+    # SSRF deny-list (security finding F-01) blocks user-supplied
+    # upstream URLs that point at private/loopback ranges. The
+    # ``MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK=1`` switch opens up
+    # 127.0.0.0/8 + ``::1`` so dev/e2e fixtures (demo MCP, fake OAuth
+    # server) keep working. In either mode the switch is only acceptable
+    # when bound to a loopback address: a server listening on ``0.0.0.0``
+    # (or a public IP) is treated as production, where the switch would
+    # let an org admin probe the host's own local services.
+    if loopback_switch_on() and not _is_loopback_bind(settings.host):
+        raise StartupConfigError(
+            "MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK=1 is only permitted "
+            f"with a loopback MCPOLIS_HOST. Got {settings.host!r}; a "
+            "non-loopback bind is treated as production and must keep "
+            "the strict SSRF deny-list intact."
+        )
+
     if settings.mode == "standalone":
         return
 
@@ -407,25 +445,6 @@ def validate_startup_secrets(settings: Settings) -> None:
             "MCPOLIS_OAUTH_PROVIDER=google."
         )
 
-    # SSRF deny-list (security finding F-01) blocks user-supplied
-    # upstream URLs that point at private/loopback ranges. The
-    # ``MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK=1`` flag opens up
-    # 127.0.0.0/8 + ``::1`` so dev/e2e fixtures (demo MCP, fake OAuth
-    # server) keep working. In cloud mode the flag is only acceptable
-    # when bound to a loopback address — a real prod deploy listens on
-    # ``0.0.0.0`` (or a public IP), so the flag would let a co-tenant
-    # admin probe the EC2 host's local services.
-    if (
-        os.environ.get("MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK") == "1"
-        and not _is_loopback_bind(settings.host)
-    ):
-        raise StartupConfigError(
-            "MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK=1 is only permitted "
-            f"with a loopback MCPOLIS_HOST. Got {settings.host!r}; a "
-            "non-loopback bind is treated as production and must keep "
-            "the strict SSRF deny-list intact."
-        )
-
     missing: list[str] = []
     if not settings.session_secret or settings.session_secret == "mcpolis-dev-secret":
         missing.append("MCPOLIS_SESSION_SECRET")
@@ -442,35 +461,63 @@ def validate_startup_secrets(settings: Settings) -> None:
             "non-dev values: " + ", ".join(missing)
         )
 
-    # Sandbox provider: cloud mode allows only ``e2b``. The
-    # ``local-subprocess`` no-isolation path is dev-only; the
-    # ``own-runner`` backend was deleted in Phase 5 and is rejected
-    # outright so a stale env var doesn't silently disable the
-    # sandbox.
-    if settings.sandbox_provider:
-        if settings.sandbox_provider == "own-runner":
-            raise StartupConfigError(
-                "MCPOLIS_SANDBOX_PROVIDER=own-runner is no longer supported. "
-                "The own-runner backend was deleted; remove the env var or "
-                "set it to 'e2b'."
-            )
-        if settings.sandbox_provider not in {"e2b", "local-subprocess"}:
-            raise StartupConfigError(
-                "MCPOLIS_SANDBOX_PROVIDER must be one of "
-                "'e2b' / 'local-subprocess'; got "
-                f"{settings.sandbox_provider!r}."
-            )
-        if settings.sandbox_provider == "e2b" and not settings.e2b_api_key:
-            raise StartupConfigError(
-                "MCPOLIS_SANDBOX_PROVIDER=e2b requires "
-                "MCPOLIS_E2B_API_KEY to be set so the SDK can authenticate."
-            )
-        if settings.sandbox_provider == "local-subprocess":
-            raise StartupConfigError(
-                "MCPOLIS_SANDBOX_PROVIDER=local-subprocess is not allowed "
-                "in cloud mode — it runs every stdio MCP unsandboxed on "
-                "the backend host."
-            )
+    # Sandbox provider: cloud mode never falls back silently to the
+    # unsandboxed ``local-subprocess`` runner (operator decision,
+    # 2026-10-07).
+    # - ``own-runner``: the backend was deleted in Phase 5; rejected
+    #   so a stale env var doesn't silently disable the sandbox.
+    # - empty: ``_build_sandbox_provider_plumbing`` resolves it to
+    #   ``e2b`` when a key is set, else to ``local-subprocess``. The
+    #   second case is the silent fallback, so it is refused here.
+    # - ``local-subprocess``: must be named explicitly, and only on a
+    #   literal loopback bind (local dev, e2e) — the same line the
+    #   loopback-only escape hatches above draw. The production image
+    #   listens on ``0.0.0.0``. The check trusts ``MCPOLIS_HOST``, not
+    #   real reachability: a loopback bind behind a same-host reverse
+    #   proxy still serves tenants, so it is not a safe production
+    #   setup, and naming the runner there stays an explicit,
+    #   loudly-logged operator choice.
+    # ``.strip()`` matches how the plumbing reads the value.
+    sandbox_provider = settings.sandbox_provider.strip()
+    if sandbox_provider == "own-runner":
+        raise StartupConfigError(
+            "MCPOLIS_SANDBOX_PROVIDER=own-runner is no longer supported. "
+            "The own-runner backend was deleted; remove the env var or "
+            "set it to 'e2b'."
+        )
+    if sandbox_provider not in {"", "e2b", "local-subprocess"}:
+        raise StartupConfigError(
+            "MCPOLIS_SANDBOX_PROVIDER must be one of "
+            "'e2b' / 'local-subprocess'; got "
+            f"{settings.sandbox_provider!r}."
+        )
+    if sandbox_provider == "e2b" and not settings.e2b_api_key:
+        raise StartupConfigError(
+            "MCPOLIS_SANDBOX_PROVIDER=e2b requires "
+            "MCPOLIS_E2B_API_KEY to be set so the SDK can authenticate."
+        )
+    if not sandbox_provider and not settings.e2b_api_key:
+        raise StartupConfigError(
+            "MCPOLIS_SANDBOX_PROVIDER is empty and MCPOLIS_E2B_API_KEY is "
+            "not set. Cloud mode does not fall back to the unsandboxed "
+            "local-subprocess runner: set MCPOLIS_E2B_API_KEY (with "
+            "MCPOLIS_SANDBOX_PROVIDER=e2b or empty). For local "
+            "development only, never in production: name the unsafe "
+            "runner explicitly with "
+            "MCPOLIS_SANDBOX_PROVIDER=local-subprocess and bind "
+            "MCPOLIS_HOST to 127.0.0.1 or ::1."
+        )
+    if sandbox_provider == "local-subprocess" and not _is_loopback_bind(
+        settings.host
+    ):
+        raise StartupConfigError(
+            "MCPOLIS_SANDBOX_PROVIDER=local-subprocess is not allowed "
+            "in cloud mode unless MCPOLIS_HOST is a literal loopback IP "
+            "(127.0.0.1 or ::1; hostnames such as localhost are not "
+            "accepted). It runs every stdio MCP unsandboxed on the "
+            "backend host, so it is for local development and e2e "
+            f"only. Got {settings.host!r}."
+        )
 
     # §5.2 email notifications. Flipping the flag on in cloud mode
     # without a configured SMTP transport would silently "send" via

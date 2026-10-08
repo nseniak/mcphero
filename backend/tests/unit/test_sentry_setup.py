@@ -9,11 +9,16 @@ because the hook only read the (unset) ``current_user_id`` ContextVar.
 """
 from __future__ import annotations
 
+import json
 import logging
+import uuid
 from typing import cast
 
+import sentry_sdk
 import structlog
+from sentry_sdk.envelope import Envelope
 from sentry_sdk.integrations.logging import EventHandler
+from sentry_sdk.transport import Transport
 from sentry_sdk.types import Event, Hint
 
 from mcpolis.adapters.observability.sentry_setup import (
@@ -220,3 +225,52 @@ def test_e2b_sdk_error_lines_never_become_sentry_issues() -> None:
     assert handler._can_record(  # pyright: ignore[reportPrivateUsage]
         record_from("mcpolis.adapters.sandbox_e2b.service"),
     ), "our own errors must still reach Sentry"
+
+
+class CaptureTransport(Transport):
+    """Keeps every event payload Sentry would send, sends nothing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.payloads: list[str] = []
+
+    def capture_envelope(self, envelope: Envelope) -> None:
+        for item in envelope.items:
+            if item.payload.json is not None:
+                self.payloads.append(json.dumps(item.payload.json))
+
+
+def make_failing_save(saved_password: str) -> None:
+    """Fails while a saved password sits in one of its locals, like a
+    rename whose write fails."""
+    value = saved_password
+    raise OSError(28, f"No space left on device ({len(value)} bytes)")
+
+
+def test_sentry_events_carry_no_frame_locals_nor_request_bodies() -> None:
+    # Built at run time: Sentry sends the source lines around each
+    # frame, and a literal here would show up in them.
+    saved_password = f"ghp_{uuid.uuid4().hex}"
+    transport = CaptureTransport()
+    settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        sentry_dsn="http://public@sentry.invalid/1",
+    )
+    try:
+        assert init_sentry(settings, transport=transport)
+        try:
+            make_failing_save(saved_password)
+        except OSError as exc:
+            sentry_sdk.capture_exception(exc)
+        sentry_sdk.flush()
+        options = sentry_sdk.get_client().options
+    finally:
+        sentry_sdk.init()  # no DSN: Sentry off again for later tests
+    assert transport.payloads, "the exception must still reach Sentry"
+    assert "make_failing_save" in "".join(transport.payloads)
+    leaks = [
+        p[max(p.index(saved_password) - 300, 0):p.index(saved_password) + 60]
+        for p in transport.payloads if saved_password in p
+    ]
+    assert not leaks, leaks
+    assert options["max_request_body_size"] == "never"

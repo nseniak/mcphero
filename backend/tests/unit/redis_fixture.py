@@ -1,7 +1,7 @@
 """Shared helpers for the Phase 2d Redis-backed tests.
 
 ``MCPOLIS_TEST_REDIS_URL`` selects the Redis endpoint — default is
-``redis://localhost:6379/15`` (db 15 by convention to stay off dev/prod
+``redis://127.0.0.1:6379/15`` (db 15 by convention to stay off dev/prod
 data). If the variable is empty or the probe below cannot connect,
 the Redis-backed tests are skipped. Each test is responsible for
 flushing its own keys before starting (keys are namespaced by
@@ -15,12 +15,12 @@ from urllib.parse import urlparse
 
 import pytest
 
-_DEFAULT_URL = "redis://localhost:6379/15"
+_DEFAULT_URL = "redis://127.0.0.1:6379/15"
 
 
 def _probe(url: str) -> bool:
     parsed = urlparse(url)
-    host = parsed.hostname or "localhost"
+    host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 6379
     try:
         with socket.create_connection((host, port), timeout=0.5):

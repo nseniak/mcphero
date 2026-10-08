@@ -56,6 +56,18 @@ class ServiceTokenRepository(Protocol):
         """Revoke a token. Returns False when the label is unknown."""
         ...
 
+    async def rename_role(
+        self, org_id: str, old_name: str, new_name: str
+    ) -> int:
+        """Point every token of this org holding ``old_name`` at
+        ``new_name``. Returns the number of tokens moved.
+
+        A token holds its role by name, and the policy engine fails
+        closed on an unknown role, so a role rename that skips this
+        leaves the token with zero tools.
+        """
+        ...
+
     async def delete_for_org(self, org_id: str) -> int:
         """Revoke every token of an org (org-deletion cascade).
 

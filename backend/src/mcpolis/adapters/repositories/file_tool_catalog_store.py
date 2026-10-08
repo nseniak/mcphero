@@ -7,6 +7,7 @@ from typing import Any
 
 import structlog
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
 from mcpolis.domain.ports.tool_catalog_repository import (
     ToolCatalogRepository,
     ToolCatalogSnapshot,
@@ -45,9 +46,7 @@ class FileToolCatalogStore(ToolCatalogRepository):
             return {}
 
     def _write(self, org_id: str, data: dict[str, Any]) -> None:
-        path = self._path(org_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2))
+        write_text_atomic(self._path(org_id), json.dumps(data, indent=2))
 
     async def load_all(
         self, org_id: str,

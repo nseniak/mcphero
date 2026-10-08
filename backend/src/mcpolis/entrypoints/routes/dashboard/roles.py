@@ -1,33 +1,20 @@
-"""Roles router (15 routes).
+"""Roles router (15 routes): the Roles and Access pages.
 
-The largest write-side cluster in the dashboard surface — every
-``policy_store`` mutation (mcp-access, tool-access, category
-defaults, argument constraints, role CRUD) lives here. All routes
-fire ``notify_policy_change(role=name)`` on success so connected
-gateway sessions re-list tools / re-resolve permissions.
-
-The ``_role_access_info`` helper used to be a closure in
-``create_dashboard_api_router``; now a private module-level function.
+Each route runs the role action the Admin MCP shares
+(``RoleAdminService``): create, rename and delete roles, and every edit
+of what a role may use (mcp-access, tool-access, category defaults,
+argument constraints). A refusal becomes an HTTP error through the
+app-level ``AdminActionRefused`` handler. Every edit returns the role's
+new full state.
 """
 # pyright: reportUnusedFunction=false
 from __future__ import annotations
 
-import re
+from fastapi import APIRouter, Depends
 
-from fastapi import APIRouter, Depends, HTTPException
-
-from mcpolis.adapters.observability.analytics_client import get_analytics
-from mcpolis.domain.model.settings import ArgumentConstraint, SettingsConfig
-from mcpolis.domain.services.plan_gates import (
-    assert_argument_constraints_allowed,
-    assert_custom_role_capacity,
-    resolve_plan,
-)
+from mcpolis.domain.model.settings import SettingsConfig
 from mcpolis.entrypoints.controllers.gateway_controller import current_org_id
-from mcpolis.entrypoints.routes.dashboard._deps import (
-    DashboardDeps,
-    notify_policy_change,
-)
+from mcpolis.entrypoints.routes.dashboard._deps import DashboardDeps
 from mcpolis.entrypoints.routes.dashboard._models import (
     CreateRoleRequest,
     RenameRoleRequest,
@@ -43,11 +30,7 @@ from mcpolis.entrypoints.routes.dashboard._models import (
 
 
 def _role_access_info(name: str, config: SettingsConfig) -> RoleAccessInfo:
-    """Pack a role's settings into the wire shape the Access page reads.
-
-    Was a closure inside ``create_dashboard_api_router`` — used by
-    every role mutation so they all return the new full role state.
-    """
+    """Pack a role's settings into the wire shape the Access page reads."""
     role = config.roles[name]
     return RoleAccessInfo(
         name=name,
@@ -64,29 +47,20 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         prefix="/api/admin", tags=["dashboard-admin"],
         dependencies=[Depends(deps.require_admin)],
     )
+    roles = deps.role_admin
 
     @router.get("/roles", response_model=list[RoleSummary])
     async def list_roles() -> list[RoleSummary]:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        config = runtime.policy_engine.config
-        user_counts: dict[str, int] = {}
-        for user in config.users.values():
-            user_counts[user.role] = user_counts.get(user.role, 0) + 1
-        token_counts: dict[str, int] = {}
-        if deps.service_token_service is not None:
-            token_counts = await deps.service_token_service.count_by_role(
-                org_id,
-            )
+        summaries = await roles.list_roles(current_org_id.get())
         return [
             RoleSummary(
-                name=name,
-                is_admin=role.is_admin,
-                is_default=role.is_default,
-                user_count=user_counts.get(name, 0),
-                service_token_count=token_counts.get(name, 0),
+                name=summary.name,
+                is_admin=summary.is_admin,
+                is_default=summary.is_default,
+                user_count=summary.user_count,
+                service_token_count=summary.service_token_count,
             )
-            for name, role in config.roles.items()
+            for summary in summaries
         ]
 
     @router.get("/roles/access", response_model=list[RoleAccessInfo])
@@ -101,16 +75,9 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         role_name: str,
         body: SetRoleMcpAccessRequest,
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        try:
-            new_config = await deps.policy_store.set_role_mcp_access(
-                org_id, role_name, body.mcp_access,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
+        new_config = await roles.set_mcp_access(
+            current_org_id.get(), role_name, body.mcp_access,
+        )
         return _role_access_info(role_name, new_config)
 
     @router.put("/roles/{role_name}/mcps/{mcp_id}")
@@ -120,24 +87,9 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         body: SetMcpAccessRequest,
         admin_email: str = Depends(deps.require_admin),
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        try:
-            new_config = await deps.policy_store.set_role_mcp_access_entry(
-                org_id, role_name, mcp_id, body.enabled,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
-        get_analytics().track_async(
-            admin_email,
-            "role_mcp_access_changed",
-            {
-                "role_name": role_name,
-                "upstream_id": mcp_id,
-                "enabled": body.enabled,
-            },
+        new_config = await roles.set_mcp_access_entry(
+            current_org_id.get(), role_name, mcp_id, body.enabled,
+            actor=admin_email,
         )
         return _role_access_info(role_name, new_config)
 
@@ -146,16 +98,9 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         role_name: str,
         body: SetAutoEnableNewRequest,
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        try:
-            new_config = await deps.policy_store.set_role_auto_enable_new(
-                org_id, role_name, body.auto_enable_new,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
+        new_config = await roles.set_auto_enable_new(
+            current_org_id.get(), role_name, body.auto_enable_new,
+        )
         return _role_access_info(role_name, new_config)
 
     # --- Tool access endpoints ---
@@ -168,25 +113,9 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         body: SetEnabledRequest,
         admin_email: str = Depends(deps.require_admin),
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        try:
-            new_config = await deps.policy_store.set_role_tool_access_entry(
-                org_id, role_name, upstream_id, tool_name, body.enabled,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
-        get_analytics().track_async(
-            admin_email,
-            "role_tool_access_changed",
-            {
-                "role_name": role_name,
-                "upstream_id": upstream_id,
-                "tool_name": tool_name,
-                "decision": "allow" if body.enabled else "deny",
-            },
+        new_config = await roles.set_tool_access_entry(
+            current_org_id.get(), role_name, upstream_id, tool_name,
+            body.enabled, actor=admin_email,
         )
         return _role_access_info(role_name, new_config)
 
@@ -196,16 +125,9 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
     async def remove_role_tool_access_entry(
         role_name: str, upstream_id: str, tool_name: str,
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        try:
-            new_config = await deps.policy_store.remove_role_tool_access_entry(
-                org_id, role_name, upstream_id, tool_name,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
+        new_config = await roles.remove_tool_access_entry(
+            current_org_id.get(), role_name, upstream_id, tool_name,
+        )
         return _role_access_info(role_name, new_config)
 
     @router.put(
@@ -215,16 +137,10 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         role_name: str, upstream_id: str,
         body: SetToolFallbackEnabledRequest,
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        try:
-            new_config = await deps.policy_store.set_role_tool_fallback_enabled(
-                org_id, role_name, upstream_id, body.fallback_enabled,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
+        new_config = await roles.set_tool_fallback_enabled(
+            current_org_id.get(), role_name, upstream_id,
+            body.fallback_enabled,
+        )
         return _role_access_info(role_name, new_config)
 
     @router.put(
@@ -234,16 +150,10 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         role_name: str, upstream_id: str, annotation: str,
         body: SetEnabledRequest,
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        try:
-            new_config = await deps.policy_store.set_role_tool_category_default(
-                org_id, role_name, upstream_id, annotation, body.enabled,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
+        new_config = await roles.set_category_default(
+            current_org_id.get(), role_name, upstream_id, annotation,
+            body.enabled,
+        )
         return _role_access_info(role_name, new_config)
 
     @router.delete(
@@ -252,16 +162,9 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
     async def remove_role_tool_category_default(
         role_name: str, upstream_id: str, annotation: str,
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        try:
-            new_config = await deps.policy_store.remove_role_tool_category_default(
-                org_id, role_name, upstream_id, annotation,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
+        new_config = await roles.remove_category_default(
+            current_org_id.get(), role_name, upstream_id, annotation,
+        )
         return _role_access_info(role_name, new_config)
 
     # --- Argument constraints ---
@@ -278,30 +181,13 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         body: SetArgumentConstraintRequest,
         admin_email: str = Depends(deps.require_admin),
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        plan = await resolve_plan(deps.org_repo, org_id)
-        assert_argument_constraints_allowed(
-            plan,
+        new_config = await roles.set_argument_constraint(
+            current_org_id.get(), role_name, upstream_id, tool_name, arg_name,
+            pattern=body.pattern,
+            mode=body.mode,
+            actor=admin_email,
             source="dashboard.set_role_argument_constraint",
-            org_id=org_id,
-            actor_email=admin_email,
         )
-        try:
-            re.compile(body.pattern)
-        except re.error as e:
-            raise HTTPException(400, f"Invalid regex: {e}") from None
-        if body.mode not in ("allow", "forbid"):
-            raise HTTPException(400, f"Invalid mode: {body.mode}")
-        constraint = ArgumentConstraint(pattern=body.pattern, mode=body.mode)
-        try:
-            new_config = await deps.policy_store.set_role_argument_constraint(
-                org_id, role_name, upstream_id, tool_name, arg_name, constraint,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
         return _role_access_info(role_name, new_config)
 
     @router.delete(
@@ -314,16 +200,9 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         tool_name: str,
         arg_name: str,
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        try:
-            new_config = await deps.policy_store.remove_role_argument_constraint(
-                org_id, role_name, upstream_id, tool_name, arg_name,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
+        new_config = await roles.remove_argument_constraint(
+            current_org_id.get(), role_name, upstream_id, tool_name, arg_name,
+        )
         return _role_access_info(role_name, new_config)
 
     # --- Role CRUD ---
@@ -333,73 +212,33 @@ def create_roles_router(deps: DashboardDeps) -> APIRouter:
         body: CreateRoleRequest,
         admin_email: str = Depends(deps.require_admin),
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        # Custom-role gate: built-in roles (admin + the is_default
-        # role, today "user") don't count. Robust against the
-        # past root→default rename — anyone adding a new built-in
-        # in the future just needs to flag it ``is_admin`` or
-        # ``is_default``.
-        plan = await resolve_plan(deps.org_repo, org_id)
-        current_custom = sum(
-            1 for r in runtime.policy_engine.config.roles.values()
-            if not r.is_admin and not r.is_default
-        )
-        assert_custom_role_capacity(
-            plan, current_custom,
+        new_config = await roles.create_role(
+            current_org_id.get(), body.name,
+            copy_from=body.copy_from,
+            actor=admin_email,
             source="dashboard.create_role",
-            org_id=org_id,
-            actor_email=admin_email,
         )
-        try:
-            new_config = await deps.policy_store.create_role(
-                org_id, body.name, copy_from=body.copy_from,
-            )
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from None
-        runtime.policy_engine.reload(new_config)
         return _role_access_info(body.name, new_config)
 
     @router.delete("/roles/{role_name}")
-    async def delete_role(role_name: str) -> dict[str, str]:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        # Service-token guard: the policy store only knows about
-        # config.users; tokens reference roles from their own
-        # registry, so check here before touching the store.
-        if deps.service_token_service is not None:
-            token_counts = await deps.service_token_service.count_by_role(
-                org_id,
-            )
-            in_use = token_counts.get(role_name, 0)
-            if in_use:
-                raise HTTPException(
-                    400,
-                    f"Cannot delete role '{role_name}': {in_use} service "
-                    f"token(s) assigned",
-                )
-        try:
-            new_config = await deps.policy_store.delete_role(org_id, role_name)
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
+    async def delete_role(
+        role_name: str,
+        admin_email: str = Depends(deps.require_admin),
+    ) -> dict[str, str]:
+        await roles.delete_role(
+            current_org_id.get(), role_name, actor=admin_email,
+        )
         return {"status": "removed"}
 
     @router.put("/roles/{role_name}/rename", response_model=RoleAccessInfo)
     async def rename_role(
-        role_name: str, body: RenameRoleRequest,
+        role_name: str,
+        body: RenameRoleRequest,
+        admin_email: str = Depends(deps.require_admin),
     ) -> RoleAccessInfo:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        try:
-            new_config = await deps.policy_store.rename_role(
-                org_id, role_name, body.new_name,
-            )
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from None
-        runtime.policy_engine.reload(new_config)
-        notify_policy_change(deps, role=role_name)
+        new_config = await roles.rename_role(
+            current_org_id.get(), role_name, body.new_name, actor=admin_email,
+        )
         return _role_access_info(body.new_name, new_config)
 
     return router

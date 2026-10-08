@@ -22,6 +22,7 @@ from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
 from tests.unit._dev_stub_login import login_as
+from tests.unit.factories import make_config_users_accepted
 
 ADMIN_EMAIL = "admin@example.com"
 
@@ -67,6 +68,7 @@ def make_settings(tmp_path: Path, *, mcp_json: str, config_json: str) -> Setting
     mcp_path.write_text(mcp_json)
     config_path = tmp_path / "config.json"
     config_path.write_text(config_json)
+    make_config_users_accepted(tmp_path / "data", config_json)
     # Standalone now defaults the lone org to the unlimited Team plan, so
     # seed an explicit Free subscription: these tests exercise the Free
     # gate mechanics, and the Team-path tests overwrite this via

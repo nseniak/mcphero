@@ -85,3 +85,22 @@ async def test_get_filter_values(backend: str, tmp_path: Path) -> None:
         assert "bob" in filters["user_ids"]
         assert "mcp-a" in filters["upstream_ids"]
         assert "mcp-b" in filters["upstream_ids"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_cross_org_search_filters_by_org_before_the_limit(
+    backend: str, tmp_path: Path,
+) -> None:
+    async with _make_repo(backend, tmp_path) as repo:
+        for i in range(2):
+            await repo.log("acme", make_audit_entry(
+                org_id="acme", timestamp=f"2026-01-01T00:00:0{i}Z",
+            ))
+        for i in range(4):
+            await repo.log("globex", make_audit_entry(
+                org_id="globex", timestamp=f"2026-01-02T00:00:0{i}Z",
+            ))
+        rows = await repo.search_cross_org(org_id="acme", limit=2)
+        assert len(rows) == 2
+        assert {r["org_id"] for r in rows} == {"acme"}

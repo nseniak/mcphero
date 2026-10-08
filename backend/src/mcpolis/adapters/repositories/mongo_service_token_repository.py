@@ -92,6 +92,15 @@ class MongoServiceTokenRepository(ServiceTokenRepository):
         )
         return result.deleted_count > 0
 
+    async def rename_role(
+        self, org_id: str, old_name: str, new_name: str
+    ) -> int:
+        result = await self._coll.update_many(
+            {"org_id": org_id, "role_name": old_name},
+            {"$set": {"role_name": new_name}},
+        )
+        return result.modified_count
+
     async def delete_for_org(self, org_id: str) -> int:
         result = await self._coll.delete_many({"org_id": org_id})
         return result.deleted_count

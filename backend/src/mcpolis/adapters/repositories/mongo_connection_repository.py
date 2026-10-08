@@ -157,25 +157,34 @@ class MongoConnectionRepository(ConnectionStore, ConnectionRepository):
         )
         if doc is None or "token" not in doc:
             return None
-        # The revision and the sign-in id sit beside the token, in plain
-        # text, so a conditional write can filter on them; the token's
-        # secrets are encrypted with a random nonce and cannot be.
+        return self._user_token_from_doc(doc)
+
+    @staticmethod
+    def _user_token_from_doc(doc: dict[str, Any]) -> OAuthToken:
+        # The revision, the sign-in id and its time sit beside the token,
+        # in plain text, so a conditional write can filter on them; the
+        # token's secrets are encrypted with a random nonce and cannot be.
+        signed_in_raw = doc.get("signed_in_at")
         return dataclasses.replace(
             _deserialize_token(doc["token"]),
             revision=doc.get("revision"),
             sign_in=doc.get("sign_in"),
+            signed_in_at=(
+                datetime.fromisoformat(signed_in_raw) if signed_in_raw else None
+            ),
         )
 
     @staticmethod
     def _user_token_doc(
         user_id: str, upstream_id: str, token: OAuthToken,
-        *, revision: str, sign_in: str | None,
+        *, revision: str, sign_in: str | None, signed_in_at: str | None,
     ) -> dict[str, Any]:
         return {
             "key": _user_key(user_id, upstream_id),
             "token": _serialize_token(token),
             "revision": revision,
             "sign_in": sign_in,
+            "signed_in_at": signed_in_at,
             "updated_at": datetime.now(UTC).isoformat(),
         }
 
@@ -189,6 +198,7 @@ class MongoConnectionRepository(ConnectionStore, ConnectionRepository):
             self._user_token_doc(
                 user_id, upstream_id, token,
                 revision=saved.revision, sign_in=saved.sign_in,
+                signed_in_at=datetime.now(UTC).isoformat(),
             ),
             upsert=True,
         )
@@ -200,16 +210,32 @@ class MongoConnectionRepository(ConnectionStore, ConnectionRepository):
     ) -> str | None:
         # ``sign_in: None`` also matches a row saved before sign-in ids
         # existed (no such field), which is what ``None`` stands for.
+        sign_in_filter = {
+            "key": _user_key(user_id, upstream_id),
+            "sign_in": expected_sign_in,
+        }
+        # The sign-in's time, which the refresh keeps. Every row of one
+        # sign-in carries the same one, so reading it from whichever is
+        # stored now is safe: if another sign-in replaced it meanwhile,
+        # the filtered write below matches nothing. A row saved before
+        # ``signed_in_at`` existed gets its last save's time, once.
+        current = await self._coll.find_one(org_id, sign_in_filter)
+        if current is None:
+            return None
+        sign_in_time = (
+            self._user_token_from_doc(current).sign_in_time
+            if "token" in current else None
+        )
         revision = uuid.uuid4().hex
         matched = await self._coll.replace_one(
             org_id,
-            {
-                "key": _user_key(user_id, upstream_id),
-                "sign_in": expected_sign_in,
-            },
+            sign_in_filter,
             self._user_token_doc(
                 user_id, upstream_id, token,
                 revision=revision, sign_in=expected_sign_in,
+                signed_in_at=(
+                    sign_in_time.isoformat() if sign_in_time is not None else None
+                ),
             ),
             upsert=False,
         )
@@ -645,14 +671,13 @@ class MongoConnectionRepository(ConnectionStore, ConnectionRepository):
     async def pop_pending_code(
         self, org_id: str, upstream_id: str, user_id: str
     ) -> tuple[str, str] | None:
-        doc = await self._coll.find_one(
+        # One atomic step: a read followed by a delete would hand the
+        # same code to every caller that read before the first delete.
+        doc = await self._coll.find_one_and_delete(
             org_id, {"key": _pending_code_key(upstream_id, user_id)}
         )
         if doc is None:
             return None
-        await self._coll.delete_one(
-            org_id, {"key": _pending_code_key(upstream_id, user_id)}
-        )
         code = doc.get("code")
         state = doc.get("original_state")
         if not isinstance(code, str) or not isinstance(state, str):

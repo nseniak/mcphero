@@ -22,7 +22,7 @@
  */
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
 
-import { apiLoginAs, loginAs, OAUTH_TEST_MCP_URL as FAKE_OAUTH, BACKEND_URL as BACKEND } from "./helpers";
+import { apiLoginAs, loginAs, OAUTH_TEST_MCP_URL as FAKE_OAUTH, resetOAuthUpstream, BACKEND_URL as BACKEND } from "./helpers";
 const ORG = "acme-corp";
 const ADMIN_A = "admin@example.com";
 const ADMIN_B = "admin2@example.com";
@@ -71,10 +71,7 @@ async function clickAndCompletePopup(
 // queued email / TTL knob can't leak into this run.
 test.beforeEach(async ({ request }) => {
   await request.post(`${FAKE_OAUTH}/test/reset`);
-  await apiLoginAs(request, ADMIN_A);
-  await request.post(
-    `${BACKEND}/api/admin/upstreams/${UPSTREAM}/disconnect`
-  );
+  await resetOAuthUpstream(request, UPSTREAM);
 });
 
 test.describe("admin_oauth take-over via the UI", () => {
@@ -114,7 +111,7 @@ test.describe("admin_oauth take-over via the UI", () => {
     ).not.toBeVisible();
   });
 
-  test("admin B sees the slot-owner subtitle and takes over via Disconnect → Authenticate", async ({
+  test("admin B sees the slot-owner subtitle and stops it with Disconnect, then Connect brings A's sign-in back", async ({
     browser,
     request,
   }) => {
@@ -146,11 +143,8 @@ test.describe("admin_oauth take-over via the UI", () => {
     await loginAs(pageB, ADMIN_B, ORG);
     await openUpstreamDetail(pageB);
 
-    // The status pill itself reads "Connected by <email>" when
-    // another admin owns the slot. The action button is plain
-    // Disconnect — no special take-over UX. Take-over is two
-    // clicks: Disconnect (which clears A's row by design — see
-    // admin_oauth disconnect semantics) then Authenticate.
+    // The status pill itself reads "Ready, by <email>" when another
+    // admin owns the slot. The action button is plain Disconnect.
     await expect(
       pageB.getByText(`Ready, by ${ADMIN_A}`)
     ).toBeVisible({ timeout: 5_000 });
@@ -159,15 +153,75 @@ test.describe("admin_oauth take-over via the UI", () => {
     ).toBeVisible();
 
     // Step 1: B clicks Disconnect — clears A's row.
+    // Disconnect stops the MCP and keeps A's sign-in: the pill reads
+    // Stopped and the button offers Connect, not Authenticate.
     await pageB.getByRole("button", { name: /Disconnect/i }).click();
+    await expect(pageB.getByText("Stopped")).toBeVisible({ timeout: 5_000 });
+    await expect(
+      pageB.getByRole("button", { name: /^Connect$/i })
+    ).toBeVisible();
+    await expect(
+      pageB.getByRole("button", { name: /Authenticate/i })
+    ).not.toBeVisible();
+
+    // Connect brings it back from A's kept sign-in: no popup opens.
+    let popupOpened = false;
+    pageB.on("popup", () => {
+      popupOpened = true;
+    });
+    await pageB.getByRole("button", { name: /^Connect$/i }).click();
+    await expect(
+      pageB.getByText(`Ready, by ${ADMIN_A}`)
+    ).toBeVisible({ timeout: 10_000 });
+    expect(popupOpened).toBe(false);
+    expect(await getSlotOwner(pageB.request)).toBe(ADMIN_A);
+
+    await ctxB.close();
+  });
+  test("admin B takes over via Remove sign-in → Authenticate", async ({
+    browser,
+    request,
+  }) => {
+    // Seed A's sign-in through the API, as in the test above.
+    await apiLoginAs(request, ADMIN_A);
+    const connectResp = await request.post(
+      `${BACKEND}/api/admin/upstreams/${UPSTREAM}/connect`
+    );
+    const body = await connectResp.json();
+    if (!body.connected) {
+      await request.post(`${FAKE_OAUTH}/test/queue-email`, {
+        form: { email: ADMIN_A },
+      });
+      const authorizeResp = await request.get(body.authorization_url, {
+        maxRedirects: 0,
+      });
+      await request.get(authorizeResp.headers()["location"], {
+        maxRedirects: 0,
+      });
+    }
+    expect(await getSlotOwner(request)).toBe(ADMIN_A);
+
+    const ctxB = await browser.newContext();
+    const pageB = await ctxB.newPage();
+    await loginAs(pageB, ADMIN_B, ORG);
+    await openUpstreamDetail(pageB);
+    await expect(
+      pageB.getByText(`Ready, by ${ADMIN_A}`)
+    ).toBeVisible({ timeout: 5_000 });
+
+    // Remove sign-in asks first, naming the admin whose sign-in goes.
+    await pageB.getByRole("button", { name: /Remove sign-in/i }).click();
+    const dialog = pageB.getByRole("dialog");
+    await expect(dialog).toContainText(ADMIN_A);
+    await dialog.getByRole("button", { name: /Remove sign-in/i }).click();
+
     await expect(
       pageB.getByRole("button", { name: /Authenticate/i })
     ).toBeVisible({ timeout: 5_000 });
     expect(await getSlotOwner(pageB.request)).toBeNull();
 
-    // Step 2: B clicks Authenticate — claims the slot via OAuth.
+    // B signs in in A's place.
     await clickAndCompletePopup(pageB, /Authenticate/i, ADMIN_B);
-
     expect(await getSlotOwner(pageB.request)).toBe(ADMIN_B);
 
     await ctxB.close();

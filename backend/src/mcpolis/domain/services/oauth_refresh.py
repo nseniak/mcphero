@@ -1,7 +1,7 @@
 """Periodic OAuth token refresh for upstream MCP servers.
 
-Walks every stored ``(upstream, user)`` pair every
-``TOKEN_REFRESH_INTERVAL`` and refreshes tokens whose access
+The app's background loop walks every stored ``(upstream, user)``
+pair every ``TOKEN_REFRESH_INTERVAL`` and refreshes tokens whose access
 credential expires within ``TOKEN_REFRESH_MARGIN``. The margin is
 the mitigation for §3.2 (boundary-crossing at expiry) from
 ``internal/documents/oauth-durability.md``: by rotating in the quiet
@@ -20,24 +20,24 @@ rather than from here — see ``test_refresh_token_retry.py``.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Coroutine
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import httpx
 import structlog
+from structlog.contextvars import bound_contextvars
 
 from mcpolis.adapters.auth.mcp_token_storage import McpTokenStorage
 from mcpolis.adapters.repositories.connection_store import (
     ConnectionStore,
     OAuthToken,
 )
+from mcpolis.domain.model.oauth_errors import TERMINAL_AUTH_ERROR_CODES
+from mcpolis.domain.model.policy import AuthMode
 from mcpolis.domain.model.upstream import UpstreamDefinition
-from mcpolis.domain.ports.distributed_lock import DistributedLock
-from mcpolis.domain.ports.email_sender import EmailSender
-from mcpolis.domain.services.upstream_health_check import (
-    AdminEmailResolver,
-    check_and_notify_upstream,
-)
+from mcpolis.domain.services.cancel_shield import finish_despite_cancels
+from mcpolis.domain.services.sign_in_refresh_lock import SignInRefreshLock
+from mcpolis.domain.services.upstream_health_check import SignInWarner
 from mcpolis.domain.services.upstream_connection_service import (
     SilentReconnectAuthRequired,
     failure_revision,
@@ -48,9 +48,8 @@ from mcpolis.domain.services.upstream_connection_service import (
     _noop_callback,  # pyright: ignore[reportPrivateUsage]
     _noop_redirect,  # pyright: ignore[reportPrivateUsage]
     _synthesize_silent_reconnect_signature,  # pyright: ignore[reportPrivateUsage]
-    _TERMINAL_AUTH_ERROR_CODES,  # pyright: ignore[reportPrivateUsage]
+    delete_refused_sign_in,
     probe_upstream_for_auth,
-    purge_user_oauth_state,
 )
 
 
@@ -61,6 +60,8 @@ TOKEN_REFRESH_INTERVAL = 10 * 60  # 10 minutes
 TOKEN_REFRESH_MARGIN = 20 * 60  # refresh if expiring within 20 minutes
 TOKEN_REFRESH_MAX_RETRIES = 3
 TOKEN_REFRESH_RETRY_DELAY = 5  # seconds
+# One try's probe, the refresh in it included, at most.
+TOKEN_REFRESH_ATTEMPT_TIMEOUT = 10  # seconds
 
 # Max-age ceiling for stored tokens, regardless of declared expires_at.
 # Catches upstreams whose actual access-token TTL is shorter than the
@@ -107,39 +108,32 @@ async def refresh_token_for_user(
     user_id: str,
     connection_store: ConnectionStore,
     server_url: str,
-    distributed_lock: DistributedLock | None = None,
-    email_sender: EmailSender | None = None,
-    admin_email_resolver: AdminEmailResolver | None = None,
-    hmac_key: bytes | None = None,
+    refresh_lock: SignInRefreshLock | None = None,
+    warner: SignInWarner | None = None,
 ) -> None:
     """Refresh OAuth tokens for one (upstream, user) pair.
 
     Only attempts refresh if the access token is close to expiring.
-    Backs up tokens before the request and restores them if they
-    vanish due to a transient network error (as opposed to a genuine
-    auth rejection).
 
-    When ``distributed_lock`` is provided (cloud mode), acquires a
-    per-upstream-user lock so only one backend refreshes at a time.
+    ``refresh_lock`` is the one-refresh-per-sign-in lock
+    (``SignInRefreshLock``) that a reconnect of the same sign-in takes
+    too. While another refresh of this sign-in is under way (in this
+    process, or on another backend in cloud mode), this one is skipped.
+    ``None``: a lock of its own, which nothing else holds.
 
-    When ``email_sender`` / ``admin_email_resolver`` / ``hmac_key`` are
-    all provided, an ``invalid_grant`` verdict triggers the §5.2 re-auth
-    notification *inline*, before the token is deleted. This is the only
-    place the user can be reached for a refresh that dies with no live
-    session: the hourly health-email sweep walks stored tokens, but the
-    delete below removes the row (and ``reset_refresh_failures`` clears
-    the signature), so a notification deferred to that sweep would never
-    find this pair. Pass ``None`` (the default) to skip notification —
-    e.g. when the health-email feature flag is off.
+    When ``warner`` is provided, a terminal verdict (``invalid_grant`` or
+    ``invalid_client``) emails the §5.2 re-auth warning *inline*, right
+    after the sign-in is deleted (``delete_refused_sign_in``). This is the
+    only place the user can be reached for a refresh that dies with no
+    live session: the hourly health-email sweep walks stored tokens, and
+    the delete removes the row. Pass ``None`` (the default) to skip the
+    email, e.g. when the health-email feature flag is off.
     """
     if upstream.http is None:
         return
-
-    # Distributed lock: skip if another backend is already refreshing.
-    lock_key = f"lock:token_refresh:{org_id}:{upstream.id}:{user_id}"
-    if distributed_lock is not None:
-        acquired = await distributed_lock.acquire(lock_key, ttl_seconds=60)
-        if not acquired:
+    lock = refresh_lock if refresh_lock is not None else SignInRefreshLock()
+    async with lock.hold_if_free(org_id, upstream.id, user_id) as held:
+        if not held:
             logger.debug(
                 "oauth.token.refresh.skipped.locked",
                 upstream_id=upstream.id,
@@ -147,7 +141,24 @@ async def refresh_token_for_user(
                 org_id=org_id,
             )
             return
+        await _refresh_holding_the_lock(
+            org_id, upstream, user_id, connection_store, server_url,
+            warner=warner,
+        )
 
+
+async def _refresh_holding_the_lock(
+    org_id: str,
+    upstream: UpstreamDefinition,
+    user_id: str,
+    connection_store: ConnectionStore,
+    server_url: str,
+    *,
+    warner: SignInWarner | None,
+) -> None:
+    """``refresh_token_for_user``, once it holds the sign-in's refresh
+    lock."""
+    assert upstream.http is not None
     # Any exception here means the stored token is unreadable — most
     # commonly a decryption failure after an encryption-key / HKDF
     # rotation. The next tool-call path will hit
@@ -165,12 +176,8 @@ async def refresh_token_for_user(
             user=user_id,
             org_id=org_id,
         )
-        if distributed_lock is not None:
-            await distributed_lock.release(lock_key)
         return
     if raw_token is None:
-        if distributed_lock is not None:
-            await distributed_lock.release(lock_key)
         return
 
     needs, reason = _token_needs_refresh(raw_token)
@@ -253,9 +260,7 @@ async def refresh_token_for_user(
     auth_flow_exc: Exception | None = None
     for attempt in range(1, TOKEN_REFRESH_MAX_RETRIES + 1):
         try:
-            await probe_upstream_for_auth(
-                upstream.http.url, oauth_auth, timeout=10,
-            )
+            await _refresh_attempt(upstream.http.url, oauth_auth)
             # Request succeeded (unusual for MCP servers, but fine)
             break
         except (
@@ -306,9 +311,15 @@ async def refresh_token_for_user(
     # every ``TOKEN_REFRESH_INTERVAL`` forever (one Sentry "OAuth flow error"
     # per tick), and the §5.2 notification never reaches the user — see the
     # meerbot/MCPOLIS-BACKEND-C loop (314 retries, 0 deletions).
+    #
+    # Not when this refresh saved new tokens: the upstream just accepted
+    # the refresh token, so a 401 on the probe that carried the new bearer
+    # (a short burst of them, while its auth backend catches up) proves
+    # nothing about the sign-in. The outcome below is then a success.
     if (
         signature is None
         and auth_flow_exc is not None
+        and not storage.tokens_saved
         and _exception_chain_contains(auth_flow_exc, SilentReconnectAuthRequired)
     ):
         signature = _synthesize_silent_reconnect_signature()
@@ -357,12 +368,17 @@ async def refresh_token_for_user(
                 org_id=org_id,
             )
     elif (
-        refreshed_token.access_token != raw_token.access_token
-        and refreshed_token.expires_at is not None
+        storage.tokens_saved
+        or refreshed_token.access_token != raw_token.access_token
     ):
+        # Tokens issued with no ``expires_in`` (no ``expires_at``) are a
+        # success too: they used to fall through to the failure branches,
+        # which deleted the sign-in this refresh had just renewed.
         new_remaining = (
-            refreshed_token.expires_at - datetime.now(UTC)
-        ).total_seconds()
+            (refreshed_token.expires_at - datetime.now(UTC)).total_seconds()
+            if refreshed_token.expires_at is not None
+            else None
+        )
         # The stored tokens changed, but maybe not through this refresh:
         # another holder of the sign-in (a reconnect, a live session) may
         # have renewed them first, rejecting this refresh's own request.
@@ -435,41 +451,7 @@ async def refresh_token_for_user(
         # The reconnect path's ``_classify_reconnect_failure`` already
         # deletes on this exact signal; mirror it here so loops with no
         # active session converge instead of looping forever.
-        if signature.error_code in _TERMINAL_AUTH_ERROR_CODES:
-            # §5.2: notify the user *before* the purge below tears down
-            # the token row + signature the notifier reads. Reuse the
-            # shared notifier so the decide / mark-notified logic lives
-            # in one place (DRY with the hourly health-email sweep).
-            # The outer guard is belt-and-suspenders: per-recipient
-            # *send* failures are already swallowed inside
-            # ``check_and_notify_upstream``, so this only catches the
-            # rarer resolver / store-read failures — and even then it
-            # logs and proceeds to delete, because converging the loop
-            # wins over a guaranteed notification (a flaky lookup must
-            # not strand the doomed token and keep the loop spinning).
-            if (
-                email_sender is not None
-                and admin_email_resolver is not None
-                and hmac_key is not None
-            ):
-                try:
-                    await check_and_notify_upstream(
-                        org_id=org_id,
-                        upstream=upstream,
-                        user_id=user_id,
-                        connection_store=connection_store,
-                        email_sender=email_sender,
-                        admin_email_resolver=admin_email_resolver,
-                        server_url=server_url,
-                        hmac_key=hmac_key,
-                    )
-                except Exception:
-                    logger.exception(
-                        "oauth.token.refresh.notify_failed",
-                        upstream_id=upstream.id,
-                        user=user_id,
-                        org_id=org_id,
-                    )
+        if signature.error_code in TERMINAL_AUTH_ERROR_CODES:
             logger.info(
                 "oauth.token.refresh.tokens_deleted",
                 upstream_id=upstream.id,
@@ -480,10 +462,13 @@ async def refresh_token_for_user(
             # Purge the whole per-user state. For ``invalid_client`` the
             # DCR client_info is dead too; dropping it (safe now the token
             # is gone) is what lets the next consent re-register instead
-            # of re-presenting the dead client_id forever.
-            await purge_user_oauth_state(
-                connection_store, org_id, upstream.id, user_id,
+            # of re-presenting the dead client_id forever. The funnel then
+            # emails the §5.2 warning (when ``warner`` is set), the same
+            # way a reconnect that deletes a refused sign-in does.
+            await delete_refused_sign_in(
+                connection_store, org_id, upstream, user_id,
                 revision=failure_revision(oauth_auth, storage),
+                warner=warner,
             )
     else:
         # Raised from DEBUG to INFO so the periodic loop's "no-op tick"
@@ -501,56 +486,97 @@ async def refresh_token_for_user(
             org_id=org_id,
         )
 
-    # Release distributed lock after refresh completes.
-    if distributed_lock is not None:
-        await distributed_lock.release(lock_key)
+
+async def _refresh_attempt(url: str, oauth_auth: httpx.Auth) -> None:
+    """One try of the periodic refresh (the probe that makes the sign-in
+    library refresh the tokens and save them), finished even when the
+    refresh is cancelled meanwhile: the shutdown cancels the periodic
+    loop, and a cancel landing after the upstream issued new tokens (and
+    retired the refresh token) but before they were saved left a dead
+    sign-in. The cancel then ends the refresh: no retry, and the sign-in's
+    lock is let go only once the save is done. Bounded by the probe's
+    timeout (``TOKEN_REFRESH_ATTEMPT_TIMEOUT``), well within what the
+    shutdown waits for a loop that outlives its cancel (the job drain).
+
+    The same shield as a reconnect's refresh (``_refresh_to_completion``),
+    except that the caller waits for the try to end: it holds the
+    sign-in's refresh lock across its retries."""
+    await finish_despite_cancels(
+        probe_upstream_for_auth(
+            url, oauth_auth, timeout=TOKEN_REFRESH_ATTEMPT_TIMEOUT,
+        ),
+        held_by=None,
+    )
 
 
-async def periodic_token_refresh(
+async def refresh_org_sign_ins(
     org_id: str,
     upstreams: list[UpstreamDefinition],
     connection_store: ConnectionStore,
     server_url: str,
+    *,
+    is_member: Callable[[str], bool],
+    is_stopped: Callable[[str], bool],
+    refresh_lock: SignInRefreshLock | None = None,
+    warner: SignInWarner | None = None,
 ) -> None:
-    """Background loop that refreshes OAuth tokens close to expiry.
+    """One pass of the periodic refresh over one org: refresh each stored
+    sign-in to one of its OAuth ``upstreams`` (``refresh_token_for_user``).
 
-    Runs every TOKEN_REFRESH_INTERVAL seconds. For each stored token
-    that expires within TOKEN_REFRESH_MARGIN, triggers a lightweight
-    HTTP request through the OAuth middleware to refresh it.
+    A sign-in whose owner is not a member of the org (removed, or one
+    that landed while they were being removed) is skipped: nobody may use
+    it, and keeping it alive would end with an email about an org they
+    are no longer in.
+
+    So are the sign-ins to an MCP an admin stopped: nobody can use it
+    until Start, which reconnects from the kept sign-ins (refreshing one
+    that is due then), and the gateway stays off a stopped MCP meanwhile.
+    A refusal while stopped used to delete a sign-in Stop promised to
+    keep, with no email (the warner skips stopped MCPs).
     """
-    from mcpolis.domain.model.policy import AuthMode
-
-    upstream_by_id = {u.id: u for u in upstreams}
-    oauth_upstream_ids = {
-        u.id for u in upstreams
-        if u.auth.mode in (AuthMode.admin_oauth, AuthMode.per_user_oauth)
-    }
-
-    while True:
-        await asyncio.sleep(TOKEN_REFRESH_INTERVAL)
-        try:
-            all_tokens = await connection_store.get_all_stored_tokens(org_id)
-            tasks: list[Coroutine[object, object, None]] = []
-            for upstream_id, user_id in all_tokens:
-                if upstream_id not in oauth_upstream_ids:
-                    continue
-                upstream = upstream_by_id.get(upstream_id)
-                if upstream is None:
-                    continue
-                tasks.append(
-                    refresh_token_for_user(
-                        org_id, upstream, user_id, connection_store, server_url,
-                    )
-                )
-            if tasks:
-                logger.info(
-                    "oauth.token.refresh.periodic.started",
-                    org_id=org_id,
-                    session_count=len(tasks),
-                )
-                await asyncio.gather(*tasks)
-        except Exception:
-            logger.exception(
-                "oauth.token.refresh.periodic.failed",
+    oauth_upstreams: dict[str, UpstreamDefinition] = {}
+    for upstream in upstreams:
+        if upstream.auth.mode not in (
+            AuthMode.admin_oauth, AuthMode.per_user_oauth,
+        ):
+            continue
+        if is_stopped(upstream.id):
+            logger.debug(
+                "oauth.token.refresh.skipped.stopped",
+                upstream_id=upstream.id,
                 org_id=org_id,
+            )
+            continue
+        oauth_upstreams[upstream.id] = upstream
+    for upstream_id, user_id in await connection_store.get_all_stored_tokens(
+        org_id,
+    ):
+        upstream = oauth_upstreams.get(upstream_id)
+        if upstream is None:
+            continue
+        if not is_member(user_id):
+            logger.info(
+                "oauth.token.refresh.skipped.not_a_member",
+                upstream_id=upstream_id,
+                user=user_id,
+                org_id=org_id,
+            )
+            continue
+        # Bind per-iteration context so log lines emitted during this
+        # refresh — including the MCP SDK's ``mcp.client.auth.oauth2``
+        # ERROR records and any httpx output, which carry no
+        # upstream/user of their own — automatically gain
+        # org/upstream/user via ``foreign_pre_chain``'s
+        # ``merge_contextvars``. Scoped via ``bound_contextvars`` so each
+        # iteration's bindings can't leak into the next.
+        with bound_contextvars(
+            org_id=org_id,
+            upstream_id=upstream.id,
+            user_id=user_id,
+        ):
+            await refresh_token_for_user(
+                org_id, upstream, user_id,
+                connection_store, server_url,
+                refresh_lock=refresh_lock,
+                warner=warner,
             )

@@ -5,11 +5,14 @@ import type { AuditSearchResponse } from "../../api/types";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../../components/ui/tooltip";
 import { useTranslation } from "../../i18n/index";
 import { useEventSource } from "../../hooks/useEventSource";
+import { AccountActionText, OperatorTag } from "./AuditAccountAction";
+import { ACCOUNT_ACTIONS, isAccountAction } from "./auditAccountActions";
 
 const ACTION_OPTIONS = [
   { value: "", labelKey: "audit.filterAllActions" },
   { value: "tool_call", labelKey: "audit.filterToolCall" },
   { value: "client_connect,client_disconnect", labelKey: "audit.filterConnection" },
+  { value: ACCOUNT_ACTIONS.join(","), labelKey: "audit.filterAccount" },
 ] as const;
 
 function Combobox({
@@ -126,22 +129,36 @@ function Combobox({
   );
 }
 
+/** What a tool-call row shows: the policy decision, unless an allowed
+ *  call then failed or was cancelled, which is what the member saw. */
+function toolCallOutcome(entry: Record<string, unknown>): { label: string; color: string } {
+  const decision = String(entry.policy_decision ?? "—");
+  const status = String(entry.response_status ?? "");
+  if (decision === "allowed" && status === "error") {
+    return { label: "error", color: "bg-red-100 text-red-700" };
+  }
+  if (decision === "allowed" && status === "cancelled") {
+    return { label: "cancelled", color: "bg-zinc-100 text-zinc-600" };
+  }
+  if (decision === "allowed") {
+    return { label: decision, color: "bg-green-100 text-green-700" };
+  }
+  return { label: decision, color: "bg-red-100 text-red-700" };
+}
+
 export function OutcomeBadge({ entry }: { entry: Record<string, unknown> }) {
   const action = String(entry.action ?? "tool_call");
   if (action === "tool_call") {
-    const decision = String(entry.policy_decision ?? "—");
-    const isAllowed = decision === "allowed";
+    const { label, color } = toolCallOutcome(entry);
     return (
       <div className="flex flex-col gap-0.5">
         <span
-          className={`px-1.5 py-0.5 rounded text-xs font-medium inline-block w-fit ${
-            isAllowed ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
-          }`}
+          className={`px-1.5 py-0.5 rounded text-xs font-medium inline-block w-fit ${color}`}
         >
-          {decision}
+          {label}
         </span>
-        {/* Deny reason (which MCP / which forbidden argument). Only
-            denials carry an error_message on tool_call rows. */}
+        {/* Why the call did not run: the deny reason (which MCP / which
+            forbidden argument), or why no MCP session was available. */}
         {entry.error_message != null && (
           <span
             className="text-[10px] text-red-500 truncate max-w-[250px]"
@@ -198,10 +215,13 @@ function ActionBadge({ action }: { action: string }) {
   );
 }
 
-function DetailCell({ entry }: { entry: Record<string, unknown> }) {
+export function DetailCell({ entry }: { entry: Record<string, unknown> }) {
   const action = String(entry.action ?? "tool_call");
   if (action === "tool_call") {
     return <span className="font-mono text-xs">{String(entry.tool ?? "—")}</span>;
+  }
+  if (isAccountAction(action)) {
+    return <AccountActionText entry={entry} />;
   }
   if (entry.client_type) {
     return <span className="text-xs text-zinc-600">{String(entry.client_type)}</span>;
@@ -402,9 +422,10 @@ export function AuditPage() {
                     </td>
                     <td className="px-4 py-2 text-zinc-700">
                       {String(entry.user_id ?? "—")}
+                      <OperatorTag entry={entry} />
                     </td>
                     <td className="px-4 py-2 text-zinc-600">
-                      {String(entry.upstream_id ?? "—")}
+                      {String(entry.upstream_id || "—")}
                     </td>
                     <td className="px-4 py-2">
                       <DetailCell entry={entry} />

@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router";
 import { fetchSuperadminOverview } from "../../api/superadmin";
 import type { SuperadminOverviewResponse } from "../../api/types";
+import { useFeatures } from "../../hooks/useFeatures";
 
 function Tile({
   label,
@@ -55,6 +56,7 @@ export function OverviewPage() {
     queryFn: fetchSuperadminOverview,
     refetchInterval: 30_000,
   });
+  const { sandboxProvider } = useFeatures();
 
   if (isLoading) {
     return <div className="text-sm text-zinc-500">Loading…</div>;
@@ -121,14 +123,10 @@ export function OverviewPage() {
             detail={system.mixpanel_enabled ? "enabled" : "disabled"}
           />
           <SystemRow
-            label="Sandbox runner"
-            ok={system.sandbox_runner_configured}
+            label="Sandbox"
+            ok={sandboxProvider === "e2b"}
             detail={
-              system.sandbox_runner_configured
-                ? `${system.sandbox_runner_url_count} URL${
-                    system.sandbox_runner_url_count === 1 ? "" : "s"
-                  }`
-                : "unsafe local-subprocess fallback"
+              sandboxProvider === "e2b" ? "E2B" : "local subprocess (unsafe)"
             }
           />
         </div>

@@ -74,16 +74,17 @@ class SlugAwareRequireAuthMiddleware:
     Replaces the SDK's static ``resource_metadata_url`` with one built
     from the current slug at 401-send time, so the WWW-Authenticate
     header points Claude at the slug-scoped metadata endpoint.
+
+    Unlike the SDK's middleware it checks no scopes: authorization is
+    the gateway's job (roles), so a valid bearer is all this gate needs.
     """
 
     def __init__(
         self,
         app: Any,
-        required_scopes: list[str],
         base_url: str,
     ) -> None:
         self.app = app
-        self.required_scopes = required_scopes
         # Trim trailing slash once so ``_join_slug`` is simple.
         self.base_url = base_url.rstrip("/")
 
@@ -97,17 +98,6 @@ class SlugAwareRequireAuthMiddleware:
                 description="Authentication required",
             )
             return
-
-        auth_credentials = scope.get("auth")
-        for required_scope in self.required_scopes:
-            if auth_credentials is None or required_scope not in auth_credentials.scopes:
-                await self._send_auth_error(
-                    send,
-                    status_code=403,
-                    error="insufficient_scope",
-                    description=f"Required scope: {required_scope}",
-                )
-                return
 
         await self.app(scope, receive, send)
 

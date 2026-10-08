@@ -286,3 +286,63 @@ async def test_mongo_repo_delete_for_org_cascades() -> None:
         )
         assert await repo.delete_for_org("org-a") == 1
         assert await repo.get_by_label("org-b", "c") is not None
+
+
+# --- rename_role: a renamed role follows its tokens ---
+
+
+async def seed_tokens_for_rename(
+    repo: FileServiceTokenRepository | MongoServiceTokenRepository,
+) -> None:
+    """Two tokens on the renamed role, one on another role, one on the
+    same role name in another org (must not move)."""
+    await repo.create(make_service_token_record(
+        label="bot-a", org_id="org-a", role_name="reader", raw_token="svct_a",
+    ))
+    await repo.create(make_service_token_record(
+        label="bot-b", org_id="org-a", role_name="reader", raw_token="svct_b",
+    ))
+    await repo.create(make_service_token_record(
+        label="bot-c", org_id="org-a", role_name="user", raw_token="svct_c",
+    ))
+    await repo.create(make_service_token_record(
+        label="bot-d", org_id="org-b", role_name="reader", raw_token="svct_d",
+    ))
+
+
+async def assert_rename_moved_only_org_a_reader_tokens(
+    repo: FileServiceTokenRepository | MongoServiceTokenRepository,
+) -> None:
+    assert await repo.rename_role("org-a", "reader", "auditor") == 2
+    org_a = {r.label: r.role_name for r in await repo.list_for_org("org-a")}
+    assert org_a == {"bot-a": "auditor", "bot-b": "auditor", "bot-c": "user"}
+    org_b = {r.label: r.role_name for r in await repo.list_for_org("org-b")}
+    assert org_b == {"bot-d": "reader"}
+    # The verify path reads by hash: it must see the new name too.
+    by_hash = await repo.get_by_hash(hash_service_token("svct_a"))
+    assert by_hash is not None
+    assert by_hash.role_name == "auditor"
+    # Unknown role: nothing to move.
+    assert await repo.rename_role("org-a", "ghost", "other") == 0
+
+
+@pytest.mark.asyncio
+async def test_file_repo_rename_role_moves_org_tokens_only(
+    tmp_path: Path,
+) -> None:
+    repo = make_file_repo(tmp_path)
+    await seed_tokens_for_rename(repo)
+    await assert_rename_moved_only_org_a_reader_tokens(repo)
+    # Persisted: a fresh instance reads the new name from disk.
+    fresh = await make_file_repo(tmp_path).get_by_label("org-a", "bot-a")
+    assert fresh is not None
+    assert fresh.role_name == "auditor"
+
+
+@pytest.mark.skipif(not mongo_available(), reason="Mongo not reachable")
+@pytest.mark.asyncio
+async def test_mongo_repo_rename_role_moves_org_tokens_only() -> None:
+    async with temp_mongo_database() as db:
+        repo = MongoServiceTokenRepository(db[COLL_SERVICE_TOKENS])
+        await seed_tokens_for_rename(repo)
+        await assert_rename_moved_only_org_a_reader_tokens(repo)

@@ -13,9 +13,10 @@
 #   keeps tests from the same file on the same worker so interleaved
 #   stdout stays attributable.
 #
-# Outputs:
-#   /tmp/mcpolis-unit-junit.xml          (JUnit XML, machine-readable)
-#   /tmp/mcpolis-unit-report.json        (pytest-json-report)
+# Outputs, in this run's own folder (tests/run_folder.py), printed at the
+# start and the end; /tmp/mcpolis-test-runs/latest-unit points at the newest:
+#   unit-junit.xml          (JUnit XML, machine-readable)
+#   unit-report.json        (pytest-json-report)
 #
 # Phase 2c: the test suite includes parameterized repo tests that run
 # against both the file backend and a real MongoDB. This script probes
@@ -32,6 +33,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/../run-in-env.sh"
+# This run's own results folder, so a concurrent run can't overwrite its
+# reports. Resolved before the cd, so a relative MCPOLIS_TEST_OUT_DIR means
+# the caller's directory.
+RUN_DIR="$(python "$SCRIPT_DIR/../tests/run_folder.py" unit)"
+# Exported so pytest prints it again at the very end
+# (backend/tests/conftest.py): this script ``exec``s pytest, so that
+# signals sent to the runner reach pytest itself.
+export MCPOLIS_TEST_OUT_DIR="$RUN_DIR"
 cd "$SCRIPT_DIR"
 
 JOBS="auto"
@@ -77,9 +86,10 @@ fi
 # in helpers so they can still exercise the strict deny-list.
 export MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK=1
 
-JUNIT_OUT="/tmp/mcpolis-unit-junit.xml"
-JSON_OUT="/tmp/mcpolis-unit-report.json"
+JUNIT_OUT="$RUN_DIR/unit-junit.xml"
+JSON_OUT="$RUN_DIR/unit-report.json"
 rm -f "$JUNIT_OUT" "$JSON_OUT"
+echo "Results folder: $RUN_DIR"
 
 PARALLEL_ARGS=()
 if [ "$JOBS" != "1" ]; then

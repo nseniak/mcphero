@@ -92,3 +92,21 @@ async def test_get_or_create_binds_buffer_to_running_loop() -> None:
     output = region.get_output("notion")
     assert output is not None
     assert "from worker thread" in output
+
+
+@pytest.mark.asyncio
+async def test_drop_forgets_the_buffer_so_the_same_id_starts_empty() -> None:
+    region = LogBufferRegion()
+    region.get_or_create("notion").write("old secret-free line")
+
+    region.drop("notion")
+
+    assert region.get("notion") is None
+    assert region.get_or_create("notion").get_output() == ""
+
+
+@pytest.mark.asyncio
+async def test_drop_of_an_unknown_id_does_nothing() -> None:
+    region = LogBufferRegion()
+    region.drop("never-opened")
+    assert region.get("never-opened") is None

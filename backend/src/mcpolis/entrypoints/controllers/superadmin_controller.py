@@ -2,13 +2,20 @@
 # NOTE: no `from __future__ import annotations` — FastMCP tool registration
 # uses issubclass() on annotations which breaks with stringified annotations.
 
+from collections.abc import Callable
+
 import structlog
+from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from mcpolis.domain.ports.organization_repository import OrganizationRepository
 from mcpolis.domain.services.org_runtime import OrgRuntimeManager
 from mcpolis.domain.services.org_service import OrgService
+from mcpolis.entrypoints.controllers.admin_tool_calls import (
+    install_call_tool_wrapper,
+)
+from mcpolis.entrypoints.mcp_transport_security import mcp_transport_security
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
@@ -16,10 +23,18 @@ READONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
 DESTRUCTIVE = ToolAnnotations(destructiveHint=True, idempotentHint=False)
 
 
+def _operator_from_auth_context() -> str:
+    """Email of the operator on this request. The allowlist middleware
+    in app.py has already checked it against MCPOLIS_SUPERADMIN_EMAILS."""
+    auth_user = auth_context_var.get(None)
+    return auth_user.display_name if auth_user is not None else "unknown"
+
+
 def create_superadmin_mcp_server(
     org_repo: OrganizationRepository,
     runtime_manager: OrgRuntimeManager,
     org_service: OrgService,
+    current_operator: Callable[[], str] = _operator_from_auth_context,
 ) -> FastMCP:
     """Create the instance-level superadmin MCP server (cloud mode only).
 
@@ -30,8 +45,18 @@ def create_superadmin_mcp_server(
     single complete path shared with the dashboard, so the two can't
     drift on what they purge. ``org_repo`` / ``runtime_manager`` remain
     for the read tools and the dry-run preview.
+
+    Every tool that changes something runs to its end once called, like
+    the Admin MCP's (``install_call_tool_wrapper``): an AI client that
+    cancels a deletion half-way no longer leaves the org gone while its
+    service tokens still work, nor loses the log line naming the
+    operator who deleted it.
     """
-    server = FastMCP(name="MCP Hero Superadmin", streamable_http_path="/")
+    server = FastMCP(
+        name="MCP Hero Superadmin",
+        streamable_http_path="/",
+        transport_security=mcp_transport_security(),
+    )
 
     @server.tool(annotations=READONLY)
     async def list_organizations() -> str:
@@ -133,13 +158,20 @@ def create_superadmin_mcp_server(
         # org-scoped collection. Shared with the dashboard route.
         await org_service.delete_organization(org.id)
 
+        # No audit row: the org's audit log is purged with it, so this
+        # log line is the record, and it must say who did it.
         logger.info(
             "superadmin.organization.deleted",
+            actor=current_operator(),
             org_slug=org.slug,
             org_id=org.id,
             member_count=len(members),
             upstream_count=upstream_count,
         )
         return f"Deleted organization '{org.display_name}' (slug={org.slug})."
+
+    # No rate limits: the operator MCP is reached only by the operators
+    # the allowlist middleware lets through.
+    install_call_tool_wrapper(server, None)
 
     return server

@@ -1074,6 +1074,8 @@ export function UpstreamsPage() {
                       transport={u.transport}
                       authMode={u.auth_mode}
                       starting={u.starting}
+                      stopped={u.stopped}
+                      slotOwner={u.slot_owner}
                       reload={reload}
                     />
                   </td>

@@ -20,15 +20,26 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
-from unittest.mock import patch
 
 from mcpolis.adapters.auth.mcp_gateway_oauth_provider import (
     McpGatewayOAuthProvider,
     extract_email_from_id_token,
 )
+from mcpolis.adapters.repositories.file_config_store import FileConfigStore
+from mcpolis.adapters.repositories.file_organization_repository import (
+    FileOrganizationRepository,
+)
+from mcpolis.domain.model.settings import SettingsConfig, UserDefinition
+from mcpolis.domain.ports import DEFAULT_ORG_ID
+from mcpolis.domain.services.org_service import OrgService
+from mcpolis.domain.services.policy_engine import PolicyEngine
+from tests.unit._gateway_oauth_store import InMemoryOAuthStateRepository
+from tests.unit.factories import make_runtime_manager
 from tests.unit.test_google_oauth import (
     make_auth_params,
     make_client,
@@ -132,6 +143,12 @@ async def test_callback_happy_path_still_works() -> None:
     error branches, drives the real exchange."""
     provider = make_provider()
     tok = make_id_token("alice@test.com")
+    # Pre-approve so the callback forwards the code directly instead of
+    # parking at the consent gate (the gate is covered on its own in
+    # test_gateway_oauth_consent.py).
+    await provider.record_client_approval(
+        "alice@test.com", "test-client", "http://localhost:3000/callback"
+    )
 
     redirect = await drive_callback_with_handler(
         provider,
@@ -215,4 +232,65 @@ async def test_callback_google_malformed_200_body_is_handled_not_unhandled() -> 
         await drive_callback_with_handler(
             provider,
             lambda request: httpx.Response(200, content=b"<not json>"),
+        )
+
+
+# ─────────── Invited, not joined yet (second review, 31) ───────────────
+
+
+async def make_provider_with_invitation(
+    tmp_path: Path, invited: str,
+) -> McpGatewayOAuthProvider:
+    """A provider whose one org (standalone's default org) has invited
+    ``invited``, who has not clicked Join yet: in its users, without a
+    membership."""
+    config_store = FileConfigStore(tmp_path / "config.json")
+    config_store.ensure_defaults_sync(DEFAULT_ORG_ID)
+    await config_store.set_user(DEFAULT_ORG_ID, invited, UserDefinition(role="user"))
+    org_service = OrgService(
+        org_repo=FileOrganizationRepository(tmp_path / "data"),
+        config_repo=config_store,
+    )
+    return McpGatewayOAuthProvider(
+        google_client_id="test-google-client-id",
+        google_client_secret="test-google-secret",
+        server_url="https://mcp.example.test",
+        runtime_manager=make_runtime_manager(PolicyEngine(SettingsConfig())),
+        state_repository=InMemoryOAuthStateRepository(),
+        org_service=org_service,
+        dashboard_url="https://app.example.test/",
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_invited_person_signing_in_from_an_ai_client_is_sent_to_join(
+    tmp_path: Path,
+) -> None:
+    """Signing in from an AI client never accepts an invitation: the
+    refusal says where to accept it, on the dashboard (not the gateway's
+    own host), instead of a bare "not authorized"."""
+    provider = await make_provider_with_invitation(tmp_path, "alice@acme.test")
+    tok = make_id_token("alice@acme.test")
+
+    with pytest.raises(ValueError) as refused:
+        await drive_callback_with_handler(
+            provider,
+            lambda request: httpx.Response(200, json={"id_token": tok}),
+        )
+
+    message = str(refused.value)
+    assert "https://app.example.test/orgs/default/join" in message
+    assert "Join" in message and "not authorized" not in message
+    assert len(provider._auth_codes) == 0 and len(provider._pending_consents) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_stranger_signing_in_is_still_not_authorized(tmp_path: Path) -> None:
+    provider = await make_provider_with_invitation(tmp_path, "alice@acme.test")
+    tok = make_id_token("mallory@evil.test")
+
+    with pytest.raises(ValueError, match="not authorized"):
+        await drive_callback_with_handler(
+            provider,
+            lambda request: httpx.Response(200, json={"id_token": tok}),
         )

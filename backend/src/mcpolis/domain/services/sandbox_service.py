@@ -409,7 +409,7 @@ class SandboxService(Protocol):
 
     async def on_upstream_removed(
         self, *, org_id: str, upstream_id: str,
-    ) -> None:
+    ) -> bool:
         """Tear down provider-side state attached to an upstream that
         has just been removed by the operator.
 
@@ -418,6 +418,12 @@ class SandboxService(Protocol):
         destroyed and the persistence ref cleared. Backends without
         persistent storage MUST implement this as a no-op so callers
         can dispatch unconditionally.
+
+        Returns whether the persistence ref was kept to finish the
+        teardown later: what failed (a sandbox kill, a volume destroy),
+        listed on it for the boot reconcile to retry, which deletes it
+        once nothing is left. An org deletion's purge keeps such a ref.
+        ``False`` when nothing is left (and for the no-op backends).
 
         Idempotent: calling it twice for the same upstream MUST NOT
         raise. The operator delete path can race the reconciler; both

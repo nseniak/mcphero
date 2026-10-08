@@ -62,7 +62,9 @@ export function AuthHealthPage() {
       mutationFn: (v) => triggerSuperadminReauth(v.email, v.orgId, v.upstreamId),
       onSuccess: (r) => {
         setActionMessage(
-          `Cleared OAuth token for ${r.email} on ${r.upstream_id} (${r.org_id}). The next request will re-auth.`,
+          r.cleared
+            ? `Cleared OAuth token for ${r.email} on ${r.upstream_id} (${r.org_id}). The next request will re-auth.`
+            : `${r.email} has no OAuth token on ${r.upstream_id} (${r.org_id}). Nothing changed.`,
         );
         queryClient.invalidateQueries({
           queryKey: ["superadmin", "auth-health"],

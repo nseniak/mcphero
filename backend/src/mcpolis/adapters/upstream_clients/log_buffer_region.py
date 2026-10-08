@@ -79,3 +79,13 @@ class LogBufferRegion:
         """
         buf = self.get_or_create(upstream_id)
         buf.set_redactions(redactions)
+
+    def drop(self, upstream_id: str) -> None:
+        """Forget the buffer of a removed upstream.
+
+        Buffers outlive reconnects on purpose, but not a removal: an
+        upstream added again under the same id is a new MCP and must
+        not show the removed one's server logs. A reader still holding
+        the old buffer keeps it; nothing new reaches it by this id.
+        """
+        self._buffers.pop(upstream_id, None)

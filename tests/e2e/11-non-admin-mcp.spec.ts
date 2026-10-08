@@ -1,7 +1,13 @@
 import { test, expect, type APIRequestContext } from "@playwright/test";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 
-import { makeMcpClient, mintMcpToken, apiLoginAs, BACKEND_URL as BACKEND } from "./helpers";
+import {
+  makeMcpClient,
+  mintMcpToken,
+  apiLoginAs,
+  joinAs,
+  BACKEND_URL as BACKEND,
+} from "./helpers";
 const ORG = "acme-corp";
 const ADMIN = "admin@example.com";
 
@@ -56,6 +62,8 @@ test.describe("Non-admin gateway access", () => {
       data: { email: NON_ADMIN_EMAIL, role: NON_ADMIN_ROLE },
     });
     expect([200, 201]).toContain(userResp.status());
+    // A member once they accept the invitation.
+    await joinAs(request, NON_ADMIN_EMAIL, ORG);
   });
 
   test.afterAll(async ({ request }) => {

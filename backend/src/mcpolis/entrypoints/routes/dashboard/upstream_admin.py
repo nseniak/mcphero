@@ -1,18 +1,15 @@
-"""Upstream-admin router (14 routes — the load-bearing concern).
+"""Upstream-admin router (the load-bearing concern).
 
-Lifecycle: list, get detail, refresh status, logs, get tools, add,
+Lifecycle: list, get detail, logs, get tools, add,
 update, remove, import (preview + confirm), connect (admin OAuth),
 disconnect, reconnect.
 
-The ``_build_upstream_summaries`` packer used to be a closure inside
-``create_dashboard_api_router`` — used by ``list_upstreams`` and
-``refresh_upstream_status``; now a private module-level helper.
+The ``_build_upstream_summaries`` packer is a private module-level
+helper used by ``list_upstreams``.
 """
 # pyright: reportUnusedFunction=false
 from __future__ import annotations
 
-import asyncio
-import re
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -21,17 +18,11 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
-from mcpolis.adapters.observability.analytics_client import get_analytics
-from mcpolis.adapters.upstream_clients.session_single_flight import (
-    ConnectAborted,
-)
 from mcpolis.adapters.repositories.upstream_config_loader import (
     build_upstream,
     extract_import_entries,
 )
-from mcpolis.domain.model.events import Event
 from mcpolis.domain.model.template_var import is_valid_template_var_name
-from mcpolis.domain.services.system_variables import is_system_variable_name
 from mcpolis.domain.model.policy import AuthMode, UpstreamAuthConfig
 from mcpolis.domain.model.upstream import (
     HttpTransportConfig,
@@ -40,30 +31,22 @@ from mcpolis.domain.model.upstream import (
     UpstreamDefinition,
     validate_stdio_uses_service_account,
 )
-from mcpolis.domain.services.org_runtime import OrgRuntime
-from mcpolis.domain.services.plan_gates import (
-    assert_http_upstream_capacity,
-    assert_sandbox_combo_allowed,
-    assert_stdio_upstream_capacity,
-    resolve_plan,
-)
-from mcpolis.domain.services.upstream_connection_service import (
-    OAuthFailureReason,
-    connect_and_refresh_tools,
-    reconnect_all_oauth_upstreams,
-    refresh_tools_in_background,
-)
-from mcpolis.domain.services.url_safety import (
-    UnsafeUpstreamUrl,
-    validate_upstream_url,
+from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
+from mcpolis.domain.services.plan_gates import resolve_plan
+from mcpolis.domain.services.upstream_admin_service import (
+    ImportRow,
+    NewUpstreamRequest,
+    SandboxSizeRequest,
+    TemplateVarInput,
+    check_sandbox_size,
+    check_template_var_names,
+    check_upstream_url,
+    resolve_upstream_readiness,
 )
 from mcpolis.entrypoints.controllers.gateway_controller import current_org_id
 from mcpolis.entrypoints.routes.dashboard._deps import (
     DashboardDeps,
-    admin_oauth_owner,
-    log_admin_action,
     notify_policy_change,
-    resolve_upstream_readiness,
     sse_encode,
 )
 from mcpolis.entrypoints.routes.dashboard._models import (
@@ -79,36 +62,109 @@ from mcpolis.entrypoints.routes.dashboard._models import (
     ImportPreviewResponse,
     ImportResultResponse,
     SandboxResourcesView,
+    SignOutRequest,
     ToolAnnotationsInfo,
     ToolInfo,
     UpdateUpstreamRequest,
+    UpdateUpstreamTemplateVarChanges,
     UpstreamDetail,
     UpstreamSummary,
 )
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
-# Upstream ids become tool-name prefixes (``{upstream}__{tool}``) and storage
-# keys, so a confirmed import id must stay within the dashboard IdInput
-# charset even when a scripted caller bypasses the UI.
-_VALID_UPSTREAM_ID = re.compile(r"[a-z0-9._-]+")
+async def _resolve_template_var_sets(
+    deps: DashboardDeps,
+    org_id: str,
+    upstream_id: str,
+    changes: UpdateUpstreamTemplateVarChanges,
+) -> dict[str, tuple[str, bool]]:
+    """Turn ``changes.sets`` into ``{name: (value, is_secret)}`` to write.
 
+    A password is write-only, so the dashboard can't send its saved
+    value back. It sends ``value=None`` instead, meaning "keep the
+    saved value" of ``rename_from`` (a rename) or of the same name.
+    Those values are read here, before any write, and a missing
+    source rejects the whole save with a 400. Keeping a row's own
+    value is a no-op, so it is left out of the result.
 
-async def _mark_added_stopped(
-    deps: DashboardDeps, runtime: OrgRuntime, org_id: str, upstream_id: str,
-) -> None:
-    """A new upstream starts stopped until the admin clicks Start, both
-    in storage (so a restart does not connect it) and in memory (so a
-    tool call does not start it before then).
-
-    ``set_disabled`` writes an explicit ``enabled: False``; clearing the
-    marker instead would fall back to default-enabled.
+    A kept value always keeps its source's ``is_secret``. It may land
+    on another existing row only when the same save deletes that row:
+    :func:`_apply_template_var_changes` then recreates the row, so the
+    source's flag holds. On a plain replace the existing row's flag
+    would win, and a password moved onto a plain row would show in the
+    list.
     """
-    if deps.connection_store is not None:
-        await deps.connection_store.set_disabled(org_id, upstream_id)
-    await runtime.client_manager.transition_to_disabled(
-        upstream_id, reason="added_stopped",
-    )
+    existing = {
+        s.name: s
+        for s in await deps.template_var_repo.list_summaries(
+            org_id, upstream_id,
+        )
+    }
+    deleted = set(changes.deletes)
+    resolved: dict[str, tuple[str, bool]] = {}
+    for var_name, spec in changes.sets.items():
+        if spec.value is not None:
+            resolved[var_name] = (spec.value, spec.is_secret)
+            continue
+        source = spec.rename_from or var_name
+        if not is_valid_template_var_name(source):
+            raise HTTPException(
+                400,
+                f"Invalid variable name {source!r}: must match "
+                "[A-Z_][A-Z0-9_]*",
+            )
+        source_row = existing.get(source)
+        value = await deps.template_var_repo.get_value(
+            org_id, upstream_id, source,
+        )
+        if source_row is None or value is None:
+            raise HTTPException(
+                400,
+                f"Variable {source!r} has no saved value to keep. "
+                "Enter a value instead.",
+            )
+        if source == var_name:
+            # Keep the row as it is. Rewriting it would bump
+            # ``updated_at`` and raise the restart banner for nothing.
+            continue
+        if var_name in existing and var_name not in deleted:
+            raise HTTPException(
+                400,
+                f"Cannot rename {source!r} to {var_name!r}: a variable "
+                "with that name already exists.",
+            )
+        resolved[var_name] = (value, source_row.is_secret)
+    return resolved
+
+
+async def _apply_template_var_changes(
+    repo: TemplateVarRepository,
+    org_id: str,
+    upstream_id: str,
+    changes: UpdateUpstreamTemplateVarChanges,
+    resolved: dict[str, tuple[str, bool]],
+) -> None:
+    """Write a save's Variable changes.
+
+    Rows the save only deletes are removed last, so a failed write
+    leaves a renamed password's source row in place: the dashboard
+    never held that value, so nobody could send it again.
+
+    A name in both ``sets`` and ``deletes`` is deleted right before its
+    own write, so the row is created fresh with the flag ``resolved``
+    gives it. A failed write there loses that row, which the save was
+    replacing (in a swap, the old value it was moving too).
+    """
+    deleted = set(changes.deletes)
+    for var_name, (value, is_secret) in resolved.items():
+        if var_name in deleted:
+            await repo.delete(org_id, upstream_id, var_name)
+        await repo.set(
+            org_id, upstream_id, var_name, value, is_secret=is_secret,
+        )
+    for var_name in deleted - changes.sets.keys():
+        await repo.delete(org_id, upstream_id, var_name)
 
 
 async def _build_upstream_summaries(
@@ -116,8 +172,8 @@ async def _build_upstream_summaries(
     upstreams: list[UpstreamDefinition],
     disconnect_reasons: Mapping[str, str] | None = None,
 ) -> list[UpstreamSummary]:
-    """Pack a list of upstreams into the wire shape both
-    ``list_upstreams`` and ``refresh_upstream_status`` return.
+    """Pack a list of upstreams into the wire shape ``list_upstreams``
+    returns.
 
     Resolves readiness once per upstream up front; fills in persistent
     errors from the connection store for non-Ready upstreams that
@@ -159,6 +215,7 @@ async def _build_upstream_summaries(
             tool_count=tool_counts.get(u.id, 0),
             refreshing=runtime.tool_registry.is_refreshing(u.id),
             starting=runtime.client_manager.is_starting(u.id),
+            stopped=runtime.client_manager.is_stopped(u.id),
             url=u.http.url if u.http else None,
             disconnect_reason=(
                 reasons.get(u.id) if not readiness[u.id][0] else None
@@ -190,6 +247,10 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
             for u in upstreams:
                 if u.auth.mode == AuthMode.service_account:
                     continue
+                if runtime.client_manager.is_stopped(u.id):
+                    # Stopped is the whole story; an expired access
+                    # token on the kept sign-in is refreshed at Start.
+                    continue
                 _, slot_owner = await resolve_upstream_readiness(
                     u, org_id, deps.connection_store, runtime,
                 )
@@ -206,25 +267,6 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
                     reasons[u.id] = "token_expired"
 
         return await _build_upstream_summaries(deps, upstreams, reasons)
-
-    @router.post(
-        "/upstreams/refresh-status",
-        response_model=list[UpstreamSummary],
-    )
-    async def refresh_upstream_status() -> list[UpstreamSummary]:
-        """Try to reconnect disconnected OAuth upstreams; return updated list."""
-        if deps.connection_store is None:
-            return await list_upstreams()
-
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        all_upstreams = await runtime.config_service.list_upstreams(org_id)
-        reasons = await reconnect_all_oauth_upstreams(
-            org_id,
-            all_upstreams, deps.connection_store, runtime.client_manager,
-            runtime.tool_registry, deps.server_url,
-        )
-        return await _build_upstream_summaries(deps, all_upstreams, reasons)
 
     @router.get(
         "/upstreams/{upstream_id}", response_model=UpstreamDetail,
@@ -266,6 +308,7 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
         if (
             disconnect_reason is None
             and slot_owner is not None
+            and not runtime.client_manager.is_stopped(upstream.id)
             and deps.connection_store is not None
         ):
             now = datetime.now(UTC)
@@ -326,6 +369,7 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
             ready=ready,
             slot_owner=slot_owner,
             starting=runtime.client_manager.is_starting(upstream.id),
+            stopped=runtime.client_manager.is_stopped(upstream.id),
             url=upstream.http.url if upstream.http else None,
             command=upstream.stdio.command if upstream.stdio else None,
             client_id=upstream.auth.client_id,
@@ -445,13 +489,11 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
     ) -> ConnectResponse:
         """Re-pull an active upstream's tool list off its live session.
 
-        Never initiates a *fresh* connection. The gate is the same
-        readiness the dashboard uses to enable the button (admin
-        authenticated for OAuth; shared session live/deferred for
-        service_account), so a down/unauthenticated upstream is refused
-        with 409 instead of being connected. When ready, the live
-        session is reattached the same in-band way a tool call does
-        before discovery — mirroring ``tool_router._resolve_session``:
+        Never initiates a *fresh* connection: a down or unauthenticated
+        upstream is refused with 409 (``UpstreamAdminService.refresh_tools``,
+        which the Admin MCP shares). When ready, the live session is
+        reattached the same in-band way a tool call does before
+        discovery, mirroring ``tool_router._resolve_session``:
 
         - ``service_account``: ``ensure_shared_connected`` lazily reopens
           a DEFERRED_ATTACH shared session (idempotent when LIVE).
@@ -459,96 +501,16 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
           session from stored tokens (with refresh). Never prompts a
           browser flow.
 
-        On failure the reason is recorded + broadcast (error banner +
-        dashboard popup) but the session is deliberately NOT torn down:
-        a refresh failure must not kill a warm sandbox or sign an OAuth
-        admin out. Genuine unreachability already flips service_account
-        to FAILED inside ``ensure_shared_connected``.
+        Non-blocking: the refresh (which can stall ~15s and reconnect on
+        a fresh session after an E2B auto-pause) runs in the background
+        and the request returns at once. The dashboard shows the
+        "Fetching info" pill and learns the outcome via tools/list_changed
+        and the upstream's error banner. This is the fix for the
+        2026-06-18 prod incident, where the SYNCHRONOUS refresh surfaced a
+        TimeoutError for a refresh that actually succeeded later.
         """
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        upstream = await runtime.config_service.get_upstream(
-            org_id, upstream_id,
-        )
-        if upstream is None:
-            raise HTTPException(404, f"Upstream '{upstream_id}' not found")
-
-        ready, slot_owner = await resolve_upstream_readiness(
-            upstream, org_id, deps.connection_store, runtime,
-        )
-        if not ready:
-            raise HTTPException(409, "Upstream is not active")
-
-        logger.info(
-            "dashboard.api.admin.upstream.refresh_tools.requested",
-            upstream_id=upstream_id,
-            admin_email=admin_email,
-            org_id=org_id,
-        )
-
-        async def _on_success() -> None:
-            if deps.connection_store is not None:
-                await deps.connection_store.clear_connection_error(
-                    org_id, upstream_id,
-                )
-            notify_policy_change(deps)
-            await log_admin_action(
-                deps,
-                action="refresh_tools",
-                upstream_id=upstream_id,
-                admin_email=admin_email,
-                outcome="success",
-            )
-            logger.info(
-                "dashboard.api.admin.upstream.refresh_tools.success",
-                upstream_id=upstream_id,
-                org_id=org_id,
-            )
-
-        async def _on_error(error_msg: str) -> None:
-            # Record + broadcast so the dashboard shows the failure
-            # (error banner + popup). Non-destructive on purpose.
-            if deps.connection_store is not None:
-                await deps.connection_store.set_connection_error(
-                    org_id, upstream_id, error_msg,
-                )
-            notify_policy_change(deps)
-            await log_admin_action(
-                deps,
-                action="refresh_tools",
-                upstream_id=upstream_id,
-                admin_email=admin_email,
-                outcome="error",
-                error_message=error_msg,
-            )
-            logger.warning(
-                "dashboard.api.admin.upstream.refresh_tools.failed",
-                upstream_id=upstream_id,
-                org_id=org_id,
-                error=error_msg,
-            )
-
-        # Non-blocking: the acquire+refresh (which can stall ~15s and
-        # reconnect on a fresh session after an E2B auto-pause) runs in a
-        # background task so the request returns immediately. The
-        # dashboard shows the "Fetching info" pill (mark_refreshing flips
-        # synchronously) and learns the outcome via tools/list_changed +
-        # the per-upstream connection-error state. This is the fix for the
-        # 2026-06-18 prod incident, where the SYNCHRONOUS refresh surfaced
-        # a TimeoutError for a refresh that actually succeeded in the
-        # background. Reattach uses the slot owner for OAuth (the admin
-        # holding the token); service_account ignores it. Never prompts a
-        # browser flow.
-        refresh_tools_in_background(
-            org_id=org_id,
-            upstream=upstream,
-            effective_user=slot_owner or admin_email,
-            connection_store=deps.connection_store,
-            client_manager=runtime.client_manager,
-            tool_registry=runtime.tool_registry,
-            server_url=deps.server_url,
-            on_success=_on_success,
-            on_error=_on_error,
+        await deps.upstream_admin.refresh_tools(
+            current_org_id.get(), upstream_id, actor=admin_email,
         )
         return ConnectResponse(connected=True, upstream_id=upstream_id)
 
@@ -559,201 +521,38 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
         body: AddUpstreamRequest,
         admin_email: str = Depends(deps.require_admin),
     ) -> UpstreamSummary:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        if not body.url and not body.command:
-            raise HTTPException(400, "Either 'url' or 'command' is required")
-        if body.command and not deps.allow_stdio_mcp:
-            raise HTTPException(400, "Stdio MCP servers are disabled")
-
-        # Plan gate: count existing upstreams by transport before
-        # any work happens. Sandbox-combo gate runs further down once
-        # the resolved stdio config is in hand.
-        plan = await resolve_plan(deps.org_repo, org_id)
-        existing_upstreams = await runtime.config_service.list_upstreams(org_id)
-        if body.command:
-            current_stdio = sum(
-                1 for u in existing_upstreams
-                if u.transport == TransportType.stdio
-            )
-            assert_stdio_upstream_capacity(
-                plan, current_stdio,
-                source="dashboard.add_upstream",
-                org_id=org_id,
-                actor_email=admin_email,
-            )
-        else:
-            current_http = sum(
-                1 for u in existing_upstreams
-                if u.transport == TransportType.streamable_http
-            )
-            assert_http_upstream_capacity(
-                plan, current_http,
-                source="dashboard.add_upstream",
-                org_id=org_id,
-                actor_email=admin_email,
-            )
-
-        try:
-            validate_stdio_uses_service_account(
-                TransportType.stdio if body.command else TransportType.streamable_http,
-                AuthMode(body.auth_mode),
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from None
-
-        auth = UpstreamAuthConfig(
-            mode=AuthMode(body.auth_mode),
-            token=body.auth_token if body.auth_token else None,
-            client_id=body.client_id,
-            client_secret=body.client_secret,
-            scopes=body.scopes,
-        )
-
-        if body.command:
-            # Resource fields are optional: missing values fall through
-            # to ``StdioTransportConfig``'s built-in defaults (1 vCPU /
-            # 1024 MB / 0 disk). When any are supplied, validate the
-            # resulting combo against the active provider's grid so an
-            # off-grid value is rejected up front with a structured
-            # 400 the admin form can flag.
-            stdio_kwargs: dict[str, object] = {
-                "command": body.command,
-                "args": body.args,
-                "env": body.env,
-            }
-            if body.cpu_vcpus is not None:
-                stdio_kwargs["cpu_vcpus"] = body.cpu_vcpus
-            if body.memory_mb is not None:
-                stdio_kwargs["memory_mb"] = body.memory_mb
-            if body.disk_gb is not None:
-                stdio_kwargs["disk_gb"] = body.disk_gb
-            if body.pids_limit is not None:
-                stdio_kwargs["pids_limit"] = body.pids_limit
-            if body.tmpfs_mb is not None:
-                stdio_kwargs["tmpfs_mb"] = body.tmpfs_mb
-            if body.persistent_disk_enabled is not None:
-                stdio_kwargs["persistent_disk_enabled"] = body.persistent_disk_enabled
-            stdio_cfg = StdioTransportConfig(**stdio_kwargs)  # type: ignore[arg-type]
-            from mcpolis.domain.services.sandbox_service import (
-                ResourcesUnsupported,
-                SandboxResources,
-            )
-            try:
-                caps = await runtime.client_manager.get_active_capabilities()
-                services = runtime.client_manager._sandbox_services  # type: ignore[reportPrivateUsage]
-                services[caps.provider].validate_resources(
-                    SandboxResources(
-                        cpu_vcpus=stdio_cfg.cpu_vcpus,
-                        memory_mb=stdio_cfg.memory_mb,
-                        disk_gb=stdio_cfg.disk_gb,
-                        pids_limit=stdio_cfg.pids_limit,
-                    ),
-                )
-            except ResourcesUnsupported as exc:
-                raise HTTPException(
-                    400,
-                    detail={
-                        "message": str(exc),
-                        "field": exc.field,
-                        "value": str(exc.value),
-                    },
-                ) from None
-            # Sandbox-combo plan gate: provider-grid validation runs
-            # FIRST so off-grid values get the more-specific 400 +
-            # field hint. Only firing here when the admin actively
-            # picked a value lets a no-resource create accept the
-            # model default (1 vCPU / 1024 MB) without hitting a 402,
-            # which matches the historical behaviour that callers
-            # depend on.
-            user_picked_combo = (
-                body.cpu_vcpus is not None or body.memory_mb is not None
-            )
-            if user_picked_combo:
-                assert_sandbox_combo_allowed(
-                    plan,
-                    stdio_cfg.cpu_vcpus,
-                    stdio_cfg.memory_mb,
-                    source="dashboard.add_upstream",
-                    org_id=org_id,
-                    actor_email=admin_email,
-                )
-            upstream = UpstreamDefinition(
+        upstream = await deps.upstream_admin.add_upstream(
+            current_org_id.get(),
+            NewUpstreamRequest(
                 id=body.id,
                 display_name=body.display_name,
-                transport=TransportType.stdio,
-                stdio=stdio_cfg,
-                auth=auth,
-            )
-        else:
-            assert body.url is not None
-            try:
-                validate_upstream_url(body.url)
-            except UnsafeUpstreamUrl as exc:
-                raise HTTPException(
-                    400,
-                    detail={
-                        "code": "UNSAFE_UPSTREAM_URL",
-                        "message": (
-                            "This URL targets a private/loopback range "
-                            "and cannot be used as an upstream MCP."
-                        ),
-                        "reason": exc.reason,
-                    },
-                ) from None
-            upstream = UpstreamDefinition(
-                id=body.id,
-                display_name=body.display_name,
-                transport=TransportType.streamable_http,
-                http=HttpTransportConfig(
-                    url=body.url,
-                    headers=body.headers,
+                url=body.url,
+                headers=body.headers,
+                command=body.command,
+                args=body.args,
+                env=body.env,
+                sandbox=SandboxSizeRequest(
+                    cpu_vcpus=body.cpu_vcpus,
+                    memory_mb=body.memory_mb,
+                    disk_gb=body.disk_gb,
+                    pids_limit=body.pids_limit,
+                    tmpfs_mb=body.tmpfs_mb,
+                    persistent_disk_enabled=body.persistent_disk_enabled,
                 ),
-                auth=auth,
-            )
-        try:
-            await runtime.config_service.add_upstream(org_id, upstream)
-        except ValueError as e:
-            raise HTTPException(409, str(e)) from None
-        # Persist any env vars the wizard collected before the create
-        # call. Each entry carries an ``is_secret`` flag (default
-        # ``True``) — secret values are masked after save, plain
-        # values stay visible. Names are validated against the env-var
-        # regex.
-        if body.template_vars:
-            for var_name, spec in body.template_vars.items():
-                if not is_valid_template_var_name(var_name):
-                    raise HTTPException(
-                        400,
-                        f"Invalid variable name {var_name!r}: must match "
-                        "[A-Z_][A-Z0-9_]*",
+                auth_mode=body.auth_mode,
+                auth_token=body.auth_token,
+                client_id=body.client_id,
+                client_secret=body.client_secret,
+                scopes=body.scopes,
+                template_vars={
+                    name: TemplateVarInput(
+                        value=spec.value, is_secret=spec.is_secret,
                     )
-                if is_system_variable_name(var_name):
-                    raise HTTPException(
-                        400,
-                        f"Cannot create a Variable named {var_name!r}: "
-                        "that name is reserved for the read-only system "
-                        f"variable ${{{var_name}}}",
-                    )
-                await deps.template_var_repo.set(
-                    org_id, upstream.id, var_name, spec.value,
-                    is_secret=spec.is_secret,
-                )
-        # Create per-role access entries based on auto_enable_new
-        new_config = await deps.policy_store.create_mcp_access(
-            org_id, upstream.id,
-        )
-        runtime.policy_engine.reload(new_config)
-        # A new upstream starts stopped: the admin clicks Start.
-        await _mark_added_stopped(deps, runtime, org_id, upstream.id)
-        get_analytics().track_async(
-            admin_email,
-            "upstream_added",
-            {
-                "upstream_id": upstream.id,
-                "transport": upstream.transport.value,
-                "auth_mode": upstream.auth.mode.value,
-            },
+                    for name, spec in (body.template_vars or {}).items()
+                },
+            ),
+            actor=admin_email,
+            source="dashboard.add_upstream",
         )
         return UpstreamSummary(
             id=upstream.id,
@@ -798,7 +597,6 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
                 raise HTTPException(400, str(exc)) from None
             upstream.auth = UpstreamAuthConfig(
                 mode=AuthMode(body.auth_mode),
-                token=upstream.auth.token,
                 client_id=upstream.auth.client_id,
                 client_secret=upstream.auth.client_secret,
                 scopes=upstream.auth.scopes,
@@ -876,21 +674,7 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
                 upstream.http = None
                 resources_touched = True
             elif "url" in sc:
-                try:
-                    validate_upstream_url(sc["url"])
-                except UnsafeUpstreamUrl as exc:
-                    raise HTTPException(
-                        400,
-                        detail={
-                            "code": "UNSAFE_UPSTREAM_URL",
-                            "message": (
-                                "This URL targets a private/loopback "
-                                "range and cannot be used as an "
-                                "upstream MCP."
-                            ),
-                            "reason": exc.reason,
-                        },
-                    ) from None
+                check_upstream_url(sc["url"])
                 upstream.transport = TransportType.streamable_http
                 upstream.http = HttpTransportConfig(
                     url=sc["url"],
@@ -934,36 +718,10 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
         # structured ``{message, field, value}`` the admin UI uses
         # to flag the offending control.
         if resources_touched and upstream.stdio is not None:
-            from mcpolis.domain.services.sandbox_service import (
-                ResourcesUnsupported,
-                SandboxResources,
-            )
-            try:
-                caps = await runtime.client_manager.get_active_capabilities()
-                provider_name = caps.provider
-                services = runtime.client_manager._sandbox_services  # type: ignore[reportPrivateUsage]
-                services[provider_name].validate_resources(
-                    SandboxResources(
-                        cpu_vcpus=upstream.stdio.cpu_vcpus,
-                        memory_mb=upstream.stdio.memory_mb,
-                        disk_gb=upstream.stdio.disk_gb,
-                        pids_limit=upstream.stdio.pids_limit,
-                    ),
-                )
-            except ResourcesUnsupported as exc:
-                raise HTTPException(
-                    400,
-                    detail={
-                        "message": str(exc),
-                        "field": exc.field,
-                        "value": str(exc.value),
-                    },
-                ) from None
-            # Plan combo gate fires only when the patch actually
-            # touched CPU or memory — picking just disk / pids /
-            # tmpfs / persistent_disk_enabled doesn't relate to the
-            # plan's matrix. Provider-grid validation runs first so
-            # off-grid values still get the more-specific 400.
+            # The plan check runs only when the patch actually touched
+            # CPU or memory — picking just disk / pids / tmpfs /
+            # persistent_disk_enabled doesn't relate to the plan's
+            # matrix. The provider check always runs.
             patch_touched_combo = False
             if body.server_config is not None:
                 sc = body.server_config
@@ -975,16 +733,17 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
                     body.sandbox_resources.cpu_vcpus is not None
                     or body.sandbox_resources.memory_mb is not None
                 )
-            if patch_touched_combo:
-                plan = await resolve_plan(deps.org_repo, org_id)
-                assert_sandbox_combo_allowed(
-                    plan,
-                    upstream.stdio.cpu_vcpus,
-                    upstream.stdio.memory_mb,
-                    source="dashboard.update_upstream",
-                    org_id=org_id,
-                    actor_email=admin_email,
-                )
+            await check_sandbox_size(
+                runtime.client_manager,
+                upstream.stdio,
+                plan=(
+                    await resolve_plan(deps.org_repo, org_id)
+                    if patch_touched_combo else None
+                ),
+                source="dashboard.update_upstream",
+                org_id=org_id,
+                actor_email=admin_email,
+            )
 
         # Validate template-var changes before any mutation so a bad
         # name rolls back the whole save without leaving half-applied
@@ -993,20 +752,7 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
         # string, sometimes the intended value).
         template_var_changes = body.template_var_changes
         if template_var_changes is not None:
-            for var_name in template_var_changes.sets:
-                if not is_valid_template_var_name(var_name):
-                    raise HTTPException(
-                        400,
-                        f"Invalid variable name {var_name!r}: must match "
-                        "[A-Z_][A-Z0-9_]*",
-                    )
-                if is_system_variable_name(var_name):
-                    raise HTTPException(
-                        400,
-                        f"Cannot create a Variable named {var_name!r}: "
-                        "that name is reserved for the read-only "
-                        f"system variable ${{{var_name}}}",
-                    )
+            check_template_var_names(template_var_changes.sets)
             for var_name in template_var_changes.deletes:
                 if not is_valid_template_var_name(var_name):
                     raise HTTPException(
@@ -1014,6 +760,16 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
                         f"Invalid variable name {var_name!r}: must match "
                         "[A-Z_][A-Z0-9_]*",
                     )
+        # Resolve every "keep the saved value" entry up front, before
+        # any write: in a swap or a chain of renames, a source row is
+        # rewritten during the apply step.
+        resolved_template_vars: dict[str, tuple[str, bool]] = (
+            await _resolve_template_var_sets(
+                deps, org_id, upstream_id, template_var_changes,
+            )
+            if template_var_changes is not None
+            else {}
+        )
 
         # Save the new config WITHOUT touching the running session.
         # Even an auth_mode or server_config change leaves the live
@@ -1040,19 +796,11 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
 
         # Apply env-var changes after the upstream config write so a
         # config validation failure doesn't strand env-var mutations.
-        # Deletes apply before sets so a same-name pair lands as the
-        # set (intuitive: the buffer's last write wins on the row).
         if template_var_changes is not None:
-            delete_set = set(template_var_changes.deletes)
-            for var_name in delete_set - set(template_var_changes.sets.keys()):
-                await deps.template_var_repo.delete(
-                    org_id, upstream_id, var_name,
-                )
-            for var_name, spec in template_var_changes.sets.items():
-                await deps.template_var_repo.set(
-                    org_id, upstream_id, var_name, spec.value,
-                    is_secret=spec.is_secret,
-                )
+            await _apply_template_var_changes(
+                deps.template_var_repo, org_id, upstream_id,
+                template_var_changes, resolved_template_vars,
+            )
 
         return await get_upstream(upstream_id)
 
@@ -1061,48 +809,8 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
         upstream_id: str,
         admin_email: str = Depends(deps.require_admin),
     ) -> dict[str, str]:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        upstream = await runtime.config_service.get_upstream(
-            org_id, upstream_id,
-        )
-        try:
-            await runtime.config_service.remove_upstream(org_id, upstream_id)
-        except ValueError as e:
-            raise HTTPException(404, str(e)) from None
-        # Provider-side teardown (E2B Volumes, persistence refs).
-        # Runs after config removal so a partial failure here can't
-        # leave the upstream half-deleted. on_upstream_removed is
-        # idempotent across all backends so a future reconciliation
-        # can still clean up if this fails transiently.
-        try:
-            await runtime.client_manager.cleanup_sandbox_state_for_upstream(
-                upstream_id,
-            )
-        except Exception:
-            logger.warning(
-                "upstream.remove.sandbox_cleanup_failed",
-                org_id=org_id, upstream_id=upstream_id, exc_info=True,
-            )
-        if deps.connection_store is not None:
-            await deps.connection_store.clear_connection_error(
-                org_id, upstream_id,
-            )
-            # Bistate (Phase E): set_enabled removes any explicit-
-            # disabled marker so a fresh re-add starts in the
-            # default-enabled state.
-            await deps.connection_store.set_enabled(org_id, upstream_id)
-        # The upstream's prefixed tools are gone from ToolRegistry; push
-        # so connected clients stop listing them.
-        notify_policy_change(deps)
-        get_analytics().track_async(
-            admin_email,
-            "upstream_removed",
-            {
-                "upstream_id": upstream_id,
-                "transport": upstream.transport.value if upstream else "unknown",
-                "auth_mode": upstream.auth.mode.value if upstream else "unknown",
-            },
+        await deps.upstream_admin.remove_upstream(
+            current_org_id.get(), upstream_id, actor=admin_email,
         )
         return {"status": "removed"}
 
@@ -1186,10 +894,6 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
         body: ImportConfirmRequest,
         admin_email: str = Depends(deps.require_admin),
     ) -> ImportResultResponse:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        existing_upstreams = await runtime.config_service.list_upstreams(org_id)
-        existing = {u.id for u in existing_upstreams}
         data = body.data
 
         def resolve_config(
@@ -1223,112 +927,25 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
                 if isinstance(config, dict) else None
             )
 
-        added: list[str] = []
-        skipped: list[str] = []
-        errors: list[ImportErrorDetail] = []
-
-        # Resolve + validate each row up front so the plan gate counts only
-        # what will actually be created. Per-row problems become row errors;
-        # the plan-cap 402 still stops the whole import.
-        valid: list[tuple[ImportConfirmEntry, dict[str, Any]]] = []
-        seen_targets: set[str] = set()
-        for entry in body.entries:
-            tid = entry.target_id
-            if not tid or not _VALID_UPSTREAM_ID.fullmatch(tid):
-                errors.append(ImportErrorDetail(
-                    id=tid or entry.original_id,
-                    error=(
-                        "Invalid id (allowed: lowercase letters, digits, "
-                        "hyphens, underscores, dots)"
-                    ),
-                ))
-                continue
-            if tid in existing:
-                errors.append(ImportErrorDetail(
-                    id=tid, error="An upstream with this id already exists",
-                ))
-                continue
-            if tid in seen_targets:
-                errors.append(ImportErrorDetail(
-                    id=tid, error="Duplicate id in this import",
-                ))
-                continue
-            config = resolve_config(entry)
-            if config is None:
-                errors.append(ImportErrorDetail(
-                    id=tid,
-                    error="Source server not found in the uploaded config",
-                ))
-                continue
-            if not deps.allow_stdio_mcp and "command" in config:
-                errors.append(ImportErrorDetail(
-                    id=tid, error="Stdio MCP servers are disabled",
-                ))
-                continue
-            seen_targets.add(tid)
-            valid.append((entry, config))
-
-        # Plan gate over the to-be-created set so a bulk import can't smuggle
-        # past the per-add gate. The 402 stops the whole import — an explicit
-        # admin action, so one popover beats partial success.
-        plan = await resolve_plan(deps.org_repo, org_id)
-        running_http = sum(
-            1 for u in existing_upstreams
-            if u.transport == TransportType.streamable_http
+        outcome = await deps.upstream_admin.import_upstreams(
+            current_org_id.get(),
+            [
+                ImportRow(
+                    original_id=entry.original_id,
+                    target_id=entry.target_id,
+                    config=resolve_config(entry),
+                )
+                for entry in body.entries
+            ],
+            actor=admin_email,
         )
-        running_stdio = sum(
-            1 for u in existing_upstreams
-            if u.transport == TransportType.stdio
-        )
-        for _entry, config in valid:
-            if "command" in config:
-                assert_stdio_upstream_capacity(
-                    plan, running_stdio,
-                    source="dashboard.import_confirm",
-                    org_id=org_id,
-                    actor_email=admin_email,
-                )
-                running_stdio += 1
-            elif "url" in config:
-                assert_http_upstream_capacity(
-                    plan, running_http,
-                    source="dashboard.import_confirm",
-                    org_id=org_id,
-                    actor_email=admin_email,
-                )
-                running_http += 1
-
-        for entry, config in valid:
-            tid = entry.target_id
-            try:
-                upstream = build_upstream(tid, config, {})
-                if upstream.http is not None:
-                    try:
-                        validate_upstream_url(upstream.http.url)
-                    except UnsafeUpstreamUrl as exc:
-                        errors.append(ImportErrorDetail(
-                            id=tid,
-                            error=(
-                                f"UNSAFE_UPSTREAM_URL: {exc.reason}"
-                            ),
-                        ))
-                        continue
-                await runtime.config_service.add_upstream_no_refresh(
-                    org_id, upstream,
-                )
-                new_config = await deps.policy_store.create_mcp_access(
-                    org_id, tid,
-                )
-                runtime.policy_engine.reload(new_config)
-                # Same off-by-default intent as ``add_upstream``.
-                await _mark_added_stopped(deps, runtime, org_id, tid)
-                added.append(tid)
-                existing.add(tid)
-            except Exception as e:
-                errors.append(ImportErrorDetail(id=tid, error=str(e)))
-
         return ImportResultResponse(
-            added=added, skipped=skipped, errors=errors,
+            added=outcome.added,
+            skipped=[],
+            errors=[
+                ImportErrorDetail(id=e.id, error=e.error)
+                for e in outcome.errors
+            ],
         )
 
     @router.post(
@@ -1338,156 +955,8 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
         upstream_id: str,
         admin_email: str = Depends(deps.require_admin),
     ) -> ConnectResponse:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        if deps.connection_store is None or deps.auth_coordinator is None:
-            raise HTTPException(400, "OAuth is not configured")
-        upstream = await runtime.config_service.get_upstream(
-            org_id, upstream_id,
-        )
-        if upstream is None:
-            raise HTTPException(404, f"Upstream '{upstream_id}' not found")
-        if upstream.auth.mode == AuthMode.service_account:
-            raise HTTPException(400, "This MCP uses service_account auth")
-
-        # Uniform single-slot UX across both OAuth modes: another
-        # admin already holding a row must be explicitly disconnected
-        # before this admin can take over. The frontend surfaces the
-        # conflict and routes users to the disconnect-then-connect
-        # flow. (per_user_oauth's storage allows multiple admin rows
-        # in principle, but the admin-tab UX deliberately collapses
-        # them into a single visible slot — same as admin_oauth.)
-        existing = await admin_oauth_owner(
-            deps.connection_store, org_id, upstream_id, admin_email,
-            policy_engine=runtime.policy_engine,
-        )
-        if existing is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"'{existing}' is already connected to this MCP. "
-                    "Disconnect first to take over."
-                ),
-            )
-
-        logger.info(
-            "dashboard.api.admin.upstream.connect.requested",
-            upstream_id=upstream_id,
-            admin_email=admin_email,
-            org_id=org_id,
-        )
-        # Bistate: removes any explicit-disabled marker so the
-        # upstream falls back to default-enabled. (Previously this
-        # wrote ``enabled: True`` — under the bistate semantic
-        # there's no such row; absence is the canonical enabled.)
-        await deps.connection_store.set_enabled(org_id, upstream_id)
-
-        async def _snapshot_started_config_hash() -> None:
-            # OAuth-mode upstreams: see the equivalent helper in the
-            # /reconnect handler below for the rationale. Snapshots
-            # the current saved-config hash so the next config edit
-            # flips ``is_dirty=true`` even before any session task
-            # is created.
-            if deps.connection_store is None:
-                return
-            hash_value = await runtime.client_manager.compute_runtime_hash(
-                upstream,
-            )
-            try:
-                await deps.connection_store.set_started_config_hash(
-                    org_id, upstream_id, hash_value,
-                )
-            except Exception:
-                logger.warning(
-                    "dashboard.api.admin.upstream.connect."
-                    "snapshot_hash_failed",
-                    upstream_id=upstream_id,
-                    org_id=org_id,
-                    exc_info=True,
-                )
-
-        def _notify_tokens_acquired() -> None:
-            if deps.event_bus is not None:
-                deps.event_bus.publish(org_id, Event(
-                    type="upstream_tokens_acquired",
-                    payload={"upstream_id": upstream_id},
-                ))
-            # Slow path: tokens arrived via OAuth callback after the
-            # request returned. Broadcast so every session picks up the
-            # now-working shared admin_oauth upstream.
-            notify_policy_change(deps)
-            asyncio.create_task(_snapshot_started_config_hash())
-
-        def _notify_error(
-            error_msg: str, reason: OAuthFailureReason,
-        ) -> None:
-            del reason  # admin connect flow does not emit Mixpanel events
-            if deps.event_bus is not None:
-                deps.event_bus.publish(org_id, Event(
-                    type="upstream_oauth_error",
-                    payload={"upstream_id": upstream_id, "error": error_msg},
-                ))
-
-        # Both OAuth modes now key tokens by the connecting admin's
-        # real email. The gateway resolves admin_oauth traffic by
-        # picking any admin's valid token from the pool (see
-        # ``ToolRouter._resolve_admin_pool_user``); per_user_oauth
-        # always looks up by caller email.
-        result = await connect_and_refresh_tools(
-            org_id=org_id,
-            upstream=upstream,
-            effective_user=admin_email,
-            connection_store=deps.connection_store,
-            auth_coordinator=deps.auth_coordinator,
-            client_manager=runtime.client_manager,
-            tool_registry=runtime.tool_registry,
-            server_url=deps.server_url,
-            on_tokens_acquired=_notify_tokens_acquired,
-            on_error=_notify_error,
-            # Background catalog refresh fires this after list_tools /
-            # list_resources / list_prompts complete. Re-broadcasting
-            # ``policy_changed`` flips the dashboard's "Fetching info"
-            # indicator off and pulls in the real tool_count.
-            on_tools_refreshed=lambda: notify_policy_change(deps),
-        )
-        if result.connected:
-            await deps.connection_store.clear_connection_error(
-                org_id, upstream_id,
-            )
-            await _snapshot_started_config_hash()
-            notify_policy_change(deps)
-            logger.info(
-                "dashboard.api.admin.upstream.connect.success",
-                upstream_id=upstream_id,
-                org_id=org_id,
-            )
-        elif result.authorization_url:
-            logger.info(
-                "dashboard.api.admin.upstream.connect.pending",
-                upstream_id=upstream_id,
-                org_id=org_id,
-            )
-        elif result.error:
-            await deps.connection_store.set_connection_error(
-                org_id, upstream_id, result.error,
-            )
-            logger.warning(
-                "dashboard.api.admin.upstream.connect.failed",
-                upstream_id=upstream_id,
-                org_id=org_id,
-                error=result.error,
-            )
-        await log_admin_action(
-            deps,
-            action="connect",
-            upstream_id=upstream_id,
-            admin_email=admin_email,
-            outcome=(
-                "success" if result.connected
-                else "pending" if result.authorization_url
-                else "error"
-            ),
-            error_message=result.error,
+        result = await deps.upstream_admin.connect_upstream(
+            current_org_id.get(), upstream_id, actor=admin_email,
         )
         return ConnectResponse(
             authorization_url=result.authorization_url,
@@ -1495,90 +964,28 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
             error=result.error,
         )
 
+    @router.post("/upstreams/{upstream_id}/sign-out")
+    async def sign_out_upstream_admin(
+        upstream_id: str,
+        body: SignOutRequest,
+        admin_email: str = Depends(deps.require_admin),
+    ) -> dict[str, str | None]:
+        """Remove sign-in: delete the admin sign-in the upstream shows,
+        if it is still ``body.email``'s (409 when another admin's is
+        shown by now). See ``UpstreamAdminService.remove_sign_in``."""
+        removed = await deps.upstream_admin.remove_sign_in(
+            current_org_id.get(), upstream_id,
+            actor=admin_email, expected_email=body.email,
+        )
+        return {"status": "signed_out", "email": removed}
+
     @router.post("/upstreams/{upstream_id}/disconnect")
     async def disconnect_upstream_admin(
         upstream_id: str,
         admin_email: str = Depends(deps.require_admin),
     ) -> dict[str, str]:
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        upstream = await runtime.config_service.get_upstream(
-            org_id, upstream_id,
-        )
-        if upstream is None:
-            raise HTTPException(404, f"Upstream '{upstream_id}' not found")
-        logger.info(
-            "dashboard.api.admin.upstream.disconnect.requested",
-            upstream_id=upstream_id,
-            admin_email=admin_email,
-            org_id=org_id,
-        )
-        # Uniform across both OAuth modes: the admin-tab disconnect
-        # releases the slot by clearing the slot-owning admin's row —
-        # regardless of which admin called the endpoint. This is what
-        # makes "B disconnects A, then B connects" work as a take-over
-        # for both admin_oauth and per_user_oauth. Non-admin users'
-        # personal per_user_oauth rows are never touched here (they're
-        # only iterated by ``admin_oauth_owner`` over admin emails).
-        # Done before session teardown so the stored token can't be
-        # consumed by an in-flight invocation that still resolves the
-        # owner.
-        cleared_owner: str | None = None
-        if (
-            upstream.auth.mode in (AuthMode.admin_oauth, AuthMode.per_user_oauth)
-            and deps.connection_store is not None
-        ):
-            cleared_owner = await admin_oauth_owner(
-                deps.connection_store, org_id, upstream_id,
-                excluding_email=None,
-                policy_engine=runtime.policy_engine,
-            )
-            if cleared_owner is not None:
-                await deps.connection_store.delete_user_token(
-                    org_id, cleared_owner, upstream_id,
-                )
-                await runtime.client_manager.disconnect_user_session(
-                    upstream_id, cleared_owner,
-                )
-        try:
-            await runtime.client_manager.disconnect_upstream(upstream_id)
-        except Exception as e:
-            logger.warning(
-                "dashboard.api.admin.upstream.disconnect.failed",
-                upstream_id=upstream_id,
-                org_id=org_id,
-                error=str(e),
-                exc_info=True,
-            )
-            await log_admin_action(
-                deps,
-                action="disconnect",
-                upstream_id=upstream_id,
-                admin_email=admin_email,
-                outcome="error",
-                error_message=str(e),
-            )
-            raise
-        if deps.connection_store is not None:
-            await deps.connection_store.clear_connection_error(
-                org_id, upstream_id,
-            )
-            # Admin Stop must survive restart — write explicit False
-            # rather than removing the marker.
-            await deps.connection_store.set_disabled(org_id, upstream_id)
-        logger.info(
-            "dashboard.api.admin.upstream.disconnect.success",
-            upstream_id=upstream_id,
-            org_id=org_id,
-            cleared_owner=cleared_owner,
-        )
-        notify_policy_change(deps)
-        await log_admin_action(
-            deps,
-            action="disconnect",
-            upstream_id=upstream_id,
-            admin_email=admin_email,
-            outcome="success",
+        await deps.upstream_admin.stop_upstream(
+            current_org_id.get(), upstream_id, actor=admin_email,
         )
         return {"status": "disconnected"}
 
@@ -1590,283 +997,19 @@ def create_upstream_admin_router(deps: DashboardDeps) -> APIRouter:
         upstream_id: str,
         admin_email: str = Depends(deps.require_admin),
     ) -> ConnectResponse:
-        """Disconnect and reconnect any upstream (all auth modes)."""
-        org_id = current_org_id.get()
-        runtime = await deps.runtime_manager.get(org_id)
-        upstream = await runtime.config_service.get_upstream(
-            org_id, upstream_id,
+        """Start any upstream (all auth modes). A service-account Start
+        runs in the background: the answer is ``pending`` and the
+        ``sandbox_state_changed`` stream carries warming → active →
+        ready / failed."""
+        outcome = await deps.upstream_admin.start_upstream(
+            current_org_id.get(), upstream_id, actor=admin_email,
         )
-        if upstream is None:
-            raise HTTPException(404, f"Upstream '{upstream_id}' not found")
-
-        logger.info(
-            "dashboard.api.admin.upstream.reconnect.requested",
-            upstream_id=upstream_id,
-            auth_mode=upstream.auth.mode.value,
-            admin_email=admin_email,
-            org_id=org_id,
+        if outcome.sign_in is None:
+            return ConnectResponse(outcome="pending", upstream_id=upstream_id)
+        return ConnectResponse(
+            authorization_url=outcome.sign_in.authorization_url,
+            connected=outcome.sign_in.connected,
+            error=outcome.sign_in.error,
         )
-
-        # Disconnect existing session — don't let failure block the
-        # reconnect. ``reset_state=False`` skips the synthetic ``cold``
-        # registry transition because we're about to ``mark_warming``
-        # in the same handler; without this skip the brief gap between
-        # the two events is a window where a refetch returns
-        # ``sandbox_state=null`` and clients flicker the button back
-        # to "Start" mid-cold-pull.
-        try:
-            await runtime.client_manager.disconnect_upstream(
-                upstream_id, reset_state=False,
-            )
-        except Exception:
-            logger.warning(
-                "dashboard.api.admin.upstream.reconnect.disconnect_failed",
-                upstream_id=upstream_id,
-                org_id=org_id,
-                exc_info=True,
-            )
-
-        if deps.connection_store is not None:
-            # Bistate: removes any explicit-disabled marker so a
-            # prior auto-disable doesn't survive the reconnect
-            # request. ``is_enabled`` returns True after this; the
-            # boot reconciler picks the upstream up next restart.
-            await deps.connection_store.set_enabled(org_id, upstream_id)
-
-        if upstream.auth.mode == AuthMode.service_account:
-            # Reset stale per-session UX state synchronously so the
-            # dashboard sees a clean slate the instant the Start
-            # click returns: previous-attempt's ``disconnect_reason``
-            # banner and ``Server logs`` panel both come from
-            # persistent stores that the in-flight ``transition_to_
-            # connecting`` doesn't touch. Without this clear, the
-            # user sees the OLD red error + OLD stderr while the
-            # button shows "Starting…" — visually confusing during
-            # the (now ~500 ms) fail-fast window.
-            if deps.connection_store is not None:
-                await deps.connection_store.clear_connection_error(
-                    org_id, upstream_id,
-                )
-            runtime.client_manager.log_buffers.get_or_create(
-                upstream_id,
-            ).clear()
-
-            # Fire-and-forget reconnect. For HTTP upstreams the inner
-            # connect is sub-second so the user sees a near-instant
-            # ready flip on the next fetch; for remote-stdio sandbox
-            # upstreams the runner has to spawn a rootless podman
-            # container and ``npx -y`` / ``uvx`` cold-pull the
-            # package before MCP ``initialize`` even starts —
-            # empirically 30–35s on a t4g.small. Awaiting that
-            # synchronously meant the user's tab sat on a spinner
-            # and lost the work if they navigated away mid-flight.
-            # Instead we hand off to a detached task and rely on the
-            # ``sandbox_state_changed`` SSE stream to drive the pill
-            # (warming → active → ready) and on
-            # ``connection_store.set_connection_error`` +
-            # ``mark_failed`` to surface failure state — both of
-            # which are reconstructible from server truth on tab
-            # switch / reload.
-            async def _do_background_reconnect() -> None:
-                connection_error: str | None = None
-                try:
-                    await runtime.client_manager.connect_upstream(upstream)
-                except asyncio.CancelledError:
-                    # Stop / re-click cancelled us. Don't touch
-                    # connection_store or registry — the canceller
-                    # owns the post-cancellation state (Stop has
-                    # already called mark_disconnected).
-                    raise
-                except ConnectAborted:
-                    # Stop aborted the connect this Start was waiting on
-                    # (it can land just after the connect went live, when
-                    # Start is no longer the tracked background task).
-                    # Same as being cancelled: Stop owns the state, so
-                    # record nothing.
-                    return
-                except Exception as e:
-                    connection_error = str(e) or e.__class__.__name__
-                if deps.connection_store is not None:
-                    if connection_error:
-                        await deps.connection_store.set_connection_error(
-                            org_id, upstream_id, connection_error,
-                        )
-                    else:
-                        await deps.connection_store.clear_connection_error(
-                            org_id, upstream_id,
-                        )
-                if connection_error is None:
-                    try:
-                        await runtime.tool_registry.refresh_upstream(
-                            upstream_id,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "dashboard.api.admin.upstream.reconnect.refresh_failed",
-                            upstream_id=upstream_id,
-                            org_id=org_id,
-                        )
-                    notify_policy_change(deps)
-                    logger.info(
-                        "dashboard.api.admin.upstream.reconnect.success",
-                        upstream_id=upstream_id,
-                        org_id=org_id,
-                    )
-                else:
-                    # Re-broadcast policy_changed: ready flips from
-                    # True → False on a failed reconnect, and the
-                    # listing's pill needs to refetch the new
-                    # disconnect_reason from connection_store.
-                    notify_policy_change(deps)
-                    logger.warning(
-                        "dashboard.api.admin.upstream.reconnect.failed",
-                        upstream_id=upstream_id,
-                        org_id=org_id,
-                        error=connection_error,
-                    )
-                await log_admin_action(
-                    deps,
-                    action="reconnect",
-                    upstream_id=upstream_id,
-                    admin_email=admin_email,
-                    outcome=(
-                        "success" if connection_error is None else "error"
-                    ),
-                    error_message=connection_error,
-                )
-
-            task = asyncio.create_task(_do_background_reconnect())
-            runtime.client_manager.register_background_connect_task(
-                upstream_id, task,
-            )
-            logger.info(
-                "dashboard.api.admin.upstream.reconnect.scheduled",
-                upstream_id=upstream_id,
-                org_id=org_id,
-            )
-            return ConnectResponse(
-                outcome="pending",
-                upstream_id=upstream_id,
-            )
-        else:
-            # OAuth — delegate to the existing connect flow
-            if deps.connection_store is None or deps.auth_coordinator is None:
-                raise HTTPException(400, "OAuth is not configured")
-
-            # Same reset-on-Start policy as the service_account branch
-            # above. ``connect_and_refresh_tools`` runs synchronously
-            # below so the window for showing stale state is shorter,
-            # but a non-trivial OAuth handshake (refresh token
-            # exchange, retried discovery) can still take a couple of
-            # seconds — clear here too so the dashboard stays clean
-            # if anything observes the intermediate state.
-            await deps.connection_store.clear_connection_error(
-                org_id, upstream_id,
-            )
-            runtime.client_manager.log_buffers.get_or_create(
-                upstream_id,
-            ).clear()
-
-            async def _snapshot_started_config_hash() -> None:
-                # OAuth-mode upstreams compute ``ready`` purely from
-                # token existence (no UpstreamState session required),
-                # so without an explicit snapshot here the dashboard's
-                # dirty banner can NEVER fire — ``started_config_hash``
-                # would stay None forever for the new process.
-                # Snapshot the current saved config the moment the
-                # OAuth flow successfully mints (or refreshes) a token
-                # so future config edits cause ``is_dirty=true`` even
-                # before any tool call lazily creates an admin session.
-                if deps.connection_store is None:
-                    return
-                hash_value = await runtime.client_manager.compute_runtime_hash(
-                    upstream,
-                )
-                try:
-                    await deps.connection_store.set_started_config_hash(
-                        org_id, upstream_id, hash_value,
-                    )
-                except Exception:
-                    logger.warning(
-                        "dashboard.api.admin.upstream.reconnect."
-                        "snapshot_hash_failed",
-                        upstream_id=upstream_id,
-                        org_id=org_id,
-                        exc_info=True,
-                    )
-
-            def _on_reconnect_tokens_acquired() -> None:
-                # Slow path (tokens arrive via the OAuth callback after
-                # this handler has returned): broadcast so every session
-                # re-lists the now-reachable upstream's tools.
-                notify_policy_change(deps)
-                # Snapshot the current saved config as the running
-                # baseline. Fire-and-forget — the broadcast above is
-                # the user-visible "tokens here, refetch" signal.
-                asyncio.create_task(_snapshot_started_config_hash())
-
-            # Reconnect runs as the calling admin — same key shape as
-            # the connect path. For ``admin_oauth`` this becomes the
-            # new slot owner; for ``per_user_oauth`` it's the admin's
-            # personal sign-in.
-            result = await connect_and_refresh_tools(
-                org_id=org_id,
-                upstream=upstream,
-                effective_user=admin_email,
-                connection_store=deps.connection_store,
-                auth_coordinator=deps.auth_coordinator,
-                client_manager=runtime.client_manager,
-                tool_registry=runtime.tool_registry,
-                server_url=deps.server_url,
-                on_tokens_acquired=_on_reconnect_tokens_acquired,
-                on_tools_refreshed=lambda: notify_policy_change(deps),
-            )
-            if result.connected:
-                await deps.connection_store.clear_connection_error(
-                    org_id, upstream_id,
-                )
-                # Synchronous-success path (silent refresh, or already
-                # had a usable token): snapshot the baseline now so
-                # the next config edit flips is_dirty.
-                await _snapshot_started_config_hash()
-                notify_policy_change(deps)
-                logger.info(
-                    "dashboard.api.admin.upstream.reconnect.success",
-                    upstream_id=upstream_id,
-                    org_id=org_id,
-                )
-            elif result.authorization_url:
-                logger.info(
-                    "dashboard.api.admin.upstream.reconnect.pending",
-                    upstream_id=upstream_id,
-                    org_id=org_id,
-                )
-            elif result.error:
-                await deps.connection_store.set_connection_error(
-                    org_id, upstream_id, result.error,
-                )
-                logger.warning(
-                    "dashboard.api.admin.upstream.reconnect.failed",
-                    upstream_id=upstream_id,
-                    org_id=org_id,
-                    error=result.error,
-                )
-            await log_admin_action(
-                deps,
-                action="reconnect",
-                upstream_id=upstream_id,
-                admin_email=admin_email,
-                outcome=(
-                    "success" if result.connected
-                    else "pending" if result.authorization_url
-                    else "error"
-                ),
-                error_message=result.error,
-            )
-            return ConnectResponse(
-                authorization_url=result.authorization_url,
-                connected=result.connected,
-                error=result.error,
-            )
 
     return router

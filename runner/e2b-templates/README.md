@@ -12,9 +12,8 @@ behind it.
 ## Grid
 
 - **Languages:** `node` (npx-distributed MCPs), `python` (uvx-distributed),
-  `docker` (`docker run`-distributed MCPs; the template starts `dockerd`
-  at boot via `set_start_cmd` so the MCP's `docker run -i …` has a live
-  daemon)
+  `docker` (`docker run`-distributed MCPs; the backend adopts or starts
+  `dockerd` after boot so the MCP's `docker run -i …` has a live daemon)
 - **CPU / RAM pairings (per language):**
 
   | vCPU | RAM (MiB)            |

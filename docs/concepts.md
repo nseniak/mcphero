@@ -37,14 +37,14 @@ A named set of permissions that decides which MCPs and tools a member can use. M
 
 ## Team member
 
-Someone in your organization, identified by their Google email. Each member has exactly one role. You add members from the Team page or by sharing your organization's invite link.
+Someone in your organization, identified by their Google email. Each member has exactly one role. You invite members from the Team page and share your organization's invite link with them. An invited person becomes a member when they accept the invitation by clicking **Join**; until then they have no access to your organization.
 
 > **User authentication modes**
 >
 > When you add an upstream MCP, you pick how end users authenticate to it. The form labels these modes **None**, **Shared**, and **Per-user**.
 >
 > - **None** — users don't authenticate to this MCP at all. Either it's open, or its credentials live in the server config (a shared API key for a Mixpanel project, a Stripe restricted key, a MongoDB read-only user). Every member's call goes out with the same credentials.
-> - **Shared** — *you* (or another admin) sign in once with OAuth on behalf of the team. Every member's call goes out as you. Use this for shared org resources like your company HubSpot or Linear workspace. Only one admin owns the connection at a time.
+> - **Shared** — *you* (or another admin) sign in once with OAuth on behalf of the team. Every member's call goes out as you. Use this for shared org resources like your company HubSpot or Linear workspace. Only one admin owns the connection at a time; any admin can hand it over with **Remove sign-in** (see [Upstream MCPs](upstream-mcps.md)).
 > - **Per-user** — every team member signs in personally with OAuth. Each call goes out as that member. Use this when the upstream is naturally scoped per person — a member's own GitHub repos or work calendar.
 >
 > **Stdio MCPs are locked to None.** Browser-based OAuth doesn't work inside a remote sandbox; stdio MCPs authenticate through the per-MCP Variables and Files surfaces described in [Upstream MCPs](upstream-mcps.md). The form hides the auth-mode picker for stdio. Full reasoning in [Stdio MCP authentication](stdio-authent.md).
@@ -52,3 +52,11 @@ Someone in your organization, identified by their Google email. Each member has 
 ## Admin MCP
 
 A second MCP that MCP Hero exposes — at a URL ending in `/admin-mcp` — for administering MCP Hero itself. Connect your AI client to it and you can add upstreams, change roles, search the audit log, and so on conversationally. It's an alternative to clicking through the dashboard, not a replacement.
+
+## Rate limits
+
+MCP Hero caps how many requests can arrive in a short time, so one runaway script or agent can't slow things down for everyone else. Normal use, including busy AI chats, stays well below the caps.
+
+- **Tool calls through the gateway MCP** are counted over the last minute, for each person or service token, and for the whole organization. A tool call over the limit doesn't run. Instead it returns an error that says how many seconds to wait. AI assistants read the error and usually try again by themselves. One person reaching their limit doesn't block their teammates. The Team plan has higher limits than the Free plan.
+- **Admin MCP calls** are counted for each person, in the same way.
+- **The dashboard and sign-in pages** have limits too. Going over one shows "Too many requests" with the number of seconds to wait.

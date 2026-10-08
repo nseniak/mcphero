@@ -94,6 +94,7 @@ class MongoAuditRepository(LegacyAuditRepository, AuditRepository):
 
     async def search_cross_org(
         self,
+        org_id: str | None = None,
         user_id: str | None = None,
         mcp_id: str | None = None,
         tool: str | None = None,
@@ -107,6 +108,8 @@ class MongoAuditRepository(LegacyAuditRepository, AuditRepository):
         # Callers MUST gate this on a superadmin check (the only call
         # site is ``/api/superadmin/audit``).
         filter_: dict[str, Any] = {}
+        if org_id:
+            filter_["org_id"] = org_id
         if user_id:
             filter_["user_id"] = user_id
         if mcp_id:

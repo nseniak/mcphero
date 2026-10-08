@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
+from tests.unit.factories import make_config_users_accepted
 
 MCP_JSON = json.dumps({"mcpServers": {}})
 CONFIG_JSON = json.dumps({
@@ -38,6 +39,7 @@ def make_dev_stub_client(tmp_path: Path) -> TestClient:
     mcp_json.write_text(MCP_JSON)
     config = tmp_path / "config.json"
     config.write_text(CONFIG_JSON)
+    make_config_users_accepted(tmp_path / "data", CONFIG_JSON)
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         mcp_json_path=mcp_json,
@@ -236,6 +238,9 @@ def test_admin_removed_from_org_loses_access_with_existing_cookie(
     # the failure is forced to come from the policy check.
     client.cookies.clear()
     _login_as(client, "second@example.com")
+    # An invitation gives no power until it is accepted.
+    accepted = client.post("/api/invitations/default/accept")
+    assert accepted.status_code == 200, accepted.text
     remove = client.delete("/api/admin/users/admin@example.com")
     assert remove.status_code == 200, remove.text
 

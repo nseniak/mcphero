@@ -10,6 +10,7 @@ import {
   makeMcpClient,
   mintMcpToken,
   OAUTH_TEST_MCP_URL,
+  startOAuthUpstreamSignedOut,
   BACKEND_URL,
 } from "./helpers";
 
@@ -111,6 +112,9 @@ export async function resetAndArm(request: APIRequestContext) {
   await request.post(`${OAUTH_TEST_MCP_URL}/test/reset`);
   await apiLoginAs(request, USER);
   await request.post(`${BACKEND_URL}/api/auth/disconnect/${UPSTREAM}`);
+  // Personal sign-ins need the upstream started (the seed adds it
+  // stopped, and another spec on this shard may leave it stopped).
+  await startOAuthUpstreamSignedOut(request, UPSTREAM);
   const ttlResp = await request.post(
     `${OAUTH_TEST_MCP_URL}/test/set-token-ttl`,
     { form: { seconds: String(TOKEN_TTL_SECONDS) } }

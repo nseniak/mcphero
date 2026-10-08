@@ -57,9 +57,27 @@ _PATTERN = re.compile(
 )
 
 
+# Attributes typed ``OrgScopedCollection`` in the mongo repos.
+_SCOPED_RECEIVERS: tuple[str, ...] = (
+    "self._coll",
+    "self._upstreams",
+    "self._memberships",
+    "self._sandbox_files",
+    "self._template_vars",
+    "self._single_document",
+)
+
+
+def test_guard_scans_the_adapter_files() -> None:
+    """The guard once resolved to a path that did not exist, globbed
+    nothing, and passed vacuously for every file."""
+    assert len(list(_adapter_dir().glob("mongo_*.py"))) >= 5
+
+
 def _adapter_dir() -> Path:
     here = Path(__file__).resolve()
-    return here.parent.parent / "src" / "mcpolis" / "adapters" / "repositories"
+    # tests/unit/<this file> → backend/
+    return here.parent.parent.parent / "src" / "mcpolis" / "adapters" / "repositories"
 
 
 def test_no_raw_collection_access_in_mongo_adapters() -> None:
@@ -82,10 +100,8 @@ def test_no_raw_collection_access_in_mongo_adapters() -> None:
             # ``_coll.find_many`` / ``_coll.find_one`` — those are the
             # wrapper's own method names, which happen to collide
             # with motor's names but live on a different class.
-            head = line[: match.start()]
-            if head.rstrip().endswith("self._coll") or head.rstrip().endswith(
-                "self._upstreams"
-            ) or head.rstrip().endswith("self._memberships"):
+            head = line[: match.start()].rstrip()
+            if head.endswith(_SCOPED_RECEIVERS):
                 continue
             # The wrapper's own ``find_many`` helper is fine too.
             if "find_many" in match.group(0):

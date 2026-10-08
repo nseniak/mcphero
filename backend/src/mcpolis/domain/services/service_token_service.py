@@ -95,6 +95,26 @@ class ServiceTokenService:
             counts[record.role_name] = counts.get(record.role_name, 0) + 1
         return counts
 
+    async def rename_role(
+        self, org_id: str, old_name: str, new_name: str
+    ) -> int:
+        """Carry this org's tokens along when a role is renamed.
+
+        Call it right after the policy store renamed the role: the
+        token holds the role by name, and an unknown name gets zero
+        tools.
+        """
+        moved = await self.repo.rename_role(org_id, old_name, new_name)
+        if moved:
+            logger.info(
+                "service_token.role_renamed",
+                org_id=org_id,
+                old_name=old_name,
+                new_name=new_name,
+                moved=moved,
+            )
+        return moved
+
     async def revoke(self, org_id: str, label: str) -> bool:
         revoked = await self.repo.delete_by_label(org_id, label)
         if revoked:

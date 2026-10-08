@@ -11,6 +11,9 @@ from mcp.shared.message import SessionMessage
 
 from mcpolis.adapters.gateway_session_registry import GatewaySessionRegistry
 from mcpolis.domain.model.policy import AuthMode
+from mcpolis.domain.model.service_token import service_identity
+from mcpolis.domain.services.background_tasks import BackgroundTaskSet
+from mcpolis.domain.services.service_token_service import ServiceTokenService
 from mcpolis.domain.services.upstream_connection_service import (
     UPSTREAM_STOPPED,
     SessionUnavailable,
@@ -59,6 +62,7 @@ class PolicyNotifier:
         connection_store: "ConnectionStore | None" = None,
         server_url: str = "",
         debounce_seconds: float = 10.0,
+        service_token_service: ServiceTokenService | None = None,
     ) -> None:
         self._session_manager = session_manager
         self._registry = session_registry
@@ -69,7 +73,12 @@ class PolicyNotifier:
         self._connection_store = connection_store
         self._server_url = server_url
         self._debounce_seconds = debounce_seconds
+        # Service tokens hold their role by name in their own registry,
+        # not in config.users, so role notices look them up here.
+        self._service_token_service = service_token_service
         self._pending: dict[str, asyncio.TimerHandle] = {}
+        # Refreshes started by a debounce timer, held until each ends.
+        self._background_tasks = BackgroundTaskSet()
 
     # ------------------------------------------------------------------
     # Public API
@@ -131,12 +140,21 @@ class PolicyNotifier:
             lambda: self._refresh_prompts_and_broadcast(org_id, upstream_id),
         )
 
-    def terminate_user_sessions(self, org_id: str, user_id: str) -> int:
+    async def terminate_user_sessions(self, org_id: str, user_id: str) -> int:
         """Immediately terminate all gateway sessions for a user.
 
         Removes sessions from the SDK's internal tracking so subsequent
         requests with the same session ID receive a 404, forcing the
         client to re-initialise (which will fail if tokens are revoked).
+        Then closes each one: forgetting the id alone left the client's
+        open event stream and the session's server task running until
+        the client hung up, still receiving the org's notifications.
+
+        Accepted race: a request of that session arriving at this very
+        moment gets its response cut off, and the MCP SDK logs it at
+        ERROR ("SSE response error"). The person was just removed or
+        revoked, so the cut-off is the intended effect; filtering that
+        SDK message would also hide real stream failures.
         """
         session_ids = self._registry.get_session_ids_for_user(org_id, user_id)
         if not session_ids:
@@ -146,9 +164,18 @@ class PolicyNotifier:
         removed = 0
         for sid in session_ids:
             transport = instances.pop(sid, None)
-            if transport is not None:
-                removed += 1
             self._registry.unregister(sid)
+            if transport is None:
+                continue
+            removed += 1
+            try:
+                await transport.terminate()
+            except Exception:
+                logger.exception(
+                    "session.terminate_failed",
+                    user=user_id,
+                    org_id=org_id,
+                )
 
         if removed:
             logger.info(
@@ -183,9 +210,12 @@ class PolicyNotifier:
         runtime = self._runtime_manager.get_cached(org_id)
         if runtime is None:
             return
-        config = runtime.policy_engine.config
+        policy_engine = runtime.policy_engine
+        # Sessions are registered under the address each person signs in
+        # with, which may differ in letter case from their config key.
         user_ids = [
-            uid for uid, udef in config.users.items()
+            policy_engine.address_of(uid)
+            for uid, udef in policy_engine.config.users.items()
             if udef.role == role_name
         ]
         session_ids: list[str] = []
@@ -193,6 +223,39 @@ class PolicyNotifier:
             session_ids.extend(
                 self._registry.get_session_ids_for_user(org_id, uid)
             )
+        self._send_to_sessions(session_ids)
+        if self._service_token_service is not None:
+            # The token registry is async; the debounce timer is not.
+            self._background_tasks.spawn(
+                self._send_for_role_tokens(
+                    self._service_token_service, org_id, role_name,
+                ),
+            )
+
+    async def _send_for_role_tokens(
+        self,
+        service_token_service: ServiceTokenService,
+        org_id: str,
+        role_name: str,
+    ) -> None:
+        """Notify the sessions of this org's tokens holding *role_name*."""
+        try:
+            records = await service_token_service.list_for_org(org_id)
+        except Exception:
+            logger.exception(
+                "tool.list_changed.service_tokens.lookup_failed",
+                org_id=org_id,
+                role=role_name,
+            )
+            return
+        session_ids: list[str] = []
+        for record in records:
+            if record.role_name == role_name:
+                session_ids.extend(
+                    self._registry.get_session_ids_for_user(
+                        org_id, service_identity(record.label),
+                    )
+                )
         self._send_to_sessions(session_ids)
 
     def _send_for_user(self, org_id: str, user_id: str) -> None:
@@ -214,7 +277,7 @@ class PolicyNotifier:
         runtime = self._runtime_manager.get_cached(org_id)
         if runtime is None:
             return
-        asyncio.create_task(
+        self._background_tasks.spawn(
             self._refresh_upstream_and_notify(
                 runtime, org_id, upstream_id,
             ),
@@ -226,7 +289,7 @@ class PolicyNotifier:
         runtime = self._runtime_manager.get_cached(org_id)
         if runtime is None:
             return
-        asyncio.create_task(
+        self._background_tasks.spawn(
             self._refresh_upstream_resources_and_notify(
                 runtime.tool_registry, org_id, upstream_id,
             ),
@@ -238,7 +301,7 @@ class PolicyNotifier:
         runtime = self._runtime_manager.get_cached(org_id)
         if runtime is None:
             return
-        asyncio.create_task(
+        self._background_tasks.spawn(
             self._refresh_upstream_prompts_and_notify(
                 runtime.tool_registry, org_id, upstream_id,
             ),
@@ -254,7 +317,10 @@ class PolicyNotifier:
         runtime = self._runtime_manager.get_cached(org_id)
         if runtime is None:
             return set()
-        return set(runtime.policy_engine.config.users.keys())
+        policy_engine = runtime.policy_engine
+        return {
+            policy_engine.address_of(uid) for uid in policy_engine.config.users
+        }
 
     async def _refresh_upstream_and_notify(
         self,

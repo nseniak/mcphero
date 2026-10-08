@@ -27,6 +27,8 @@ on the property bag for analytics filtering).
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from mcpolis.adapters.observability.analytics_client import get_analytics
 from mcpolis.domain.model.subscription import PlanName
 from mcpolis.domain.ports.organization_repository import OrganizationRepository
@@ -44,8 +46,7 @@ async def resolve_plan(
 
     Defaults to ``PlanName.free`` when ``org_repo`` is unavailable or
     the org row is missing — a repo gap can't accidentally widen
-    limits. Mirrors the fallback semantic of
-    :func:`mcpolis.entrypoints.routes.dashboard._deps.resolve_plan_limits`.
+    limits.
     """
     if org_repo is None:
         return PlanName.free
@@ -60,6 +61,21 @@ async def resolve_plan_limits(
 ) -> PlanLimits:
     """Look up the active org's plan limits via :func:`resolve_plan`."""
     return limits_for(await resolve_plan(org_repo, org_id))
+
+
+async def audit_retention_since(
+    org_repo: OrganizationRepository | None, org_id: str,
+) -> str:
+    """Oldest audit timestamp (ISO 8601 UTC) the org's plan may read.
+
+    Every surface that reads the audit log on an org's behalf (the
+    dashboard Audit page, the Admin MCP search tool) passes this as
+    ``since_iso``, so a Free org reads the same 30 days everywhere even
+    before the global TTL has purged older rows.
+    """
+    limits = await resolve_plan_limits(org_repo, org_id)
+    since = datetime.now(UTC) - timedelta(days=limits.audit_retention_days)
+    return since.isoformat()
 
 
 def _emit_plan_limit_hit(

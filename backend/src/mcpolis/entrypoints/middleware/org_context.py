@@ -111,10 +111,9 @@ class SlugCache:
 class OrgContextMiddleware:
     """ASGI middleware that resolves ``current_org_id`` for each request.
 
-    Must be added AFTER the rate-limit middleware in the ASGI stack so
-    rate limiting sees the correct org key. In FastAPI, ``add_middleware``
-    stacks are LIFO — the last one added runs first. This middleware
-    is added **last** in ``create_app`` so that it runs first.
+    In FastAPI, ``add_middleware`` stacks are LIFO — the last one added
+    runs first. This middleware is added **last** in ``create_app`` so
+    that it runs first and every later layer sees the resolved org.
     """
 
     def __init__(

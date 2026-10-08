@@ -7,20 +7,31 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import mcp.types as mcp_types
+from mcp.server.fastmcp import FastMCP
 from mcp.shared.exceptions import McpError
 import pytest
 import structlog
 
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManager
 from mcpolis.adapters.repositories.file_audit_repository import FileAuditRepository
+from mcpolis.domain.model.policy import AuthMode, UpstreamAuthConfig
 from mcpolis.domain.model.settings import SettingsConfig
 from mcpolis.domain.model.upstream import DiscoveredTool, ToolAnnotations
 from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.services.tool_router import ToolRouter
 from mcpolis.domain.ports import DEFAULT_ORG_ID
+from mcpolis.entrypoints.lifecycle import McpEndpoints
+from mcpolis.entrypoints.mcp_transport_security import mcp_transport_security
+from tests.unit._mcp_http_calls import call_tool_over_http
 from tests.unit.stall_client_manager_fake import StallClientManagerFake
-from tests.unit.factories import make_discovered_tool, make_upstream_definition
+from tests.unit.factories import (
+    Gate,
+    YieldingAuditRepository,
+    cancel_while_gated,
+    make_discovered_tool,
+    make_upstream_definition,
+)
 
 
 def make_tool_router(
@@ -320,36 +331,42 @@ async def test_route_call_heals_but_does_not_retry_non_idempotent_tool(
 
 @pytest.mark.asyncio
 async def test_route_call_cancelled_midflight_audited_cancelled_not_success(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Review item 1: a client that cancels the gateway request mid-dispatch
     must NOT be audited as a successful call (CancelledError is a
     BaseException that bypasses ``except Exception``, so the finally used to
     default to "success"), must NOT heal the session (cancellation isn't a
-    transport stall), and the abandoned op must be cancelled."""
+    transport stall), and the abandoned op must be cancelled.
+
+    Cancelled the way the MCP SDK does it, through the request's anyio
+    cancel scope, which raises again at every ``await`` until the scope
+    exits; and with an audit store whose write waits like Mongo's. A plain
+    ``task.cancel()`` raises once, and ``FileAuditRepository`` never waits,
+    so together they can't see a row lost to the cancel."""
     from mcpolis.domain.services import tool_router as tr_module
 
     upstream = make_upstream_definition(id="mee6")  # service_account
-    op_started = asyncio.Event()
+    upstream_gate = Gate()  # never opened: the upstream never answers
     op_cancelled = asyncio.Event()
 
-    async def hang(*_a: Any, **_k: Any) -> Any:
-        op_started.set()
+    async def held_call(*_a: Any, **_k: Any) -> Any:
         try:
-            await asyncio.sleep(3600)
+            await upstream_gate.hold()
         except asyncio.CancelledError:
             op_cancelled.set()
             raise
+        raise AssertionError("the upstream call was never cut off")
 
     session = MagicMock()
-    session.call_tool = AsyncMock(side_effect=hang)
+    session.call_tool = AsyncMock(side_effect=held_call)
     session.send_ping = AsyncMock(return_value=mcp_types.EmptyResult())
     cm = _FakeStallManager(session)
     registry = ToolRegistry([upstream], cast(Any, cm))
     registry._tools = [
         make_discovered_tool(upstream_id="mee6", original_name="do_thing"),
     ]
-    audit = FileAuditRepository(tmp_path / "audit.jsonl")
+    audit = YieldingAuditRepository()
     router = ToolRouter(
         registry, cast(Any, cm), audit, [upstream],
         policy_engine=PolicyEngine(SettingsConfig()),
@@ -363,24 +380,15 @@ async def test_route_call_cancelled_midflight_audited_cancelled_not_success(
 
     monkeypatch.setattr(tr_module, "get_analytics", lambda: _Stub())
 
-    task = asyncio.create_task(router.route_call(
+    await cancel_while_gated(upstream_gate, lambda: router.route_call(
         org_id=DEFAULT_ORG_ID, prefixed_name="mee6__do_thing",
         arguments={}, user_id="alice", session_id=None,
     ))
-    await asyncio.wait_for(op_started.wait(), timeout=5)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
 
     assert op_cancelled.is_set(), "the abandoned op must be cancelled"
     assert cm.fresh_calls == 0, "cancellation is not a stall — no heal"
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "audit.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    assert len(rows) == 1
-    assert rows[0]["response_status"] == "cancelled", (
+    assert len(audit.rows) == 1, "the cancelled call must leave its row"
+    assert audit.rows[0].response_status == "cancelled", (
         "a cancelled dispatch must not be audited as success"
     )
     assert tracked and tracked[0][2]["response_status"] == "cancelled"
@@ -785,3 +793,253 @@ async def test_invalid_request_is_still_an_error(tmp_path: Path) -> None:
         tmp_path, "Invalid request", code=mcp_types.INVALID_REQUEST,
     )
     assert level == "error"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_without_a_live_session_writes_an_error_row(
+    tmp_path: Path,
+) -> None:
+    """A call that cannot get an upstream session on its first attempt
+    used to stop with no audit row. It must leave an ``error`` row, and
+    the row must never carry the call's arguments."""
+    upstream = make_upstream_definition(
+        id="notion",
+        auth=UpstreamAuthConfig(mode=AuthMode.per_user_oauth),
+    )
+    client_manager = UpstreamClientManager([upstream])
+    audit = FileAuditRepository(tmp_path / "audit.jsonl")
+    registry = ToolRegistry([upstream], client_manager)
+    registry._tools = [  # pyright: ignore[reportPrivateUsage]
+        make_discovered_tool(upstream_id="notion", original_name="search"),
+    ]
+    router = ToolRouter(
+        registry, client_manager, audit, [upstream],
+        policy_engine=PolicyEngine(SettingsConfig()),
+        connection_store=None,
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID,
+        prefixed_name="notion__search",
+        arguments={"api_key": "sk-live-do-not-store-me"},
+        user_id="alice",
+        session_id="sess1",
+    )
+
+    assert result.isError
+    rows = await audit.search(DEFAULT_ORG_ID, limit=10)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["tool"] == "notion__search"
+    assert row["user_id"] == "alice"
+    assert row["response_status"] == "error"
+    assert row["error_message"]
+    raw = (tmp_path / "audit.jsonl").read_text()
+    assert "sk-live-do-not-store-me" not in raw
+    assert "api_key" not in raw
+
+
+class RefuseSecondConnectFake(StallClientManagerFake):
+    """Hands out the session once; every later connect fails, so the
+    retry after a stall is refused ("not currently available")."""
+
+    async def ensure_shared_connected(self, upstream: Any) -> Any:
+        del upstream
+        self.ensure_calls += 1
+        if self.ensure_calls > 1:
+            raise RuntimeError("sandbox gone")
+        return self.session
+
+
+class ResolveRaisesRouter(ToolRouter):
+    """Session lookup itself blows up (a storage error, say)."""
+
+    async def _resolve_session(
+        self, org_id: str, upstream: Any, user_id: str,
+    ) -> Any:
+        del org_id, upstream, user_id
+        raise RuntimeError("store unreachable")
+
+
+class FailingAuditRepository(FileAuditRepository):
+    """An audit store that is down."""
+
+    async def log(self, org_id: str, entry: Any) -> None:
+        del org_id, entry
+        raise RuntimeError("audit store down")
+
+
+def make_retry_refused_router(tmp_path: Path) -> tuple[ToolRouter, FileAuditRepository]:
+    upstream = make_upstream_definition(id="mee6")
+    session = MagicMock()
+    session.call_tool = AsyncMock(side_effect=[asyncio.TimeoutError()])
+    client_manager = RefuseSecondConnectFake(session)
+    registry = ToolRegistry([upstream], cast(Any, client_manager))
+    registry._tools = [  # pyright: ignore[reportPrivateUsage]
+        make_discovered_tool(
+            upstream_id="mee6", original_name="do_thing",
+            annotations=ToolAnnotations(idempotentHint=True),
+        ),
+    ]
+    audit = FileAuditRepository(tmp_path / "audit.jsonl")
+    router = ToolRouter(
+        registry, cast(Any, client_manager), audit, [upstream],
+        policy_engine=PolicyEngine(SettingsConfig()),
+    )
+    return router, audit
+
+
+@pytest.mark.asyncio
+async def test_refused_retry_row_carries_the_message_the_caller_saw(
+    tmp_path: Path,
+) -> None:
+    router, audit = make_retry_refused_router(tmp_path)
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID, prefixed_name="mee6__do_thing",
+        arguments={}, user_id="alice", session_id=None,
+    )
+
+    assert result.isError
+    first = result.content[0]
+    assert isinstance(first, mcp_types.TextContent)
+    assert "not currently available" in first.text
+    rows = await audit.search(DEFAULT_ORG_ID, limit=10)
+    assert len(rows) == 1
+    assert rows[0]["response_status"] == "error"
+    assert rows[0]["error_message"] == first.text
+
+
+@pytest.mark.asyncio
+async def test_tool_call_whose_session_lookup_raises_still_writes_a_row(
+    tmp_path: Path,
+) -> None:
+    upstream = make_upstream_definition(id="github")
+    client_manager = UpstreamClientManager([upstream])
+    registry = ToolRegistry([upstream], client_manager)
+    registry._tools = [  # pyright: ignore[reportPrivateUsage]
+        make_discovered_tool(upstream_id="github", original_name="create_issue"),
+    ]
+    audit = FileAuditRepository(tmp_path / "audit.jsonl")
+    router = ResolveRaisesRouter(
+        registry, client_manager, audit, [upstream],
+        policy_engine=PolicyEngine(SettingsConfig()),
+    )
+
+    with pytest.raises(RuntimeError):
+        await router.route_call(
+            org_id=DEFAULT_ORG_ID, prefixed_name="github__create_issue",
+            arguments={}, user_id="alice", session_id=None,
+        )
+
+    rows = await audit.search(DEFAULT_ORG_ID, limit=10)
+    assert len(rows) == 1
+    assert rows[0]["response_status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_refused_call_still_answers_when_the_audit_store_is_down(
+    tmp_path: Path,
+) -> None:
+    upstream = make_upstream_definition(
+        id="notion", auth=UpstreamAuthConfig(mode=AuthMode.per_user_oauth),
+    )
+    client_manager = UpstreamClientManager([upstream])
+    registry = ToolRegistry([upstream], client_manager)
+    registry._tools = [  # pyright: ignore[reportPrivateUsage]
+        make_discovered_tool(upstream_id="notion", original_name="search"),
+    ]
+    router = ToolRouter(
+        registry, client_manager,
+        FailingAuditRepository(tmp_path / "audit.jsonl"), [upstream],
+        policy_engine=PolicyEngine(SettingsConfig()),
+        connection_store=None,
+    )
+
+    result = await router.route_call(
+        org_id=DEFAULT_ORG_ID, prefixed_name="notion__search",
+        arguments={}, user_id="alice", session_id=None,
+    )
+
+    assert result.isError
+
+
+@pytest.mark.asyncio
+async def test_successful_call_still_answers_when_the_audit_store_is_down(
+    tmp_path: Path,
+) -> None:
+    router, _session, _ = make_tool_router(tmp_path)
+    router._audit = FailingAuditRepository(tmp_path / "down.jsonl")  # pyright: ignore[reportPrivateUsage]
+
+    with structlog.testing.capture_logs() as logs:
+        result = await router.route_call(
+            org_id=DEFAULT_ORG_ID, prefixed_name="github__create_issue",
+            arguments={"title": "Bug"}, user_id="alice", session_id="s1",
+        )
+
+    assert not result.isError
+    failures = [e for e in logs if e["event"] == "audit.write_failed"]
+    assert len(failures) == 1
+    assert failures[0]["log_level"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_denied_call_audit_survives_a_down_audit_store(
+    tmp_path: Path,
+) -> None:
+    router, _session, _ = make_tool_router(tmp_path)
+    router._audit = FailingAuditRepository(tmp_path / "down.jsonl")  # pyright: ignore[reportPrivateUsage]
+
+    await router.audit_denied(
+        DEFAULT_ORG_ID, user_id="alice", upstream_id="github",
+        tool="github__create_issue", reason="MCP 'github' is disabled.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_closing_the_gateway_sessions_during_the_audit_write_keeps_the_row(
+    tmp_path: Path,
+) -> None:
+    """At a deploy the shutdown leaves the gateway's session manager, which
+    cancels, through anyio, the handler of every call still running. That
+    is the cancel a gateway handler really gets at shutdown: the handler
+    runs in the session manager's task group, so uvicorn's native
+    ``Task.cancel()`` of the HTTP requests it cuts never reaches it. The
+    row being written then is kept, and the cancel still ends the call,
+    so the session manager is left."""
+    router, _session, _ = make_tool_router(tmp_path)
+    gate = Gate()
+    audit = YieldingAuditRepository(gate=gate)
+    router._audit = audit  # pyright: ignore[reportPrivateUsage]
+    ended: list[str] = []
+    server = FastMCP(
+        name="gateway", streamable_http_path="/",
+        transport_security=mcp_transport_security(),
+    )
+
+    @server.tool()
+    async def create_issue() -> str:  # pyright: ignore[reportUnusedFunction]
+        try:
+            await router.audit_denied(
+                DEFAULT_ORG_ID, user_id="alice", upstream_id="github",
+                tool="github__create_issue", reason="MCP 'github' is disabled.",
+            )
+        except asyncio.CancelledError:
+            ended.append("cancelled")
+            raise
+        ended.append("returned")
+        return "denied"
+
+    app = server.streamable_http_app()  # makes its session manager
+    endpoints = McpEndpoints([server.session_manager])
+    await endpoints.start()
+    call = asyncio.create_task(call_tool_over_http(app, "create_issue"))
+    await asyncio.wait_for(gate.reached.wait(), 10)
+    closing = asyncio.create_task(endpoints.close())
+    await asyncio.sleep(0.05)  # the cancel lands during the write
+    gate.release.set()
+    await asyncio.wait_for(closing, 10)
+    await asyncio.gather(call, return_exceptions=True)
+
+    assert [row.response_status for row in audit.rows] == ["denied"]
+    assert ended == ["cancelled"]

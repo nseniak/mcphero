@@ -1,15 +1,14 @@
 """Phase 2 — single-slot admin_oauth invariants.
 
 UX directive: only one admin owns the shared connection at a time.
-Admin B cannot click ``Connect`` while admin A is connected — they
-must explicitly disconnect A first, then connect themselves. The
-backend enforces the invariant via:
+Admin B cannot click ``Connect`` while admin A is signed in to a running
+upstream: A's sign-in must be gone first (A signs out), then B connects.
+The backend enforces the invariant via:
 
 1. The connect handler returns ``409`` when another admin already
-   owns the slot.
-2. The disconnect handler clears the active admin's stored token (and
-   tears down their session) regardless of which admin called it,
-   so the take-over flow ("B disconnects A, then B connects") works.
+   owns the slot of a running upstream.
+2. A signing out deletes A's stored token. The admin Stop deletes no
+   sign-in (see ``test_dashboard_stop_keeps_sign_ins.py``).
 3. ``per_user_oauth`` is unaffected — every user's connect always
    stores under their own email; multiple users coexist without
    conflict.
@@ -38,7 +37,7 @@ from mcpolis.domain.model.settings import (
 )
 from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.domain.services.policy_engine import PolicyEngine
-from mcpolis.entrypoints.routes.dashboard._deps import (
+from mcpolis.domain.services.upstream_admin_service import (
     admin_oauth_owner as _admin_oauth_owner,
 )
 
@@ -169,7 +168,7 @@ async def test_take_over_flow_disconnect_then_connect(
 ) -> None:
     """Simulates the take-over flow at the storage layer:
     1. Alice's token in slot.
-    2. Bob disconnects alice → alice's token is gone.
+    2. Alice signs out → alice's token is gone.
     3. Bob's connect now allowed (no owner) → bob's token in slot.
     """
     store = FileConnectionStore(tmp_path)
@@ -179,8 +178,7 @@ async def test_take_over_flow_disconnect_then_connect(
         DEFAULT_ORG_ID, "alice@co.com", "slack", make_token("alice"),
     )
 
-    # Step 2: disconnect simulates the route handler clearing the
-    # active owner's slot.
+    # Step 2: alice's sign-out clears the slot.
     owner = await _admin_oauth_owner(
         store, DEFAULT_ORG_ID, "slack", excluding_email=None,
         policy_engine=policy,

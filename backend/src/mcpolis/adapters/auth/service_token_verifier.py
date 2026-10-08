@@ -6,21 +6,19 @@ everything else to the untouched OAuth provider. The ``/admin-mcp``
 app keeps wrapping the raw OAuth provider, so service tokens fail
 there structurally.
 
-The boundary-resolved (role, org) ride in the SDK-blessed channel —
-``AccessToken.scopes`` — which downstream code reaches through
-``auth_context_var``, the same channel identity already uses. The
-scope encoding itself (constants + parse helpers) lives in
-``domain/model/service_token.py``; this adapter mints it.
+The boundary-resolved (role, org) ride as typed fields of
+``ServiceAccessToken``, which downstream code reaches through
+``auth_context_var``. Never as scopes: scopes are client input on the
+OAuth path. The type and its readers live in
+``domain/model/service_token.py``; this adapter is its only minter.
 """
 from __future__ import annotations
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 
 from mcpolis.domain.model.service_token import (
-    SCOPE_ORG_PREFIX,
-    SCOPE_ROLE_PREFIX,
-    SCOPE_SVC,
     SERVICE_TOKEN_PREFIX,
+    ServiceAccessToken,
     service_identity,
 )
 from mcpolis.domain.services.service_token_service import ServiceTokenService
@@ -30,20 +28,18 @@ class ServiceTokenVerifier:
     def __init__(self, service: ServiceTokenService) -> None:
         self._service = service
 
-    async def verify_token(self, token: str) -> AccessToken | None:
+    async def verify_token(self, token: str) -> ServiceAccessToken | None:
         record = await self._service.verify(token)
         if record is None:
             return None
-        return AccessToken(
+        return ServiceAccessToken(
             token=token,
             # client_id becomes AuthenticatedUser.display_name — the
             # identity string for policy, audit, and log context.
             client_id=service_identity(record.label),
-            scopes=[
-                SCOPE_SVC,
-                SCOPE_ROLE_PREFIX + record.role_name,
-                SCOPE_ORG_PREFIX + record.org_id,
-            ],
+            scopes=[],
+            role_name=record.role_name,
+            org_id=record.org_id,
             # None = non-expiring. The SDK's BearerAuthBackend uses a
             # truthiness check (``if auth_info.expires_at and ...``);
             # pinned by test_service_token_verifier.py against the

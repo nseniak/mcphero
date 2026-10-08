@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { BACKEND_URL, createOrg, loginAs } from "./helpers";
+import { BACKEND_URL, acceptInvitation, createOrg, loginAs } from "./helpers";
 
 /**
  * Regression: a user who is admin in org A and a plain ``user`` in
@@ -42,19 +42,20 @@ test("OrgSwitcher must not land a non-admin user on /admin/upstream", async ({
   let resp = await request.post(`${BACKEND_URL}/api/orgs/${ORG1}/switch`);
   expect(resp.status()).toBe(204);
 
-  // Pre-approve user@ as a non-admin in org1. The membership row is
-  // created lazily on the user's first sign-in (login callback).
+  // Invite user@ as a non-admin in org1. They become a member when
+  // they accept the invitation.
   resp = await request.post(`${BACKEND_URL}/api/admin/users`, {
     data: { email: USER, role: "user" },
   });
   expect([200, 201]).toContain(resp.status());
 
-  // ── User signs in (browser context) — materializes membership.
+  // ── User signs in (browser context) and accepts the invitation.
   await loginAs(page, USER);
+  const pageReq = page.context().request;
+  await acceptInvitation(pageReq, ORG1);
 
   // User creates org2 via the page's request context (carries the
   // user's session cookie). Creator becomes admin of the new org.
-  const pageReq = page.context().request;
   resp = await pageReq.post(`${BACKEND_URL}/api/orgs`, {
     data: { slug: ORG2, display_name: "Org Two", created_via: "manage_page" },
   });

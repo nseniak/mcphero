@@ -53,6 +53,7 @@ def _make_service(
     # AsyncMock so awaits are honoured.
     client_manager = MagicMock()
     client_manager.unregister_upstream = AsyncMock()
+    client_manager.cleanup_sandbox_state_for_upstream = AsyncMock()
     tool_registry = MagicMock()
     tool_registry.unregister_upstream = AsyncMock()
     tool_registry.refresh_all = AsyncMock()
@@ -65,6 +66,8 @@ def _make_service(
         connection_store=connection_store,
         template_var_repo=template_var_repo,
         sandbox_file_repo=sandbox_file_repo,
+        config_repo=AsyncMock(),
+        policy_engine=MagicMock(),
     )
 
 

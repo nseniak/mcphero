@@ -1,6 +1,7 @@
 """Adapter between FileConnectionStore and MCP SDK's TokenStorage protocol."""
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Literal
@@ -87,6 +88,8 @@ class McpTokenStorage:
         *,
         refresh_margin_seconds: float = 0.0,
         max_age_seconds: float | None = None,
+        fresh_sign_in_refusal: Callable[[], Awaitable[str | None]] | None = None,
+        force_refresh: bool = False,
     ) -> None:
         self._store = connection_store
         self._org_id = org_id
@@ -94,6 +97,16 @@ class McpTokenStorage:
         self._user_id = user_id
         self._refresh_margin_s = refresh_margin_seconds
         self._max_age_s = max_age_seconds
+        # Asked right before a fresh sign-in is saved: why it may not land
+        # any more, or None. The sign-in was called off meanwhile (the
+        # person was removed from the org), or another admin took the
+        # admin_oauth upstream's admin sign-in slot first.
+        self._fresh_sign_in_refusal_check = fresh_sign_in_refusal
+        self._fresh_sign_in_refused: str | None = None
+        # Present every stored token that has a refresh token as already
+        # expired, so the next request refreshes it first (see
+        # ``_internal_to_sdk_token``).
+        self._force_refresh = force_refresh
         self._loaded_revision: LoadedRevision = NO_ROW
         # The sign-in of the loaded row; meaningless while no row is.
         self._loaded_sign_in: str | None = None
@@ -126,10 +139,25 @@ class McpTokenStorage:
         return self._loaded_revision
 
     @property
+    def loaded_sign_in(self) -> str | None:
+        """The sign-in id of the row the sign-in library holds (see
+        ``loaded_revision``); ``None`` while it holds none, or for a row
+        saved before sign-in ids existed."""
+        if self._loaded_revision is NO_ROW:
+            return None
+        return self._loaded_sign_in
+
+    @property
     def fresh_sign_in_saved(self) -> bool:
         """Whether a fresh sign-in's tokens were saved through this
         instance."""
         return self._fresh_sign_in_saved
+
+    @property
+    def fresh_sign_in_refused(self) -> str | None:
+        """Why a fresh sign-in's tokens were not saved, when its check
+        refused them."""
+        return self._fresh_sign_in_refused
 
     @property
     def tokens_saved(self) -> bool:
@@ -177,6 +205,19 @@ class McpTokenStorage:
             internal,
             refresh_margin_seconds=self._refresh_margin_s,
             max_age_seconds=self._max_age_s,
+            force_refresh=self._force_refresh,
+        )
+
+    def refresh_due(self, stored: InternalOAuthToken) -> bool:
+        """Whether the sign-in library refreshes ``stored`` before its
+        next request, as this instance presents it: shown as expired, with
+        a refresh token to refresh it with."""
+        return bool(stored.refresh_token) and _presented_as_expired(
+            stored,
+            refresh_margin_seconds=self._refresh_margin_s,
+            max_age_seconds=self._max_age_s,
+            force_refresh=self._force_refresh,
+            now=datetime.now(UTC),
         )
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
@@ -199,6 +240,19 @@ class McpTokenStorage:
         previous = await self._store.get_user_token(
             self._org_id, self._user_id, self._upstream_id,
         )
+        if self._fresh_sign_in and self._fresh_sign_in_refusal_check is not None:
+            refusal = await self._fresh_sign_in_refusal_check()
+            if refusal is not None:
+                self._fresh_sign_in_refused = refusal
+                logger.info(
+                    "oauth.token.storage.write_skipped",
+                    upstream_id=self._upstream_id,
+                    user=self._user_id,
+                    org_id=self._org_id,
+                    reason="sign_in_refused",
+                    refusal=refusal,
+                )
+                return
         revision: str | None
         if self._fresh_sign_in:
             saved = await self._store.put_user_token(
@@ -329,6 +383,7 @@ def _internal_to_sdk_token(
     *,
     refresh_margin_seconds: float = 0.0,
     max_age_seconds: float | None = None,
+    force_refresh: bool = False,
 ) -> OAuthToken:
     """Convert internal OAuthToken to MCP SDK OAuthToken.
 
@@ -383,15 +438,41 @@ def _internal_to_sdk_token(
     expires_in: int | None = None
     now = datetime.now(UTC)
     if token.expires_at is not None:
-        remaining = (token.expires_at - now).total_seconds()
-        if remaining < refresh_margin_seconds:
-            expires_in = -1
-        else:
-            expires_in = int(remaining)
+        expires_in = int((token.expires_at - now).total_seconds())
+    if _presented_as_expired(
+        token,
+        refresh_margin_seconds=refresh_margin_seconds,
+        max_age_seconds=max_age_seconds,
+        force_refresh=force_refresh,
+        now=now,
+    ):
+        expires_in = -1
+    return OAuthToken(
+        access_token=token.access_token,
+        token_type="Bearer",
+        expires_in=expires_in,
+        scope=scope,
+        refresh_token=token.refresh_token,
+    )
+
+
+def _presented_as_expired(
+    token: InternalOAuthToken,
+    *,
+    refresh_margin_seconds: float,
+    max_age_seconds: float | None,
+    force_refresh: bool,
+    now: datetime,
+) -> bool:
+    """Whether ``_internal_to_sdk_token`` clamps ``expires_in`` to -1 for
+    ``token``: the sign-in library then treats it as expired."""
+    if token.expires_at is not None and (
+        (token.expires_at - now).total_seconds() < refresh_margin_seconds
+    ):
+        return True
     # §3.6 seatbelt: clamp on stale ``updated_at`` regardless of
-    # ``expires_at``. Set last so a stale-but-not-yet-expiring token
-    # still gets clamped; the margin clamp above only fires for the
-    # expiry path.
+    # ``expires_at``, so a stale-but-not-yet-expiring token still gets
+    # clamped; the margin clamp above only fires for the expiry path.
     #
     # Gated on ``token.refresh_token``: the seatbelt's whole job is to
     # force a *rotation*, and a rotation is a refresh_token grant. With
@@ -410,14 +491,11 @@ def _internal_to_sdk_token(
         and token.updated_at is not None
         and (now - token.updated_at).total_seconds() > max_age_seconds
     ):
-        expires_in = -1
-    return OAuthToken(
-        access_token=token.access_token,
-        token_type="Bearer",
-        expires_in=expires_in,
-        scope=scope,
-        refresh_token=token.refresh_token,
-    )
+        return True
+    # A caller that must try the refresh token now (the upstream refused
+    # the bearer without the SDK trying it). Same refresh_token gate as
+    # the seatbelt above: without one there is nothing to refresh.
+    return force_refresh and bool(token.refresh_token)
 
 
 def _sdk_to_internal_token(token: OAuthToken) -> InternalOAuthToken:

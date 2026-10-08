@@ -41,7 +41,7 @@ import {
   ANNOTATION_LABELS,
   resolveToolDefault,
   toolFlags,
-} from "../../components/admin/ToolAccessSection";
+} from "../../components/admin/toolAccess";
 import SettingToggle from "../../components/ui/setting-toggle";
 import CategoryToggle from "../../components/ui/category-toggle";
 import { ConfirmDialog, useConfirm } from "../../components/ConfirmDialog";

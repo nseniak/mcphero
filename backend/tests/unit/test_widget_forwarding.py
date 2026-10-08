@@ -592,10 +592,10 @@ def test_resolve_bare_resource_uri_errors_on_ambiguity() -> None:
         runtime, user_id="alice",
         original_uri="ui://widget/data/foo",
     )
-    assert isinstance(resolved, list)
-    text = resolved[0].content
-    assert isinstance(text, str)
-    assert "Ambiguous" in text
+    # The refusal's text: the caller charges it to the refused-call
+    # bucket before sending it.
+    assert isinstance(resolved, str)
+    assert "Ambiguous" in resolved
 
 
 def test_resolve_bare_resource_uri_errors_when_unknown() -> None:
@@ -604,10 +604,8 @@ def test_resolve_bare_resource_uri_errors_when_unknown() -> None:
         runtime, user_id="alice",
         original_uri="ui://widget/data/missing",
     )
-    assert isinstance(resolved, list)
-    text = resolved[0].content
-    assert isinstance(text, str)
-    assert "Invalid resource URI" in text
+    assert isinstance(resolved, str)
+    assert "Invalid resource URI" in resolved
 
 
 def test_resolve_bare_resource_uri_respects_policy_engine() -> None:

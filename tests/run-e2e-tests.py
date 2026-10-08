@@ -22,18 +22,25 @@ Why isolated mongo / redis containers (test profile):
     canonical 27017 / 6379 / 8080 / 5173 stack while tests run — no
     port collision, no risk of a destructive test dropping a dev DB.
 
-Outputs (per shard ``k`` ∈ [0, N)):
-    /tmp/mcpolis-e2e-shard-{k}.log     combined log (backend + vite +
-                                       MCP fakes + playwright stdout)
-    /tmp/mcpolis-e2e-shard-{k}.json    Playwright JSON reporter output
-    /tmp/mcpolis-e2e-aggregate.json    aggregated pass/fail summary
-    /tmp/mcpolis-e2e-aggregate.txt     human-readable summary
+Outputs, in this run's own folder (see ``run_folder.py``; printed at the
+start and at the end), per shard ``k`` ∈ [0, N):
+    e2e-shard-{k}.log     combined log (backend + vite + MCP fakes +
+                          playwright stdout)
+    e2e-shard-{k}.json    Playwright JSON reporter output
+    e2e-shard-{k}-artifacts/   Playwright failure files (error context,
+                          traces)
+    e2e-aggregate.json    aggregated pass/fail summary
+    e2e-aggregate.txt     human-readable summary
+Under ``make test-all`` the folder is test-all's own, passed down as
+``MCPOLIS_TEST_OUT_DIR``. Shared on purpose by every run on the host:
+the spec-times cache and the port lock below.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import http.cookiejar
 import json
 import os
@@ -47,11 +54,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, TextIO
+
+from run_folder import resolve_run_folder
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_DIR = REPO_ROOT / "backend"
@@ -62,7 +72,8 @@ E2E_DIR = REPO_ROOT / "tests" / "e2e"
 # durations from each shard's Playwright JSON report. Used by the
 # bin-packer to balance work across shards. Missing entries fall back
 # to the median duration so a brand-new spec gets a reasonable initial
-# placement.
+# placement. Shared by every run on the host, unlike the run's results:
+# it is a cache, so a run that reads another run's numbers is fine.
 SPEC_TIMES_CACHE = Path("/tmp/mcpolis-e2e-spec-times.json")
 
 # Test infra ports (compose profile=test). These are intentionally
@@ -177,6 +188,59 @@ def _find_free_port(preferred: int, span: int = 400) -> int:
     return port
 
 
+# ``_allocated_ports`` only guards one run. Across runs, the same gap
+# between probe and bind let two runs started together probe the same
+# free ports, then lose each other's bind races. Reproduced 2026-10-07:
+# two ``make test-all`` runs from two worktrees, started together, both
+# failed their e2e leg after 12s, each with half its shards squatted by
+# the other run's servers. So a run holds this host-wide lock from
+# picking its ports until every server listens (seeding comes after the
+# release); a second run then probes around the first run's bound ports.
+# The kernel drops an flock when its holder exits, so a crashed run never
+# leaves it held.
+PORT_LOCK_PATH = Path("/tmp/mcpolis-e2e-ports.lock")
+# A waiting run gives up after this long instead of hanging. The holder
+# only starts servers (each start has its own timeout) and, at worst,
+# brings up the test containers.
+PORT_LOCK_WAIT_SECONDS = 600.0
+
+
+@contextlib.contextmanager
+def hold_port_lock(
+    path: Path = PORT_LOCK_PATH, wait_seconds: float = PORT_LOCK_WAIT_SECONDS,
+) -> Iterator[None]:
+    """Hold the host-wide port lock. The holder writes its pid into the
+    lock file, so a waiting run can say whom it waits for."""
+    with path.open("a+") as handle:
+        deadline = time.monotonic() + wait_seconds
+        holder = ""
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not holder:
+                    handle.seek(0)
+                    holder = handle.read().strip() or "unknown"
+                    print(f"[orchestrator] another e2e run (pid {holder}) is "
+                          f"starting its servers; waiting until they listen, "
+                          f"so the ports can't collide...", flush=True)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"gave up after {wait_seconds:.0f}s waiting for the "
+                        f"e2e port lock {path}, held by pid {holder}",
+                    ) from None
+                time.sleep(0.5)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 # ─── Shard configuration ──────────────────────────────────────────────
 
 
@@ -191,6 +255,11 @@ class ShardConfig:
     db_name: str
     log_path: Path
     json_report_path: Path
+    # Playwright's ``--output`` (failure files, traces). Its default,
+    # tests/e2e/test-results/, is shared by every run in the checkout and
+    # emptied by each Playwright start, so a later run deleted an earlier
+    # run's failure files.
+    artifacts_dir: Path
 
     @property
     def backend_url(self) -> str:
@@ -209,14 +278,14 @@ class ShardConfig:
         return f"http://{LOOPBACK_HOST}:{self.oauth_mcp_port}"
 
 
-def make_shard(index: int, total: int) -> ShardConfig:
+def make_shard(index: int, total: int, run_dir: Path) -> ShardConfig:
     # Probe upward from each preferred base for a free port. A lone run
     # lands on the historic 18080/15173/19999/19998+index*10 numbers; a
     # run sharing the host with a leftover/concurrent run spills to the
     # next free port rather than colliding. The demo/OAuth bases are
     # only 1 apart, so a spill from one can land in the other's band —
     # ``_allocated_ports`` guarantees the spilled ports are still
-    # distinct. Log paths stay index-keyed (stable for grep) regardless
+    # distinct. Log names stay index-keyed (stable for grep) regardless
     # of which ports get chosen.
     return ShardConfig(
         index=index,
@@ -226,8 +295,9 @@ def make_shard(index: int, total: int) -> ShardConfig:
         demo_mcp_port=_find_free_port(SHARD_DEMO_MCP_BASE + index * 10),
         oauth_mcp_port=_find_free_port(SHARD_OAUTH_MCP_BASE + index * 10),
         db_name=f"mcpolis_e2e_{RUN_TOKEN}_s{index}",
-        log_path=Path(f"/tmp/mcpolis-e2e-shard-{index}.log"),
-        json_report_path=Path(f"/tmp/mcpolis-e2e-shard-{index}.json"),
+        log_path=run_dir / f"e2e-shard-{index}.log",
+        json_report_path=run_dir / f"e2e-shard-{index}.json",
+        artifacts_dir=run_dir / f"e2e-shard-{index}-artifacts",
     )
 
 
@@ -723,19 +793,29 @@ def _build_backend_env(shard: ShardConfig) -> dict[str, str]:
         # is what closes the SSRF.
         "MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK": "1",
         # Pin the sandbox to local-subprocess so e2e stays hermetic and
-        # free — stdio MCPs must never reach paid hosted E2B. We can't
-        # name 'local-subprocess' explicitly (the cloud-mode validator
-        # rejects it), so instead we leave MCPOLIS_SANDBOX_PROVIDER unset
-        # and force the empty-provider fallback onto local-subprocess by
-        # ensuring no E2B key is visible. Stripping MCPOLIS_* above only
-        # clears the *process* env; Settings still loads the operator's
-        # backend env file, which on some machines DOES carry a real
-        # MCPOLIS_E2B_API_KEY — which would silently route every stdio
-        # MCP through hosted E2B. A blank env var overrides the env file
-        # (env > env_file in pydantic-settings), exactly like
-        # MCPOLIS_SENTRY_DSN above, so the fallback always lands on
-        # local-subprocess regardless of what the env file holds.
+        # free — stdio MCPs must never reach paid hosted E2B. Cloud mode
+        # has no silent fallback to it: the validator accepts it only
+        # when named explicitly AND bound to loopback (MCPOLIS_HOST
+        # above). Stripping MCPOLIS_* above only clears the *process*
+        # env; Settings still loads the operator's backend env file,
+        # which on some machines DOES carry a real MCPOLIS_E2B_API_KEY
+        # or sandbox provider. Env vars override the env file (env >
+        # env_file in pydantic-settings), exactly like MCPOLIS_SENTRY_DSN
+        # above, so these two always win. The blank key also keeps the
+        # E2B client from being built at all.
+        "MCPOLIS_SANDBOX_PROVIDER": "local-subprocess",
         "MCPOLIS_E2B_API_KEY": "",
+        # Lift the per-IP sign-in and per-user dashboard / Admin MCP
+        # limits out of reach. Every e2e request comes from 127.0.0.1,
+        # the seeded users are shared by many specs, and all shards
+        # count in one Redis, so the production numbers would refuse
+        # ordinary test traffic. Gateway tool-call limits are per org
+        # and per caller, and each run's orgs are fresh, so they keep
+        # their production plan values; 47-rate-limits.spec.ts
+        # asserts them.
+        "MCPOLIS_RATE_LIMIT_SIGN_IN_PER_MIN": "1000000",
+        "MCPOLIS_RATE_LIMIT_DASHBOARD_PER_MIN": "1000000",
+        "MCPOLIS_RATE_LIMIT_ADMIN_MCP_PER_MIN": "1000000",
     })
     return env
 
@@ -759,6 +839,18 @@ def _build_oauth_mcp_env(shard: ShardConfig) -> dict[str, str]:
     return env
 
 
+def open_shard_log(path: Path) -> TextIO:
+    """Empty the shard log, then open it in append mode.
+
+    The shard's servers share this handle, and ``run_playwright`` later
+    opens the same file in append mode too. A "w" handle writes at its own
+    position, so every server line landed on top of Playwright's lines: a
+    passing 4-shard run kept 1 of its test lines (2026-10-07). With every
+    writer appending, no writer overwrites another."""
+    path.write_text("")
+    return path.open("a")
+
+
 def start_shard(shard: ShardConfig) -> ShardProcesses:
     """Bring up the four background processes for a single shard.
 
@@ -767,7 +859,7 @@ def start_shard(shard: ShardConfig) -> ShardProcesses:
     have skipped a teardown last time)."""
     drop_test_db(shard.db_name)
 
-    log_handle = shard.log_path.open("w")
+    log_handle = open_shard_log(shard.log_path)
 
     def _spawn(label: str, argv: list[str], cwd: Path, env: dict[str, str]) -> subprocess.Popen[bytes]:
         # Prefix every line so interleaved subprocesses stay
@@ -1006,6 +1098,19 @@ def seed_shard(shard: ShardConfig) -> None:
         opener, f"{backend}/api/admin/users",
         {"email": "admin2@example.com", "role": "admin"},
     )
+    # Inviting is not joining: each seeded teammate accepts their
+    # invitation, as they would by clicking Join after signing in.
+    for teammate in ("alice@example.com", "admin2@example.com"):
+        teammate_opener, _ = _opener_with_jar()
+        _dev_stub_login(teammate_opener, backend, teammate)
+        status, body = _post_empty(
+            teammate_opener, f"{backend}/api/invitations/acme-corp/accept",
+        )
+        if status != 200:
+            raise RuntimeError(
+                f"seed: {teammate} could not accept the invitation: "
+                f"{status} {body}"
+            )
 
     _post_json(
         opener, f"{backend}/api/admin/upstreams",
@@ -1108,7 +1213,13 @@ def load_spec_times() -> dict[str, float]:
 
 
 def save_spec_times(times: dict[str, float]) -> None:
-    SPEC_TIMES_CACHE.write_text(json.dumps(times, indent=2, sort_keys=True))
+    # Write a temp file, then rename it over the cache in one step: two
+    # runs finishing together must never leave part of one write over
+    # the other, or a reader see a half-written file.
+    temp = SPEC_TIMES_CACHE.with_name(
+        f"{SPEC_TIMES_CACHE.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(times, indent=2, sort_keys=True))
+    os.replace(temp, SPEC_TIMES_CACHE)
 
 
 def bin_pack(files: list[str], times: dict[str, float],
@@ -1198,6 +1309,17 @@ def _sum_durations(node: dict[str, Any]) -> int:
 # ─── Playwright execution ─────────────────────────────────────────────
 
 
+def playwright_base_argv(shard: ShardConfig) -> list[str]:
+    """The Playwright command for one shard, before the spec files and
+    the caller's flags."""
+    return [
+        "npx", "playwright", "test",
+        "--project=chromium",
+        "--reporter=list,json",
+        f"--output={shard.artifacts_dir}",
+    ]
+
+
 def run_playwright(shard: ShardConfig, passthru: list[str],
                    spec_files: list[str] | None) -> int:
     """Run Playwright for a single shard, writing output to the shard's
@@ -1224,11 +1346,7 @@ def run_playwright(shard: ShardConfig, passthru: list[str],
         "E2E_OAUTH_TEST_MCP_URL": shard.oauth_mcp_url,
     })
 
-    argv = [
-        "npx", "playwright", "test",
-        "--project=chromium",
-        "--reporter=list,json",
-    ]
+    argv = playwright_base_argv(shard)
     # Playwright's JSON reporter target is set via env var, not CLI.
     env["PLAYWRIGHT_JSON_OUTPUT_NAME"] = str(shard.json_report_path)
 
@@ -1371,9 +1489,29 @@ def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + "...[truncated]"
 
 
-def write_aggregate(agg: AggregateResult) -> None:
-    json_path = Path("/tmp/mcpolis-e2e-aggregate.json")
-    txt_path = Path("/tmp/mcpolis-e2e-aggregate.txt")
+def aggregate_paths(run_dir: Path) -> tuple[Path, Path]:
+    """The run's aggregate summary, as (JSON, text)."""
+    return run_dir / "e2e-aggregate.json", run_dir / "e2e-aggregate.txt"
+
+
+def wipe_stale_outputs(run_dir: Path) -> None:
+    """Delete shard logs, shard reports and the aggregate that an earlier
+    run left in this run's folder, whatever its shard count (a fresh folder
+    has none; a reused MCPOLIS_TEST_OUT_DIR may). Only paths inside
+    ``run_dir``: when these were fixed /tmp paths, this step deleted a live
+    concurrent run's files."""
+    stale = [
+        *run_dir.glob("e2e-shard-*.log"),
+        *run_dir.glob("e2e-shard-*.json"),
+        *aggregate_paths(run_dir),
+    ]
+    for p in stale:
+        with contextlib.suppress(FileNotFoundError):
+            p.unlink()
+
+
+def write_aggregate(agg: AggregateResult, run_dir: Path) -> None:
+    json_path, txt_path = aggregate_paths(run_dir)
     json_path.write_text(json.dumps({
         "passed": agg.passed,
         "failed": agg.failed,
@@ -1433,13 +1571,20 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     return parser.parse_known_args(argv)
 
 
-def _bootstrap_shard(shard: ShardConfig) -> tuple[ShardConfig, str | None]:
-    try:
-        start_shard(shard)
-        seed_shard(shard)
-        return shard, None
-    except Exception as e:
-        return shard, f"{type(e).__name__}: {e}"
+def _run_on_shards(
+    step: Callable[[ShardConfig], object], shards: list[ShardConfig],
+) -> dict[int, str]:
+    """Run one bootstrap step on every shard in parallel. Returns each
+    failed shard's error, by shard index."""
+    failures: dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(shards))) as ex:
+        futures = {ex.submit(step, s): s for s in shards}
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                failures[futures[fut].index] = f"{type(e).__name__}: {e}"
+    return failures
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1447,24 +1592,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.shards < 1:
         print("--shards must be ≥ 1", file=sys.stderr)
         return 2
-    # Pre-flight: clear any leaked e2e children from an interrupted
-    # prior run before we probe for ports, so this run lands on the
-    # predictable preferred ports rather than spilling around a
-    # squatter. Safe by construction — never touches the dev stack or
-    # a live concurrent run (see ``reap_leaked_e2e_orphans``).
-    reap_leaked_e2e_orphans(args.shards)
-    shards = [make_shard(i, args.shards) for i in range(args.shards)]
-
-    # Wipe stale per-shard outputs so an aborted previous run can't
-    # contaminate the aggregate.
-    for shard in shards:
-        for p in (shard.log_path, shard.json_report_path):
-            with contextlib.suppress(FileNotFoundError):
-                p.unlink()
-    for p in (Path("/tmp/mcpolis-e2e-aggregate.json"),
-              Path("/tmp/mcpolis-e2e-aggregate.txt")):
-        with contextlib.suppress(FileNotFoundError):
-            p.unlink()
+    run_dir = resolve_run_folder("e2e")
+    print(f"[orchestrator] results folder: {run_dir}", flush=True)
 
     def _signal_handler(sig: int, _frame: Any) -> None:
         print(f"\n[orchestrator] received signal {sig}, tearing down...")
@@ -1473,23 +1602,42 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
+    # Held from picking ports until every shard's servers listen (see
+    # ``PORT_LOCK_PATH``). An ExitStack, so it can be released right
+    # after the servers start, or in ``finally`` if anything raises first.
+    port_lock = contextlib.ExitStack()
+    shards: list[ShardConfig] = []
     overall_exit = 0
     try:
+        port_lock.enter_context(hold_port_lock())
+        # Pre-flight: clear any leaked e2e children from an interrupted
+        # prior run before we probe for ports, so this run lands on the
+        # predictable preferred ports rather than spilling around a
+        # squatter. Safe by construction — never touches the dev stack or
+        # a live concurrent run (see ``reap_leaked_e2e_orphans``).
+        reap_leaked_e2e_orphans(args.shards)
+        shards = [make_shard(i, args.shards, run_dir) for i in range(args.shards)]
+        # So an aborted previous run can't contaminate the aggregate.
+        wipe_stale_outputs(run_dir)
         ensure_test_infra()
 
         print(f"[orchestrator] bootstrapping {len(shards)} shard(s) in parallel...")
-        bootstrap_failures: list[tuple[int, str]] = []
-        with ThreadPoolExecutor(max_workers=max(1, len(shards))) as ex:
-            futures = {ex.submit(_bootstrap_shard, s): s for s in shards}
-            for fut in as_completed(futures):
-                shard, err = fut.result()
-                if err:
-                    bootstrap_failures.append((shard.index, err))
-                    print(f"[shard {shard.index}] BOOTSTRAP FAILED: {err}")
-                else:
-                    print(f"[shard {shard.index}] ready "
-                          f"(backend:{shard.backend_port} frontend:{shard.frontend_port} "
-                          f"demo:{shard.demo_mcp_port} oauth:{shard.oauth_mcp_port})")
+        bootstrap_failures = _run_on_shards(start_shard, shards)
+        # Every server is listening now (or its shard failed), so a run
+        # waiting on the lock can probe around our ports. Seeding only
+        # talks to this run's own servers, so it runs after the release.
+        port_lock.close()
+        bootstrap_failures |= _run_on_shards(
+            seed_shard, [s for s in shards if s.index not in bootstrap_failures],
+        )
+        for shard in shards:
+            if shard.index in bootstrap_failures:
+                print(f"[shard {shard.index}] BOOTSTRAP FAILED: "
+                      f"{bootstrap_failures[shard.index]}")
+            else:
+                print(f"[shard {shard.index}] ready "
+                      f"(backend:{shard.backend_port} frontend:{shard.frontend_port} "
+                      f"demo:{shard.demo_mcp_port} oauth:{shard.oauth_mcp_port})")
         if bootstrap_failures and not args.keep_going:
             return 1
 
@@ -1532,13 +1680,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[shard {shard.index}] playwright exited {code}")
 
         agg = aggregate_reports(shards, exit_codes)
-        write_aggregate(agg)
+        write_aggregate(agg, run_dir)
         update_spec_times_from_reports(shards)
         if agg.failed > 0:
             overall_exit = overall_exit or 1
         return overall_exit
 
     finally:
+        port_lock.close()
         _terminate_all()
         for shard in shards:
             drop_test_db(shard.db_name)
@@ -1552,6 +1701,7 @@ def main(argv: list[str] | None = None) -> int:
                 wait_for_port_free(port, timeout=2)
         if args.clean:
             teardown_test_infra()
+        print(f"[orchestrator] results folder: {run_dir}", flush=True)
 
 
 if __name__ == "__main__":

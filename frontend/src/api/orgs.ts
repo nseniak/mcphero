@@ -72,3 +72,21 @@ export function deleteOrg(slug: string): Promise<void> {
     method: "DELETE",
   });
 }
+
+/** The signed-in person accepts their invitation to ``slug`` (the Join
+ *  button): they become a member. Switch to the org afterwards to open it. */
+export function acceptInvitation(slug: string): Promise<void> {
+  return apiFetch<void>(
+    `/api/invitations/${encodeURIComponent(slug)}/accept`,
+    { method: "POST" },
+  );
+}
+
+/** The signed-in person declines their invitation to ``slug``: it is
+ *  deleted. */
+export function declineInvitation(slug: string): Promise<void> {
+  return apiFetch<void>(
+    `/api/invitations/${encodeURIComponent(slug)}/decline`,
+    { method: "POST" },
+  );
+}

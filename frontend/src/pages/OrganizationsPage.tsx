@@ -7,27 +7,7 @@ import { PlanBadge } from "../components/layout/PlanBadge";
 import { RoleBadge } from "../components/RoleBadge";
 import { UpstreamCapacityPills } from "../components/UpstreamCapacityPills";
 import { FieldHint } from "../components/ui/field-hint";
-
-const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/;
-const SLUG_CHARS = /[^a-z0-9-]/g;
-
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 40);
-}
-
-function validateSlug(value: string): string | null {
-  if (!value) return null;
-  if (value.startsWith("-") || value.endsWith("-")) return "Cannot start or end with a hyphen";
-  if (value.length < 3) return "Must be at least 3 characters";
-  if (value.length > 40) return "Must be at most 40 characters";
-  if (!SLUG_REGEX.test(value)) return "Invalid format";
-  return null;
-}
+import { sanitizeSlugInput, suggestSlug, validateSlug } from "../lib/org-slug";
 
 export function OrganizationsPage() {
   const { confirm, dialogProps } = useConfirm();
@@ -80,7 +60,7 @@ export function OrganizationsPage() {
   function handleNameChange(value: string) {
     setDisplayName(value);
     if (!slugEdited) {
-      const suggested = slugify(value);
+      const suggested = suggestSlug(value);
       setSlug(suggested);
       checkSlugAvailability(suggested);
     }
@@ -235,7 +215,7 @@ export function OrganizationsPage() {
                 value={slug}
                 onFocus={() => setSlugTouched(true)}
                 onChange={(e) => {
-                  const raw = e.target.value.toLowerCase().replace(SLUG_CHARS, "");
+                  const raw = sanitizeSlugInput(e.target.value);
                   setSlug(raw);
                   setSlugEdited(true);
                   checkSlugAvailability(raw);

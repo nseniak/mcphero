@@ -8,14 +8,16 @@ from typing import TYPE_CHECKING, Any
 import mcp.types as mcp_types
 import structlog
 from mcp.server.auth.middleware.auth_context import auth_context_var
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.lowlevel.helper_types import ReadResourceContents
-from mcp.server.lowlevel.server import NotificationOptions, Server
+from mcp.server.lowlevel.server import NotificationOptions, Server, request_ctx
 from mcp.server.models import InitializationOptions
 from mcp.types import ServerCapabilities
 from pydantic import AnyUrl
+from starlette.requests import Request
 
 from mcpolis.domain.model.service_token import (
-    boundary_role_from_auth_scopes,
+    boundary_role_from_access_token,
 )
 from mcpolis.domain.model.upstream import (
     DiscoveredPrompt,
@@ -29,7 +31,11 @@ from mcpolis.domain.services.tool_registry import (
     SEPARATOR,
     prefix_display_title,
 )
-from mcpolis.domain.services.tool_router import UpstreamRouterError
+from mcpolis.domain.services.tool_router import (
+    UpstreamRouterError,
+    prompt_audit_name,
+    resource_audit_name,
+)
 from mcpolis.domain.services.uri_wrapping import (
     WrappedUriError,
     unwrap_resource_uri,
@@ -128,6 +134,7 @@ def _instructions_for_org(
 if TYPE_CHECKING:
     from mcpolis.domain.services.org_runtime import OrgRuntime, OrgRuntimeManager
     from mcpolis.domain.services.org_service import OrgService
+    from mcpolis.domain.services.rate_limit_service import RateLimitService
 
 
 def _merge_extension_value(
@@ -256,31 +263,62 @@ current_user_orgs: contextvars.ContextVar[list[Organization] | None] = (
 )
 
 
-def _get_current_user() -> str:
-    """Get user identity from OAuth context (if available) or header-based context var."""
+def current_caller_id() -> str:
+    """Who is calling this MCP request: the OAuth bearer's identity, else
+    the cookie-based context var. Both MCP mounts (``/mcp`` and
+    ``/admin-mcp``) authenticate with a bearer token, which only the
+    auth context carries: the context var stays "anonymous" for them."""
     auth_user = auth_context_var.get(None)
     if auth_user is not None:
         return auth_user.display_name
     return current_user_id.get()
 
 
+def _request_auth_user() -> AuthenticatedUser | None:
+    """The bearer that signed the request being handled.
+
+    The MCP SDK runs every request of a session in the task opened at
+    ``initialize``, so ``auth_context_var`` holds the bearer verified for
+    that first request for the session's whole life. The SDK hands each
+    handler the HTTP request its message arrived on
+    (``request_context.request``), whose bearer the auth middleware
+    verified again for this very request: that one wins. Transports with
+    no HTTP request (in-memory, stdio) fall back on the session's.
+    """
+    context = request_ctx.get(None)
+    request = context.request if context is not None else None
+    if isinstance(request, Request):
+        user = request.scope.get("user")
+        if isinstance(user, AuthenticatedUser):
+            return user
+    return auth_context_var.get(None)
+
+
 def _get_boundary_role() -> str | None:
     """Role established at the auth boundary, or None for human auth.
 
-    Service tokens carry their minted role in the auth scopes (see
-    ``service_token_verifier``); their ``svc:<label>`` identity has no
-    ``config.users`` entry by design, so the policy engine must be
-    handed the role explicitly.
+    Service tokens carry their minted role on a ``ServiceAccessToken``
+    (see ``service_token_verifier``), never in scopes; their
+    ``svc:<label>`` identity has no ``config.users`` entry by design,
+    so the policy engine must be handed the role explicitly.
+
+    Read from the current request's bearer, which the verifier resolves
+    from the token registry on every request: a session a token opened
+    before its role was renamed then keeps its tools. The session's own
+    bearer still names the old role, which matches no role any more.
+    The session owner guard makes sure both bearers are the same token
+    holder.
     """
-    auth_user = auth_context_var.get(None)
+    auth_user = _request_auth_user()
     if auth_user is None:
         return None
-    return boundary_role_from_auth_scopes(auth_user.access_token.scopes)
+    return boundary_role_from_access_token(auth_user.access_token)
 
 
 def create_mcp_server(
     runtime_manager: OrgRuntimeManager,
     org_service: OrgService | None = None,
+    rate_limits: RateLimitService | None = None,
 ) -> Server[Any, Any]:
     """Build the MCP gateway server.
 
@@ -288,6 +326,10 @@ def create_mcp_server(
     (``current_org_id == MULTI_ORG_SENTINEL``); without it the gateway
     can't enumerate the user's memberships. Standalone-mode tests
     that only exercise the single-org path can omit it.
+
+    ``rate_limits`` charges every tool call to its caller and org, and
+    every refused tools/call, resources/read and prompts/get to its
+    caller; ``None`` leaves them unlimited (tests that don't exercise it).
     """
     server: Server[Any, Any] = Server("MCP Hero")
 
@@ -360,6 +402,7 @@ def create_mcp_server(
             instructions = (
                 _instructions_with_upstreams_multi_org(
                     runtime_manager, user_orgs, base_instructions,
+                    user_id=current_caller_id(),
                 )
                 if user_orgs is not None
                 else base_instructions
@@ -390,6 +433,7 @@ def create_mcp_server(
                     runtime_manager, org_id,
                     base_instructions=base,
                     name_prefix="",
+                    user_id=current_caller_id(),
                 ),
             }
         )
@@ -398,7 +442,7 @@ def create_mcp_server(
 
     @server.list_tools()
     async def handle_list_tools() -> list[mcp_types.Tool]:  # pyright: ignore[reportUnusedFunction]
-        user_id = _get_current_user()
+        user_id = current_caller_id()
         org_id = current_org_id.get()
 
         if org_id == MULTI_ORG_SENTINEL:
@@ -418,7 +462,7 @@ def create_mcp_server(
         # genuine upstream tool errors both surface as ``isError: true``
         # rather than being flattened to a success-shaped result. This
         # also preserves any ``structuredContent`` the upstream returned.
-        user_id = _get_current_user()
+        user_id = current_caller_id()
         session_id = current_session_id.get()
         org_id = current_org_id.get()
 
@@ -426,6 +470,7 @@ def create_mcp_server(
             return await _call_tool_multi_org(
                 runtime_manager,
                 org_service,
+                rate_limits,
                 user_id=user_id,
                 session_id=session_id,
                 prefixed_name=name,
@@ -434,6 +479,7 @@ def create_mcp_server(
 
         return await _call_tool_single_org(
             runtime_manager,
+            rate_limits,
             org_id=org_id,
             user_id=user_id,
             session_id=session_id,
@@ -445,7 +491,7 @@ def create_mcp_server(
 
     @server.list_resources()
     async def handle_list_resources() -> list[mcp_types.Resource]:  # pyright: ignore[reportUnusedFunction]
-        user_id = _get_current_user()
+        user_id = current_caller_id()
         org_id = current_org_id.get()
         if org_id == MULTI_ORG_SENTINEL:
             return await _list_resources_multi_org(
@@ -457,7 +503,7 @@ def create_mcp_server(
 
     @server.list_resource_templates()
     async def handle_list_resource_templates() -> list[mcp_types.ResourceTemplate]:  # pyright: ignore[reportUnusedFunction]
-        user_id = _get_current_user()
+        user_id = current_caller_id()
         org_id = current_org_id.get()
         if org_id == MULTI_ORG_SENTINEL:
             return await _list_resource_templates_multi_org(
@@ -471,17 +517,18 @@ def create_mcp_server(
     async def handle_read_resource(  # pyright: ignore[reportUnusedFunction]
         uri: AnyUrl,
     ) -> Iterable[ReadResourceContents]:
-        user_id = _get_current_user()
+        user_id = current_caller_id()
         session_id = current_session_id.get()
         org_id = current_org_id.get()
         if org_id == MULTI_ORG_SENTINEL:
             return await _read_resource_multi_org(
-                runtime_manager, org_service,
+                runtime_manager, org_service, rate_limits,
                 user_id=user_id, session_id=session_id,
                 wrapped_uri=str(uri),
             )
         return await _read_resource_single_org(
             runtime_manager,
+            rate_limits,
             org_id=org_id,
             user_id=user_id,
             session_id=session_id,
@@ -492,7 +539,7 @@ def create_mcp_server(
 
     @server.list_prompts()
     async def handle_list_prompts() -> list[mcp_types.Prompt]:  # pyright: ignore[reportUnusedFunction]
-        user_id = _get_current_user()
+        user_id = current_caller_id()
         org_id = current_org_id.get()
         if org_id == MULTI_ORG_SENTINEL:
             return await _list_prompts_multi_org(
@@ -506,17 +553,18 @@ def create_mcp_server(
     async def handle_get_prompt(  # pyright: ignore[reportUnusedFunction]
         name: str, arguments: dict[str, str] | None,
     ) -> mcp_types.GetPromptResult:
-        user_id = _get_current_user()
+        user_id = current_caller_id()
         session_id = current_session_id.get()
         org_id = current_org_id.get()
         if org_id == MULTI_ORG_SENTINEL:
             return await _get_prompt_multi_org(
-                runtime_manager, org_service,
+                runtime_manager, org_service, rate_limits,
                 user_id=user_id, session_id=session_id,
                 prefixed_name=name, arguments=arguments,
             )
         return await _get_prompt_single_org(
             runtime_manager,
+            rate_limits,
             org_id=org_id,
             user_id=user_id,
             session_id=session_id,
@@ -713,6 +761,7 @@ def _discovered_tools_for_user(runtime: OrgRuntime, user_id: str) -> list[Any]:
 
 async def _call_tool_single_org(
     runtime_manager: OrgRuntimeManager,
+    rate_limits: RateLimitService | None,
     *,
     org_id: str,
     user_id: str,
@@ -741,10 +790,14 @@ async def _call_tool_single_org(
             )
             prefixed_name = resolved
         else:
-            return resolved  # CallToolResult error from the resolver.
-    denial = await _enforce_policy(
-        runtime, org_id=org_id, user_id=user_id, session_id=session_id,
-        prefixed_name=prefixed_name, arguments=arguments,
+            # CallToolResult error from the resolver.
+            return await _refused(
+                rate_limits, resolved, caller=user_id, org_id=org_id,
+            )
+    denial = await _admit_call(
+        runtime, rate_limits, org_id=org_id, user_id=user_id,
+        session_id=session_id, prefixed_name=prefixed_name,
+        arguments=arguments,
     )
     if denial is not None:
         return denial
@@ -794,6 +847,7 @@ def _resolve_bare_tool_name(
 async def _call_tool_multi_org(
     runtime_manager: OrgRuntimeManager,
     org_service: OrgService | None,
+    rate_limits: RateLimitService | None,
     *,
     user_id: str,
     session_id: str | None,
@@ -824,12 +878,19 @@ async def _call_tool_multi_org(
                 prefixed_name = resolved
                 parts = prefixed_name.split(SEPARATOR, 2)
             else:
-                return resolved
+                return await _refused(
+                    rate_limits, resolved, caller=user_id, org_id=None,
+                )
         if len(parts) < 3:
-            return _access_denied(
-                f"Tool '{prefixed_name}' is missing the org prefix expected "
-                f"on the multi-org gateway: "
-                f"'{{org}}__{{upstream}}__{{tool}}'.",
+            return await _refused(
+                rate_limits,
+                _access_denied(
+                    f"Tool '{prefixed_name}' is missing the org prefix "
+                    f"expected on the multi-org gateway: "
+                    f"'{{org}}__{{upstream}}__{{tool}}'.",
+                ),
+                caller=user_id,
+                org_id=None,
             )
     org_slug, _, inner_prefixed = prefixed_name.partition(SEPARATOR)
 
@@ -845,9 +906,14 @@ async def _call_tool_multi_org(
             user_id=user_id,
             org_slug=org_slug,
         )
-        return _access_denied(
-            f"Access denied: user '{user_id}' is not a member of org "
-            f"'{org_slug}'.",
+        return await _refused(
+            rate_limits,
+            _access_denied(
+                f"Access denied: user '{user_id}' is not a member of org "
+                f"'{org_slug}'.",
+            ),
+            caller=user_id,
+            org_id=None,
         )
 
     runtime = await runtime_manager.get(org.id)
@@ -857,9 +923,13 @@ async def _call_tool_multi_org(
         org_id=org.id,
         inner_name=inner_prefixed,
     )
-    denial = await _enforce_policy(
-        runtime, org_id=org.id, user_id=user_id, session_id=session_id,
-        prefixed_name=inner_prefixed, arguments=arguments,
+    # After the membership check above, never before it: a hostile
+    # client naming an org it doesn't belong to must not be able to
+    # spend that org's quota.
+    denial = await _admit_call(
+        runtime, rate_limits, org_id=org.id, user_id=user_id,
+        session_id=session_id, prefixed_name=inner_prefixed,
+        arguments=arguments,
     )
     if denial is not None:
         return denial
@@ -948,7 +1018,17 @@ def _check_upstream_and_tool_policy(
 
     parts = prefixed_name.split(SEPARATOR, 1)
     if len(parts) != 2:
-        return None
+        # Callers resolve bare names before getting here, so this is
+        # unreachable today; fail closed rather than report "allowed"
+        # for a name the check cannot attribute to an upstream.
+        reason = f"Unknown tool '{prefixed_name}'."
+        return _PolicyDenial(
+            result=_access_denied(f"Access denied: {reason}"),
+            upstream_id="",
+            tool=prefixed_name,
+            reason=reason,
+            policy_rule="unknown_tool",
+        )
 
     target_upstream, tool_name = parts
     boundary_role = _get_boundary_role()
@@ -960,9 +1040,7 @@ def _check_upstream_and_tool_policy(
     enabled_ids = [uid for uid in all_ids if uid in allowed]
 
     if target_upstream not in enabled_ids:
-        reason = (
-            f"MCP '{target_upstream}' is disabled for user '{user_id}'."
-        )
+        reason = _mcp_disabled_reason(target_upstream, user_id)
         return _PolicyDenial(
             result=_access_denied(f"Access denied: {reason}"),
             upstream_id=target_upstream,
@@ -974,24 +1052,40 @@ def _check_upstream_and_tool_policy(
     tool_annotations = tool_registry.get_tool_annotations(
         target_upstream, tool_name,
     )
+    # Check what will actually be sent: stored default arguments
+    # override the caller's, so they must pass the same argument check.
+    router = runtime.tool_router
+    effective = router.effective_arguments(target_upstream, tool_name, arguments)
     decision = policy_engine.decide_tool_call(
-        user_id, target_upstream, tool_name, arguments,
+        user_id, target_upstream, tool_name, effective,
         tool_annotations=tool_annotations,
         boundary_role=boundary_role,
     )
     if not decision.allowed:
+        reason = decision.reason
+        if decision.matched_argument is not None and (
+            decision.matched_argument
+            in router.stored_default_arguments(target_upstream, tool_name)
+        ):
+            # The caller can't change this value, so say where it
+            # comes from: only an admin can fix it.
+            reason += (
+                " (the value is a stored default argument of this MCP, "
+                "not the caller's; an admin must change it)"
+            )
         return _PolicyDenial(
-            result=_access_denied(f"Access denied: {decision.reason}"),
+            result=_access_denied(f"Access denied: {reason}"),
             upstream_id=target_upstream,
             tool=prefixed_name,
-            reason=decision.reason,
+            reason=reason,
             policy_rule=decision.matched_rule or decision.reason,
         )
     return None
 
 
-async def _enforce_policy(
+async def _admit_call(
     runtime: OrgRuntime,
+    rate_limits: RateLimitService | None,
     *,
     org_id: str,
     user_id: str,
@@ -999,28 +1093,180 @@ async def _enforce_policy(
     prefixed_name: str,
     arguments: dict[str, Any],
 ) -> mcp_types.CallToolResult | None:
-    """Run the policy check and, on denial, write the ``denied`` audit
-    row before returning the denial result. ``None`` means allowed.
+    """Decide whether a tool call may run. ``None`` means it may.
 
-    Single choke point shared by the single- and multi-org call paths
-    so both deny paths (MCP-disabled, argument-check) audit identically.
+    Single choke point shared by the single- and multi-org call paths,
+    in this order:
+
+    1. Policy decides (pure, nothing written yet).
+    2. The rate limit charges the call. A call the policy allows is
+       charged to the caller AND the org. A denied one goes through
+       ``_refused``: the caller's refused-call bucket only. On
+       ``/mcp/{slug}`` org membership is enforced by policy, so this
+       keeps any signed-in outsider from spending the org's shared
+       quota, while still bounding a caller who hammers a denied tool.
+    3. A policy denial writes its ``denied`` audit row, so both deny
+       paths (MCP-disabled, argument-check) audit identically. A caller
+       over its refused-call limit gets the rate-limit refusal instead,
+       and no audit row: the flood it is sending stays bounded.
     """
     denial = _check_upstream_and_tool_policy(
         runtime, user_id=user_id, prefixed_name=prefixed_name,
         arguments=arguments,
     )
     if denial is None:
-        return None
-    await runtime.tool_router.audit_denied(
-        org_id,
+        if rate_limits is None:
+            return None
+        refusal = await rate_limits.admit_tool_call(
+            org_id=org_id, caller=user_id,
+        )
+        return None if refusal is None else _rate_limited(refusal.message)
+    over_limit = await _charge_and_audit_denial(
+        runtime,
+        rate_limits,
+        org_id=org_id,
         user_id=user_id,
+        session_id=session_id,
         upstream_id=denial.upstream_id,
         tool=denial.tool,
         reason=denial.reason,
         policy_rule=denial.policy_rule,
+    )
+    return denial.result if over_limit is None else _rate_limited(over_limit)
+
+
+def _mcp_disabled_reason(upstream_id: str, user_id: str) -> str:
+    return f"MCP '{upstream_id}' is disabled for user '{user_id}'."
+
+
+async def _charge_and_audit_denial(
+    runtime: OrgRuntime,
+    rate_limits: RateLimitService | None,
+    *,
+    org_id: str,
+    user_id: str,
+    session_id: str | None,
+    upstream_id: str,
+    tool: str,
+    reason: str,
+    policy_rule: str,
+) -> str | None:
+    """Charge a request the org's policy refused to the caller's
+    refused-call bucket, then write its ``denied`` audit row.
+
+    Shared by tools/call, resources/read and prompts/get. Returns the
+    rate-limit refusal's text when the caller is over that limit: the
+    caller gets it instead, and no row is written, so a flood of
+    refused requests can't write a flood of rows into the org's log.
+    """
+    over_limit = await _over_refused_call_limit(
+        rate_limits, caller=user_id, org_id=org_id,
+    )
+    if over_limit is not None:
+        return over_limit
+    await runtime.tool_router.audit_denied(
+        org_id,
+        user_id=user_id,
+        upstream_id=upstream_id,
+        tool=tool,
+        reason=reason,
+        policy_rule=policy_rule,
         session_id=session_id,
     )
-    return denial.result
+    return None
+
+
+async def _refuse_disabled_mcp(
+    runtime: OrgRuntime,
+    rate_limits: RateLimitService | None,
+    *,
+    org_id: str,
+    user_id: str,
+    session_id: str | None,
+    upstream_id: str,
+    audit_name: str,
+) -> str:
+    """Refuse a resources/read or prompts/get on an MCP the caller can't
+    use, charged and audited like a tool call refused this way. Returns
+    the text shown to the caller.
+
+    An MCP the org doesn't have gets the same answer as one disabled for
+    the caller, so the answer can't tell an outsider which MCPs the org
+    has (tools/call already answers both the same way).
+    """
+    reason = _mcp_disabled_reason(upstream_id, user_id)
+    over_limit = await _charge_and_audit_denial(
+        runtime,
+        rate_limits,
+        org_id=org_id,
+        user_id=user_id,
+        session_id=session_id,
+        upstream_id=upstream_id,
+        tool=audit_name,
+        reason=reason,
+        policy_rule="mcp_disabled",
+    )
+    return f"Access denied: {reason}" if over_limit is None else over_limit
+
+
+async def _refused(
+    rate_limits: RateLimitService | None,
+    refusal: mcp_types.CallToolResult,
+    *,
+    caller: str,
+    org_id: str | None,
+) -> mcp_types.CallToolResult:
+    """Return a refusal, charged to the caller's refused-call bucket.
+
+    Every path that refuses a call before it reaches an upstream goes
+    through here or ``_admit_call``, so none of them is unbounded (each
+    costs lookups, e.g. the multi-org membership query). Once the caller
+    is over the limit, it gets the rate-limit refusal instead.
+    """
+    over_limit = await _over_refused_call_limit(
+        rate_limits, caller=caller, org_id=org_id,
+    )
+    return refusal if over_limit is None else _rate_limited(over_limit)
+
+
+async def _refused_text(
+    rate_limits: RateLimitService | None,
+    text: str,
+    *,
+    caller: str,
+    org_id: str | None,
+) -> str:
+    """``_refused`` for resources/read and prompts/get, whose answers
+    carry text rather than an ``isError`` tool result. Every refusal of
+    theirs goes through here or ``_refuse_disabled_mcp``."""
+    over_limit = await _over_refused_call_limit(
+        rate_limits, caller=caller, org_id=org_id,
+    )
+    return text if over_limit is None else over_limit
+
+
+async def _over_refused_call_limit(
+    rate_limits: RateLimitService | None,
+    *,
+    caller: str,
+    org_id: str | None,
+) -> str | None:
+    """Charge one refused request to the caller's refused-call bucket.
+    Returns the rate-limit refusal's text once the caller is over that
+    limit, else None."""
+    if rate_limits is None:
+        return None
+    refusal = await rate_limits.admit_denied_tool_call(
+        caller=caller, org_id=org_id,
+    )
+    return None if refusal is None else refusal.message
+
+
+def _rate_limited(message: str) -> mcp_types.CallToolResult:
+    # ``isError`` result, not a JSON-RPC error: the AI client reads the
+    # message (with its wait) and can retry; a protocol-level error
+    # tends to look like a broken connection.
+    return _access_denied(message)
 
 
 def _access_denied(message: str) -> mcp_types.CallToolResult:
@@ -1313,6 +1559,7 @@ def _result_contents_to_iterable(
 
 async def _read_resource_single_org(
     runtime_manager: OrgRuntimeManager,
+    rate_limits: RateLimitService | None,
     *,
     org_id: str,
     user_id: str,
@@ -1332,23 +1579,29 @@ async def _read_resource_single_org(
         resolved = _resolve_bare_resource_uri(
             runtime, user_id=user_id, original_uri=wrapped_uri,
         )
-        if isinstance(resolved, tuple):
-            target_upstream_id, target_original_uri = resolved
-            logger.info(
-                "gateway.resources.read.bare_uri_resolved",
-                bare_uri=wrapped_uri, upstream_id=target_upstream_id,
-            )
-        else:
-            return resolved
-    if target_upstream_id not in runtime.tool_registry.get_upstream_ids():
-        return _read_resource_error(
-            f"Unknown upstream '{target_upstream_id}' for resource."
+        if isinstance(resolved, str):
+            return _read_resource_error(await _refused_text(
+                rate_limits, resolved, caller=user_id, org_id=org_id,
+            ))
+        target_upstream_id, target_original_uri = resolved
+        logger.info(
+            "gateway.resources.read.bare_uri_resolved",
+            bare_uri=wrapped_uri, upstream_id=target_upstream_id,
         )
+    # Access before existence: an MCP the org doesn't have is refused
+    # like one disabled for the caller (see ``_refuse_disabled_mcp``).
     if target_upstream_id not in _allowed_upstream_ids(runtime, user_id):
-        return _read_resource_error(
-            f"Access denied: MCP '{target_upstream_id}' is disabled for "
-            f"user '{user_id}'."
-        )
+        return _read_resource_error(await _refuse_disabled_mcp(
+            runtime,
+            rate_limits,
+            org_id=org_id,
+            user_id=user_id,
+            session_id=session_id,
+            upstream_id=target_upstream_id,
+            audit_name=resource_audit_name(
+                target_upstream_id, target_original_uri,
+            ),
+        ))
     try:
         result = await runtime.tool_router.read_resource(
             org_id=org_id,
@@ -1367,13 +1620,12 @@ def _resolve_bare_resource_uri(
     *,
     user_id: str,
     original_uri: str,
-) -> tuple[str, str] | list[ReadResourceContents]:
+) -> tuple[str, str] | str:
     """Find the unique enabled upstream that exposes a resource with
     the given *original_uri* (or a templated URI that matches).
 
-    Returns either ``(upstream_id, original_uri)`` for routing, or a
-    ``ReadResourceContents``-shaped error iterable for the
-    ``resources/read`` decorator. Mirrors
+    Returns either ``(upstream_id, original_uri)`` for routing, or the
+    text of the refusal, which the caller charges and sends. Mirrors
     ``_resolve_bare_tool_name``'s shape — the gateway's fallback for
     widget callbacks that read resources by upstream-native URI.
     """
@@ -1383,15 +1635,15 @@ def _resolve_bare_resource_uri(
         if r.original_uri == original_uri:
             matches.append(r.upstream_id)
     if not matches:
-        return _read_resource_error(
+        return (
             f"Invalid resource URI: {original_uri!r}. Resources must be read "
             f"by their gateway-wrapped URI (``mcphero://...`` or the "
             f"widget form ``ui://mcphero/...``); only widget-internal "
             f"calls may use upstream-native URIs, and only when one upstream "
-            f"owns the URI.",
+            f"owns the URI."
         )
     if len(matches) > 1:
-        return _read_resource_error(
+        return (
             f"Ambiguous resource URI {original_uri!r}: owned by multiple "
             f"upstreams ({', '.join(sorted(matches))}). Read by wrapped URI."
         )
@@ -1401,6 +1653,7 @@ def _resolve_bare_resource_uri(
 async def _read_resource_multi_org(
     runtime_manager: OrgRuntimeManager,
     org_service: OrgService | None,
+    rate_limits: RateLimitService | None,
     *,
     user_id: str,
     session_id: str | None,
@@ -1428,10 +1681,13 @@ async def _read_resource_multi_org(
                 "gateway.resources.read.multi_org.not_a_member",
                 user_id=user_id, org_slug=target_org_slug,
             )
-            return _read_resource_error(
+            return _read_resource_error(await _refused_text(
+                rate_limits,
                 f"Access denied: user '{user_id}' is not a member of org "
-                f"'{target_org_slug}'."
-            )
+                f"'{target_org_slug}'.",
+                caller=user_id,
+                org_id=None,
+            ))
         target_org_id = org.id
     except WrappedUriError:
         # Bare-URI fallback for widget callbacks. Same rationale as
@@ -1441,8 +1697,10 @@ async def _read_resource_multi_org(
             runtime_manager, org_service,
             user_id=user_id, original_uri=wrapped_uri,
         )
-        if not isinstance(resolved, tuple):
-            return resolved
+        if isinstance(resolved, str):
+            return _read_resource_error(await _refused_text(
+                rate_limits, resolved, caller=user_id, org_id=None,
+            ))
         target_org_id, target_org_slug, target_upstream_id, target_original_uri = resolved
         logger.info(
             "gateway.resources.read.multi_org.bare_uri_resolved",
@@ -1451,15 +1709,19 @@ async def _read_resource_multi_org(
             upstream_id=target_upstream_id,
         )
     runtime = await runtime_manager.get(target_org_id)
-    if target_upstream_id not in runtime.tool_registry.get_upstream_ids():
-        return _read_resource_error(
-            f"Unknown upstream '{target_upstream_id}' for resource."
-        )
+    # Access before existence, as in ``_read_resource_single_org``.
     if target_upstream_id not in _allowed_upstream_ids(runtime, user_id):
-        return _read_resource_error(
-            f"Access denied: MCP '{target_upstream_id}' is disabled for "
-            f"user '{user_id}'."
-        )
+        return _read_resource_error(await _refuse_disabled_mcp(
+            runtime,
+            rate_limits,
+            org_id=target_org_id,
+            user_id=user_id,
+            session_id=session_id,
+            upstream_id=target_upstream_id,
+            audit_name=resource_audit_name(
+                target_upstream_id, target_original_uri,
+            ),
+        ))
     try:
         result = await runtime.tool_router.read_resource(
             org_id=target_org_id,
@@ -1479,11 +1741,11 @@ async def _resolve_bare_resource_uri_multi_org(
     *,
     user_id: str,
     original_uri: str,
-) -> tuple[str, str, str, str] | list[ReadResourceContents]:
+) -> tuple[str, str, str, str] | str:
     """Multi-org variant of ``_resolve_bare_resource_uri``.
 
     Returns ``(org_id, org_slug, upstream_id, original_uri)`` for
-    routing, or a ``ReadResourceContents``-shaped error iterable.
+    routing, or the text of the refusal.
     """
     user_orgs = await org_service.list_user_orgs(user_id)
     matches: list[tuple[str, str, str]] = []  # (org_id, org_slug, upstream_id)
@@ -1496,7 +1758,7 @@ async def _resolve_bare_resource_uri_multi_org(
             if r.original_uri == original_uri:
                 matches.append((org.id, org.slug, r.upstream_id))
     if not matches:
-        return _read_resource_error(
+        return (
             f"Invalid resource URI: {original_uri!r}. Resources must be read "
             f"by their gateway-wrapped URI; only widget-internal calls may "
             f"use upstream-native URIs, and only when one upstream across "
@@ -1506,7 +1768,7 @@ async def _resolve_bare_resource_uri_multi_org(
         details = ", ".join(
             f"{slug}__{up}" for _, slug, up in sorted(matches)
         )
-        return _read_resource_error(
+        return (
             f"Ambiguous resource URI {original_uri!r}: owned by multiple "
             f"upstreams ({details}). Read by wrapped URI."
         )
@@ -1589,6 +1851,7 @@ def _prompt_error_result(message: str) -> mcp_types.GetPromptResult:
 
 async def _get_prompt_single_org(
     runtime_manager: OrgRuntimeManager,
+    rate_limits: RateLimitService | None,
     *,
     org_id: str,
     user_id: str,
@@ -1599,17 +1862,22 @@ async def _get_prompt_single_org(
     runtime = await runtime_manager.get(org_id)
     parts = prefixed_name.split(SEPARATOR, 1)
     if len(parts) != 2:
-        return _prompt_error_result(f"Unknown prompt: {prefixed_name}")
+        return _prompt_error_result(await _refused_text(
+            rate_limits, f"Unknown prompt: {prefixed_name}",
+            caller=user_id, org_id=org_id,
+        ))
     upstream_id, original_name = parts
-    if upstream_id not in runtime.tool_registry.get_upstream_ids():
-        return _prompt_error_result(
-            f"Unknown upstream '{upstream_id}' for prompt."
-        )
+    # Access before existence, as in ``_read_resource_single_org``.
     if upstream_id not in _allowed_upstream_ids(runtime, user_id):
-        return _prompt_error_result(
-            f"Access denied: MCP '{upstream_id}' is disabled for "
-            f"user '{user_id}'."
-        )
+        return _prompt_error_result(await _refuse_disabled_mcp(
+            runtime,
+            rate_limits,
+            org_id=org_id,
+            user_id=user_id,
+            session_id=session_id,
+            upstream_id=upstream_id,
+            audit_name=prompt_audit_name(upstream_id, original_name),
+        ))
     try:
         return await runtime.tool_router.get_prompt(
             org_id=org_id,
@@ -1626,6 +1894,7 @@ async def _get_prompt_single_org(
 async def _get_prompt_multi_org(
     runtime_manager: OrgRuntimeManager,
     org_service: OrgService | None,
+    rate_limits: RateLimitService | None,
     *,
     user_id: str,
     session_id: str | None,
@@ -1638,10 +1907,13 @@ async def _get_prompt_multi_org(
         )
     parts = prefixed_name.split(SEPARATOR, 2)
     if len(parts) < 3:
-        return _prompt_error_result(
+        return _prompt_error_result(await _refused_text(
+            rate_limits,
             f"Prompt '{prefixed_name}' is missing the org prefix expected "
             f"on the multi-org gateway: '{{org}}__{{upstream}}__{{prompt}}'.",
-        )
+            caller=user_id,
+            org_id=None,
+        ))
     org_slug, _, inner = prefixed_name.partition(SEPARATOR)
     user_orgs = await org_service.list_user_orgs(user_id)
     org = next((o for o in user_orgs if o.slug == org_slug), None)
@@ -1650,24 +1922,32 @@ async def _get_prompt_multi_org(
             "gateway.prompt.get.multi_org.not_a_member",
             user_id=user_id, org_slug=org_slug,
         )
-        return _prompt_error_result(
+        return _prompt_error_result(await _refused_text(
+            rate_limits,
             f"Access denied: user '{user_id}' is not a member of org "
             f"'{org_slug}'.",
-        )
+            caller=user_id,
+            org_id=None,
+        ))
     inner_parts = inner.split(SEPARATOR, 1)
     if len(inner_parts) != 2:
-        return _prompt_error_result(f"Unknown prompt: {prefixed_name}")
+        return _prompt_error_result(await _refused_text(
+            rate_limits, f"Unknown prompt: {prefixed_name}",
+            caller=user_id, org_id=org.id,
+        ))
     upstream_id, original_name = inner_parts
     runtime = await runtime_manager.get(org.id)
-    if upstream_id not in runtime.tool_registry.get_upstream_ids():
-        return _prompt_error_result(
-            f"Unknown upstream '{upstream_id}' for prompt."
-        )
+    # Access before existence, as in ``_read_resource_single_org``.
     if upstream_id not in _allowed_upstream_ids(runtime, user_id):
-        return _prompt_error_result(
-            f"Access denied: MCP '{upstream_id}' is disabled for "
-            f"user '{user_id}'."
-        )
+        return _prompt_error_result(await _refuse_disabled_mcp(
+            runtime,
+            rate_limits,
+            org_id=org.id,
+            user_id=user_id,
+            session_id=session_id,
+            upstream_id=upstream_id,
+            audit_name=prompt_audit_name(upstream_id, original_name),
+        ))
     try:
         return await runtime.tool_router.get_prompt(
             org_id=org.id,
@@ -1721,27 +2001,23 @@ def _self_description_line(
     )
 
 
-def _instructions_for_org_with_upstreams(
-    runtime_manager: OrgRuntimeManager,
-    org_id: str,
-    *,
-    base_instructions: str,
-    name_prefix: str,
-) -> str:
-    """Append a 'Connected upstreams' block to *base_instructions* for
-    org *org_id*.
+def _upstream_description_lines(
+    runtime: OrgRuntime, user_id: str, *, name_prefix: str,
+) -> list[str]:
+    """One line per upstream of *runtime* that *user_id* may use and that
+    advertised a ``description`` or ``instructions`` string at
+    ``initialize``.
 
-    Iterates the registry (live add/remove tracking) rather than
-    ``runtime.upstreams`` (frozen at construction time) so upstreams
-    added after startup still surface their descriptions. Lines are
-    emitted only for upstreams that advertised a ``description`` or
-    ``instructions`` string at ``initialize``.
+    Gated like tools, resources and prompts (``_allowed_upstream_ids``):
+    any signed-in account can open a session on ``/mcp/{slug}``, so an
+    outsider, or an invited person who has not joined, must not read
+    which MCPs the org runs. Iterates the registry (live add/remove
+    tracking) rather than ``runtime.upstreams`` (frozen at construction
+    time) so upstreams added after startup still surface their
+    descriptions.
     """
-    runtime = runtime_manager.get_cached(org_id)
-    if runtime is None:
-        return base_instructions
     lines: list[str] = []
-    for upstream_id in runtime.tool_registry.get_upstream_ids():
+    for upstream_id in _allowed_upstream_ids(runtime, user_id):
         sd = runtime.tool_registry.get_self_description(upstream_id)
         if sd is None:
             continue
@@ -1755,6 +2031,26 @@ def _instructions_for_org_with_upstreams(
         )
         if line is not None:
             lines.append(line)
+    return lines
+
+
+def _instructions_for_org_with_upstreams(
+    runtime_manager: OrgRuntimeManager,
+    org_id: str,
+    *,
+    base_instructions: str,
+    name_prefix: str,
+    user_id: str,
+) -> str:
+    """Append a 'Connected upstreams' block to *base_instructions* for
+    org *org_id*, listing only the upstreams *user_id* may use; none
+    leaves *base_instructions* as is."""
+    runtime = runtime_manager.get_cached(org_id)
+    if runtime is None:
+        return base_instructions
+    lines = _upstream_description_lines(
+        runtime, user_id, name_prefix=name_prefix,
+    )
     if not lines:
         return base_instructions
     return f"{base_instructions}\n\nConnected upstreams:\n" + "\n".join(lines)
@@ -1764,6 +2060,8 @@ def _instructions_with_upstreams_multi_org(
     runtime_manager: OrgRuntimeManager,
     user_orgs: list[Organization],
     base_instructions: str,
+    *,
+    user_id: str,
 ) -> str:
     """Multi-org variant — group upstream descriptions by org slug."""
     blocks: list[str] = []
@@ -1771,23 +2069,9 @@ def _instructions_with_upstreams_multi_org(
         runtime = runtime_manager.get_cached(org.id)
         if runtime is None:
             continue
-        org_lines: list[str] = []
-        for upstream_id in runtime.tool_registry.get_upstream_ids():
-            sd = runtime.tool_registry.get_self_description(upstream_id)
-            if sd is None:
-                continue
-            u_def = runtime.tool_registry.get_upstream_definition(upstream_id)
-            display_name = (
-                u_def.display_name if u_def is not None else upstream_id
-            )
-            line = _self_description_line(
-                name_prefix=f"{org.slug}{SEPARATOR}",
-                upstream_id=upstream_id,
-                display_name=display_name,
-                self_description=sd,
-            )
-            if line is not None:
-                org_lines.append(line)
+        org_lines = _upstream_description_lines(
+            runtime, user_id, name_prefix=f"{org.slug}{SEPARATOR}",
+        )
         if org_lines:
             blocks.append("\n".join(org_lines))
     if not blocks:

@@ -40,6 +40,12 @@ class PlanLimits:
     allow_argument_constraints: bool
     audit_retention_days: int
     allowed_sandbox_combos: tuple[tuple[int, int], ...] | None
+    # Gateway tool calls per sliding minute: per caller (a user or a
+    # service token) inside the org, and for the whole org. Enforced by
+    # ``RateLimitService``. Runaway ceilings, about 5x the busiest real
+    # traffic; not published in the user docs (Terms §3 note).
+    tool_calls_per_min_per_caller: int
+    tool_calls_per_min_per_org: int
 
 
 FREE = PlanLimits(
@@ -50,6 +56,8 @@ FREE = PlanLimits(
     allow_argument_constraints=False,
     audit_retention_days=30,
     allowed_sandbox_combos=((1, 1024),),
+    tool_calls_per_min_per_caller=60,
+    tool_calls_per_min_per_org=120,
 )
 
 
@@ -61,6 +69,8 @@ TEAM = PlanLimits(
     allow_argument_constraints=True,
     audit_retention_days=365,
     allowed_sandbox_combos=None,
+    tool_calls_per_min_per_caller=120,
+    tool_calls_per_min_per_org=600,
 )
 
 

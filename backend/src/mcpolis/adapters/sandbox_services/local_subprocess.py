@@ -483,10 +483,11 @@ class LocalSubprocessSandboxService:
 
     async def on_upstream_removed(
         self, *, org_id: str, upstream_id: str,
-    ) -> None:
+    ) -> bool:
         # No persistent storage on this backend — nothing to tear
         # down. Method exists so callers can dispatch unconditionally.
         _ = org_id, upstream_id
+        return False
 
     async def kill_persisted_session(
         self, *, org_id: str, upstream_id: str,

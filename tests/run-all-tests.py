@@ -35,19 +35,23 @@ Knobs:
     NO_INTEGRATION=1        skip the (paid) E2B integration leg entirely
     UNIT_JOBS / E2E_SHARDS / INTEGRATION_JOBS   override the budget pieces
     E2E_RETRIES / E2E_TIMEOUT_MS                forwarded to Playwright
-                                               (default 2 / 45000 here)
+                                               (default 3 / 45000 here)
     TEST_ALL_CORES          pretend the host has this many cores (testing)
 
-Outputs:
-    /tmp/mcpolis-all-unit.log / -e2e.log / -integration.log   per-suite logs
+Outputs, all in this run's own folder (see ``run_folder.py``), printed
+at the start and in the summary at the end:
+    all-unit.log / all-e2e.log / all-integration.log   per-suite logs
     plus each suite's own JSON report (read back for the aggregate):
-      unit         /tmp/mcpolis-unit-report.json
-      e2e          /tmp/mcpolis-e2e-aggregate.json
-      integration  /tmp/mcpolis-integration-report.json
-    /tmp/mcpolis-all-aggregate.txt   the combined summary printed at the end
+      unit         unit-report.json
+      e2e          e2e-aggregate.json
+      integration  integration-report.json
+    all-aggregate.txt   the combined summary printed at the end
+The folder is passed down to every leg as ``MCPOLIS_TEST_OUT_DIR``, so a
+leg's own files (shard logs, JUnit XML) land next to the summary, and a
+second test-all running at the same time never touches them.
 
-Exit code is non-zero if ANY suite's process exits non-zero or reports a
-failure.
+Exit code is non-zero if ANY suite's process exits non-zero, reports a
+failure, or leaves no readable report.
 """
 from __future__ import annotations
 
@@ -61,12 +65,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from run_folder import OUT_DIR_ENV, resolve_run_folder
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_DIR = REPO_ROOT / "backend"
-
-UNIT_REPORT = Path("/tmp/mcpolis-unit-report.json")
-E2E_AGGREGATE = Path("/tmp/mcpolis-e2e-aggregate.json")
-INTEGRATION_REPORT = Path("/tmp/mcpolis-integration-report.json")
 
 
 def _env_int(name: str, default: int | None) -> int | None:
@@ -141,8 +143,10 @@ class Suite:
     finished_at: float = 0.0
 
 
-def build_suites(budget: Budget) -> list[Suite]:
-    base_env = os.environ.copy()
+def build_suites(budget: Budget, run_dir: Path) -> list[Suite]:
+    # Every leg writes into this run's folder, so its reports sit next to
+    # this run's summary and no other run can overwrite them.
+    base_env = {**os.environ, OUT_DIR_ENV: str(run_dir)}
     suites: list[Suite] = [
         Suite(
             name="unit",
@@ -150,7 +154,7 @@ def build_suites(budget: Budget) -> list[Suite]:
                 "bash", str(BACKEND_DIR / "run-unit-tests.sh"),
                 "-j", str(budget.unit_jobs),
             ],
-            log_path=Path("/tmp/mcpolis-all-unit.log"),
+            log_path=run_dir / "all-unit.log",
             # Give the unit leg the same transient-blip resilience the
             # e2e leg gets from Playwright retries. Under this
             # oversubscribed cross-suite run a CPU-/Docker-VM-starved box
@@ -177,7 +181,7 @@ def build_suites(budget: Budget) -> list[Suite]:
                 "bash", str(REPO_ROOT / "tests" / "run-e2e-tests.sh"),
                 "--shards", str(budget.e2e_shards),
             ],
-            log_path=Path("/tmp/mcpolis-all-e2e.log"),
+            log_path=run_dir / "all-e2e.log",
             env={
                 **base_env,
                 # Loosen Playwright under cross-suite load: a triple blip
@@ -200,7 +204,7 @@ def build_suites(budget: Budget) -> list[Suite]:
                     "bash", str(BACKEND_DIR / "run-integration-tests.sh"),
                     "-j", str(budget.integration_jobs),
                 ],
-                log_path=Path("/tmp/mcpolis-all-integration.log"),
+                log_path=run_dir / "all-integration.log",
                 env=base_env,
             )
         )
@@ -257,10 +261,15 @@ class SuiteResult:
     skipped: int = 0
     duration_s: float = 0.0
     note: str = ""
+    # False when the leg's report is missing or unreadable. Such a leg
+    # can't prove it ran its tests, so it fails even with exit code 0:
+    # a runner that renamed its report would otherwise pass with
+    # passed=0.
+    report_found: bool = True
 
     @property
     def ok(self) -> bool:
-        return self.returncode == 0 and self.failed == 0
+        return self.returncode == 0 and self.failed == 0 and self.report_found
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -277,6 +286,7 @@ def parse_pytest_report(name: str, suite: Suite, path: Path) -> SuiteResult:
     data = _read_json(path)
     if data is None:
         res.note = f"no/invalid JSON report at {path}"
+        res.report_found = False
         return res
     summary = data.get("summary", {})
     res.passed = int(summary.get("passed", 0))
@@ -285,13 +295,14 @@ def parse_pytest_report(name: str, suite: Suite, path: Path) -> SuiteResult:
     return res
 
 
-def parse_e2e_aggregate(suite: Suite) -> SuiteResult:
+def parse_e2e_aggregate(suite: Suite, path: Path) -> SuiteResult:
     rc = suite.returncode if suite.returncode is not None else -1
     res = SuiteResult(name="e2e", returncode=rc,
                       duration_s=suite.finished_at - suite.started_at)
-    data = _read_json(E2E_AGGREGATE)
+    data = _read_json(path)
     if data is None:
-        res.note = f"no/invalid aggregate at {E2E_AGGREGATE}"
+        res.note = f"no/invalid aggregate at {path}"
+        res.report_found = False
         return res
     res.passed = int(data.get("passed", 0))
     res.failed = int(data.get("failed", 0))
@@ -300,15 +311,18 @@ def parse_e2e_aggregate(suite: Suite) -> SuiteResult:
     return res
 
 
-def collect_results(suites: list[Suite]) -> list[SuiteResult]:
+def collect_results(suites: list[Suite], run_dir: Path) -> list[SuiteResult]:
+    # The file names each leg's runner writes into the run folder.
     out: list[SuiteResult] = []
     for s in suites:
         if s.name == "unit":
-            out.append(parse_pytest_report("unit", s, UNIT_REPORT))
+            out.append(parse_pytest_report(
+                "unit", s, run_dir / "unit-report.json"))
         elif s.name == "integration":
-            out.append(parse_pytest_report("integration", s, INTEGRATION_REPORT))
+            out.append(parse_pytest_report(
+                "integration", s, run_dir / "integration-report.json"))
         elif s.name == "e2e":
-            out.append(parse_e2e_aggregate(s))
+            out.append(parse_e2e_aggregate(s, run_dir / "e2e-aggregate.json"))
     return out
 
 
@@ -316,7 +330,7 @@ def collect_results(suites: list[Suite]) -> list[SuiteResult]:
 
 
 def render_summary(results: list[SuiteResult], budget: Budget,
-                   wall_s: float) -> str:
+                   wall_s: float, run_dir: Path) -> str:
     lines = [
         "═" * 64,
         f"test-all: {budget.cores} cores -> unit -j{budget.unit_jobs}, "
@@ -338,12 +352,15 @@ def render_summary(results: list[SuiteResult], budget: Budget,
     lines.append("─" * 64)
     lines.append(f"  OVERALL: {'PASS' if overall else 'FAIL'} "
                  f"(wall {wall_s:.0f}s)")
+    lines.append(f"  results: {run_dir}")
     lines.append("═" * 64)
     return "\n".join(lines) + "\n"
 
 
 def main() -> int:
     budget = compute_budget()
+    run_dir = resolve_run_folder("all")
+    print(f"[test-all] results folder: {run_dir}", flush=True)
     print(
         f"[test-all] {budget.cores} cores -> unit -j{budget.unit_jobs}, "
         f"e2e --shards {budget.e2e_shards}, "
@@ -352,11 +369,12 @@ def main() -> int:
         flush=True,
     )
 
-    suites = build_suites(budget)
+    suites = build_suites(budget, run_dir)
     started = time.time()
 
     def _handle_signal(sig: int, _frame: Any) -> None:
-        print(f"\n[test-all] signal {sig} — tearing down suites...", flush=True)
+        print(f"\n[test-all] signal {sig} — tearing down suites "
+              f"(partial results in {run_dir})...", flush=True)
         terminate_all(suites)
         sys.exit(130)
 
@@ -403,9 +421,9 @@ def main() -> int:
         terminate_all(suites)
 
     wall = time.time() - started
-    results = collect_results(suites)
-    summary = render_summary(results, budget, wall)
-    Path("/tmp/mcpolis-all-aggregate.txt").write_text(summary)
+    results = collect_results(suites, run_dir)
+    summary = render_summary(results, budget, wall, run_dir)
+    (run_dir / "all-aggregate.txt").write_text(summary)
     print(summary, end="")
 
     return 0 if all(r.ok for r in results) else 1

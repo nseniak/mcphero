@@ -25,6 +25,7 @@ import pytest
 from anyio.streams.memory import MemoryObjectReceiveStream
 from mcp import types as mcp_types
 from mcp.shared.message import SessionMessage
+from structlog.testing import capture_logs
 
 from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (
     InMemorySandboxPersistenceRepository,
@@ -41,6 +42,8 @@ from mcpolis.adapters.sandbox_e2b import (
 from mcpolis.adapters.sandbox_e2b.service import (
     PERSISTENT_VOLUME_MOUNT_PATH,
     VOLUME_METADATA_KEY,
+    VOLUMES_TO_DESTROY_METADATA_KEY,
+    _describe_stream_error,  # pyright: ignore[reportPrivateUsage]
 )
 from mcpolis.adapters.sandbox_e2b.template_grid import language_for_command
 from mcpolis.domain.services.exit_reason import ExitReason
@@ -83,6 +86,7 @@ def make_e2b_service(
     persistence: SandboxPersistenceRepository | None = None,
     volumes_enabled: bool = True,
     on_timeout_seconds: int = 60,
+    reuse_sandboxes_on_restart: bool = False,
 ) -> tuple[E2BSandboxService, MockE2BClient]:
     """Builder for the E2B service with a fresh mock client.
 
@@ -99,6 +103,7 @@ def make_e2b_service(
             on_timeout_seconds=on_timeout_seconds,
             persistence=persistence,
             volumes_enabled=volumes_enabled,
+            reuse_sandboxes_on_restart=reuse_sandboxes_on_restart,
         ),
         real_client,
     )
@@ -121,6 +126,18 @@ def make_persistent_disk_upstream(
         ),
         auth=make_upstream_auth(),
     )
+
+
+async def run_a_session(
+    service: E2BSandboxService, upstream: UpstreamDefinition, session_id: str,
+) -> None:
+    """One session of ``upstream`` (org ``acme``), opened then closed: a
+    Start, then a Stop."""
+    async with service.session(
+        session_id=session_id, org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ):
+        pass
 
 
 # ---------- template grid ----------
@@ -817,6 +834,129 @@ async def test_session_wake_kill_failure_still_withholds_the_frame() -> None:
             "a refused kill must not let the frame reach the frozen "
             "process"
         )
+
+
+@pytest.mark.asyncio
+async def test_stream_death_logs_why_the_stream_raised() -> None:
+    """Sentry MCPOLIS-BACKEND-1E: a fresh process on a woken sandbox
+    lost its output stream 5 ms after start. ``wait()`` raised, the
+    watcher swallowed the exception, and nothing anywhere said why.
+    The ``stream_dead`` line must carry the error text."""
+    service, _mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    with capture_logs() as logs:
+        async with service.session(
+            session_id="stream-error-session",
+            org_id="acme",
+            upstream=upstream,
+            resources=make_default_resources(),
+            denylist=(),
+        ):
+            live_handle = cast(
+                MockE2BSandboxHandle,
+                service._live_sandboxes["stream-error-session"],  # type: ignore[reportPrivateUsage]
+            )
+            process = live_handle.last_process
+            assert process is not None
+            process.simulate_stream_error(
+                E2BSDKError("ReadError", "stream reset by peer"),
+            )
+            for _ in range(50):
+                if any(le.get("event") == "sandbox.e2b.stream_dead" for le in logs):
+                    break
+                await asyncio.sleep(0.01)
+
+    dead = [le for le in logs if le.get("event") == "sandbox.e2b.stream_dead"]
+    assert len(dead) == 1, dead
+    assert dead[0]["cause"] == "severed"
+    assert dead[0]["exit_code"] is None
+    assert dead[0]["stream_error"] == "E2BSDKError: ReadError: stream reset by peer"
+
+
+@pytest.mark.asyncio
+async def test_stream_death_from_a_clean_return_logs_no_stream_error() -> None:
+    """A stream that ends by returning an exit code has no error to
+    report; the field stays empty rather than inventing one."""
+    service, _mock = make_e2b_service()
+    upstream = make_upstream_definition(id="ups-x", command="npx")
+    with capture_logs() as logs:
+        async with service.session(
+            session_id="stream-exit-session",
+            org_id="acme",
+            upstream=upstream,
+            resources=make_default_resources(),
+            denylist=(),
+        ):
+            live_handle = cast(
+                MockE2BSandboxHandle,
+                service._live_sandboxes["stream-exit-session"],  # type: ignore[reportPrivateUsage]
+            )
+            process = live_handle.last_process
+            assert process is not None
+            process.simulate_exit(3)
+            for _ in range(50):
+                if any(le.get("event") == "sandbox.e2b.stream_dead" for le in logs):
+                    break
+                await asyncio.sleep(0.01)
+
+    dead = [le for le in logs if le.get("event") == "sandbox.e2b.stream_dead"]
+    assert len(dead) == 1, dead
+    assert dead[0]["exit_code"] == 3
+    assert dead[0]["stream_error"] is None
+
+
+def test_stream_error_text_is_bounded() -> None:
+    long_error = E2BSDKError("ReadError", "x" * 5000)
+    assert len(_describe_stream_error(long_error)) == 500
+    assert _describe_stream_error(OSError()) == "OSError"
+
+
+def make_wrapped_stream_error(cause: BaseException) -> E2BSDKError:
+    """The shape ``real_client.wait`` produces: the SDK error wrapped,
+    the original kept as ``__cause__``."""
+    try:
+        try:
+            raise cause
+        except BaseException as exc:
+            raise E2BSDKError(type(exc).__name__, str(exc)) from exc
+    except E2BSDKError as wrapped:
+        return wrapped
+
+
+def test_stream_error_names_the_underlying_cause() -> None:
+    """Network errors often have an empty message, so the wrapper alone
+    says only ``ReadError``; the reason is further down the chain."""
+    root = ConnectionResetError("connection reset by peer")
+    try:
+        try:
+            raise root
+        except ConnectionResetError as exc:
+            raise OSError("") from exc
+    except OSError as middle:
+        wrapped = make_wrapped_stream_error(middle)
+    assert _describe_stream_error(wrapped) == (
+        "E2BSDKError: OSError <- OSError"
+        " <- ConnectionResetError: connection reset by peer"
+    )
+
+
+def test_stream_error_chain_stops_at_three_links() -> None:
+    error: BaseException = ValueError("root")
+    for depth in range(5):
+        try:
+            raise RuntimeError(f"level {depth}") from error
+        except RuntimeError as exc:
+            error = exc
+    assert _describe_stream_error(error).count(" <- ") == 2
+
+
+class _UnprintableError(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("no str")
+
+
+def test_stream_error_never_raises_on_an_unprintable_exception() -> None:
+    assert _describe_stream_error(_UnprintableError()) == "_UnprintableError"
 
 
 @pytest.mark.asyncio
@@ -1654,12 +1794,12 @@ async def test_on_upstream_removed_handles_already_deleted_volume() -> None:
 
 
 @pytest.mark.asyncio
-async def test_on_upstream_removed_keeps_ref_on_transient_destroy_error() -> None:
+async def test_on_upstream_removed_keeps_a_volume_it_could_not_destroy_to_retry() -> None:
     """If volume destroy raises something other than NotFound (network
-    blip, rate limit, etc.) we MUST leave the persistence ref intact
-    so a retry can complete the teardown. Clearing the ref + leaving
-    the volume orphaned would be worse than leaving the ref so the
-    reconciler can chase it later.
+    blip, rate limit, etc.) the ref keeps the volume id, or nothing
+    would point at the volume any more, but as one still to destroy:
+    never as the volume an upstream added again under the same id
+    mounts. Nothing else of the removed upstream stays on the ref.
     """
     persistence = InMemorySandboxPersistenceRepository()
     service, mock = make_e2b_service(persistence=persistence)
@@ -1669,6 +1809,7 @@ async def test_on_upstream_removed_keeps_ref_on_transient_destroy_error() -> Non
         resources=make_default_resources(), denylist=(),
     ):
         pass
+    volume_id = mock.volume_creates[0].volume_id
     mock.volume_destroy_raises = E2BSDKError(
         "E2BSDKError", "transient network",
     )
@@ -1679,7 +1820,74 @@ async def test_on_upstream_removed_keeps_ref_on_transient_destroy_error() -> Non
         org_id="acme", upstream_id="ups-vol",
     )
     assert persisted is not None
-    assert VOLUME_METADATA_KEY in persisted.metadata
+    assert persisted.metadata == {VOLUMES_TO_DESTROY_METADATA_KEY: volume_id}
+    assert persisted.sandbox_id is None
+
+
+@pytest.mark.asyncio
+async def test_a_stop_keeps_the_persistent_volume_for_the_next_start() -> None:
+    """Production reuses sandboxes across restarts, so a session's close
+    forgets its ref once its sandbox is killed. Forgetting the volume id
+    with it made the next Start provision a new, empty volume: the MCP's
+    ``/data`` was gone, and the old volume stayed on the account."""
+    persistence = InMemorySandboxPersistenceRepository()
+    service, mock = make_e2b_service(
+        persistence=persistence, reuse_sandboxes_on_restart=True,
+    )
+    upstream = make_persistent_disk_upstream(id="ups-vol")
+
+    await run_a_session(service, upstream, "s1")  # Start, then Stop
+    await service.kill_persisted_session(org_id="acme", upstream_id="ups-vol")
+    await run_a_session(service, upstream, "s2")  # Start again
+
+    assert [v.volume_id for v in mock.volume_creates] == ["vol-0"]
+    assert [c.volume_mounts for c in mock.creates] == [
+        {PERSISTENT_VOLUME_MOUNT_PATH: "vol-0"},
+        {PERSISTENT_VOLUME_MOUNT_PATH: "vol-0"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_removing_a_stopped_mcp_destroys_its_volume() -> None:
+    persistence = InMemorySandboxPersistenceRepository()
+    service, mock = make_e2b_service(
+        persistence=persistence, reuse_sandboxes_on_restart=True,
+    )
+    upstream = make_persistent_disk_upstream(id="ups-vol")
+
+    await run_a_session(service, upstream, "s1")
+    await service.kill_persisted_session(org_id="acme", upstream_id="ups-vol")
+    await service.on_upstream_removed(org_id="acme", upstream_id="ups-vol")
+
+    assert [d.volume_id for d in mock.volume_destroys] == ["vol-0"]
+    assert await persistence.get(org_id="acme", upstream_id="ups-vol") is None
+
+
+@pytest.mark.asyncio
+async def test_an_mcp_added_again_never_mounts_the_removed_ones_volume() -> None:
+    """The removal's destroy failed, so the volume is still on the
+    account, with the removed MCP's data. A new MCP added under the same
+    id gets a volume of its own, and its removal destroys both."""
+    persistence = InMemorySandboxPersistenceRepository()
+    service, mock = make_e2b_service(persistence=persistence)
+    upstream = make_persistent_disk_upstream(id="ups-vol")
+    await run_a_session(service, upstream, "old")
+    mock.volume_destroy_raises = E2BSDKError("E2BSDKError", "503")
+    await service.on_upstream_removed(org_id="acme", upstream_id="ups-vol")
+    mock.volume_destroy_raises = None
+
+    # Added again: it starts stopped (``kill_persisted_session``), then
+    # an admin starts it.
+    await service.kill_persisted_session(org_id="acme", upstream_id="ups-vol")
+    await run_a_session(service, upstream, "new")
+    await service.on_upstream_removed(org_id="acme", upstream_id="ups-vol")
+
+    assert [c.volume_mounts for c in mock.creates] == [
+        {PERSISTENT_VOLUME_MOUNT_PATH: "vol-0"},
+        {PERSISTENT_VOLUME_MOUNT_PATH: "vol-1"},
+    ]
+    assert sorted(d.volume_id for d in mock.volume_destroys) == ["vol-0", "vol-1"]
+    assert await persistence.get(org_id="acme", upstream_id="ups-vol") is None
 
 
 # ---------- kill-on-stop + preserve-on-shutdown contract ----------
@@ -1801,6 +2009,344 @@ async def test_explicit_pause_path_still_skips_kill() -> None:
     )
 
 
+async def open_until(
+    service: E2BSandboxService,
+    upstream_id: str,
+    *,
+    opened: asyncio.Event,
+    stop: asyncio.Event,
+) -> None:
+    """A session of ``upstream_id`` (org ``acme``) that closes on ``stop``,
+    the way a Stop sets the session's shutdown event."""
+    async with service.session(
+        session_id=f"session-{upstream_id}",
+        org_id="acme",
+        upstream=make_upstream_definition(id=upstream_id, command="npx"),
+        resources=make_default_resources(),
+        denylist=(),
+    ):
+        opened.set()
+        await stop.wait()
+
+
+@pytest.mark.asyncio
+async def test_a_stop_cut_by_the_close_timeout_still_kills_the_sandbox() -> None:
+    """Stop closes the session, and ``close()`` cancels its task once
+    CLOSE_TIMEOUT (10 s) has passed. A cancel landing while E2B is still
+    answering the sandbox kill must not cut it: the kill goes through,
+    the ref goes after it, and the cancel then ends the task.
+
+    Checked right after the close, before Stop's second chance
+    (``kill_persisted_session``): that one kills from the ref a cut kill
+    leaves, so a test that runs it first stays green with the close's
+    kill unshielded."""
+    persistence = InMemorySandboxPersistenceRepository()
+    service, mock = make_e2b_service(
+        persistence=persistence, reuse_sandboxes_on_restart=True,
+    )
+    opened, stop = asyncio.Event(), asyncio.Event()
+    session_task = asyncio.create_task(
+        open_until(service, "ups-stop", opened=opened, stop=stop),
+    )
+    await asyncio.wait_for(opened.wait(), timeout=5)
+    mock.kill_gate = asyncio.Event()
+
+    stop.set()
+    await asyncio.wait_for(mock.kill_started.wait(), timeout=5)
+    session_task.cancel()  # close(): CLOSE_TIMEOUT has passed
+    mock.kill_gate.set()
+    outcome = await asyncio.gather(session_task, return_exceptions=True)
+
+    assert isinstance(outcome[0], asyncio.CancelledError), outcome
+    assert [k.sandbox_id for k in mock.kills] == ["sbx-0"], (
+        f"the cancelled close cut its sandbox kill; kills={mock.kills}"
+    )
+    assert mock.live_infos == []
+    assert await persistence.get(org_id="acme", upstream_id="ups-stop") is None
+
+
+@pytest.mark.asyncio
+async def test_a_stop_of_a_wedged_mcp_does_not_wait_on_its_process() -> None:
+    """A wedged MCP is what admins stop, and what hangs then is envd,
+    through which a process kill goes (60 s SDK timeout). Killing the
+    sandbox ends every process in it, so the close must not wait on a
+    process kill first: the sandbox goes, and the ref with it."""
+    persistence = InMemorySandboxPersistenceRepository()
+    service, mock = make_e2b_service(
+        persistence=persistence, reuse_sandboxes_on_restart=True,
+    )
+    opened, stop = asyncio.Event(), asyncio.Event()
+    session_task = asyncio.create_task(
+        open_until(service, "ups-wedged", opened=opened, stop=stop),
+    )
+    await asyncio.wait_for(opened.wait(), timeout=5)
+    mock.process_kill_hangs = True
+
+    stop.set()
+    await asyncio.wait_for(session_task, timeout=5)
+
+    assert [k.sandbox_id for k in mock.kills] == ["sbx-0"]
+    assert await persistence.get(org_id="acme", upstream_id="ups-wedged") is None
+
+
+@pytest.mark.asyncio
+async def test_a_kill_that_fails_at_close_keeps_the_ref_for_stop_to_retry() -> None:
+    """When E2B refuses the kill, the ref must stay: it is how Stop's
+    second chance (``kill_persisted_session``) finds the sandbox to try
+    again. Deleted before the kill, it left nothing to retry with."""
+    persistence = InMemorySandboxPersistenceRepository()
+    service, mock = make_e2b_service(
+        persistence=persistence, reuse_sandboxes_on_restart=True,
+    )
+    mock.kill_raises = E2BSDKError("E2BSDKError", "502 Bad Gateway")
+    async with service.session(
+        session_id="retry", org_id="acme",
+        upstream=make_upstream_definition(id="ups-retry", command="npx"),
+        resources=make_default_resources(), denylist=(),
+    ):
+        pass
+
+    ref = await persistence.get(org_id="acme", upstream_id="ups-retry")
+    assert ref is not None and ref.sandbox_id == "sbx-0", (
+        "a refused kill must leave the ref that names the sandbox"
+    )
+    mock.kill_raises = None
+    await service.kill_persisted_session(org_id="acme", upstream_id="ups-retry")
+
+    assert [k.sandbox_id for k in mock.kills] == ["sbx-0", "sbx-0"]
+    assert "sbx-0" not in {info.sandbox_id for info in mock.live_infos}
+    assert await persistence.get(org_id="acme", upstream_id="ups-retry") is None
+
+
+@pytest.mark.asyncio
+async def test_a_slow_kill_leaves_the_ref_of_a_newer_session_alone() -> None:
+    """The ref now goes only once the kill is through, so a newer session
+    of the same upstream may have written its own ref meanwhile. That ref
+    names the new sandbox and must stay."""
+    persistence = InMemorySandboxPersistenceRepository()
+    service, mock = make_e2b_service(
+        persistence=persistence, reuse_sandboxes_on_restart=True,
+    )
+    opened, stop = asyncio.Event(), asyncio.Event()
+    session_task = asyncio.create_task(
+        open_until(service, "ups-newer", opened=opened, stop=stop),
+    )
+    await asyncio.wait_for(opened.wait(), timeout=5)
+    mock.kill_gate = asyncio.Event()
+
+    stop.set()
+    await asyncio.wait_for(mock.kill_started.wait(), timeout=5)
+    old_ref = await persistence.get(org_id="acme", upstream_id="ups-newer")
+    assert old_ref is not None
+    await persistence.upsert(
+        old_ref.model_copy(update={"sandbox_id": "sbx-newer", "pid": 7}),
+    )
+    mock.kill_gate.set()
+    await asyncio.wait_for(session_task, timeout=5)
+
+    ref = await persistence.get(org_id="acme", upstream_id="ups-newer")
+    assert ref is not None and ref.sandbox_id == "sbx-newer"
+
+
+def make_e2b_service_with_kill_timeout(
+    kill_timeout_seconds: float,
+) -> tuple[E2BSandboxService, MockE2BClient]:
+    """``make_e2b_service`` with a short time limit on sandbox kills."""
+    client = make_mock_e2b_client()
+    service = E2BSandboxService(
+        client,
+        mcpolis_instance="test-instance",
+        on_timeout_seconds=60,
+        kill_timeout_seconds=kill_timeout_seconds,
+    )
+    return service, client
+
+
+def make_kills_hang_ignoring_cancels(client: MockE2BClient) -> asyncio.Event:
+    """Make every sandbox kill of ``client`` hang until the returned event
+    is set, whatever cancels it: an E2B call that finishes its own
+    cleanup through a cancel."""
+    release = asyncio.Event()
+
+    async def hang_ignoring_cancels() -> None:
+        client.kill_started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    client.wait_for_kill_gate = hang_ignoring_cancels  # type: ignore[method-assign]
+    return release
+
+
+async def open_and_close_session(
+    service: E2BSandboxService, upstream_id: str,
+) -> None:
+    """Open a session of ``upstream_id`` (org ``acme``), then close it."""
+    stop = asyncio.Event()
+    stop.set()
+    await open_until(service, upstream_id, opened=asyncio.Event(), stop=stop)
+
+
+async def overdue_kills_end(service: E2BSandboxService) -> None:
+    """Wait until no kill cut by its time limit is still running."""
+    async with asyncio.timeout(5):
+        while len(service._overdue_kills):  # pyright: ignore[reportPrivateUsage]
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_kill_past_its_time_limit_is_cut_and_the_close_goes_on() -> None:
+    """A hung E2B API must not hold a close forever: the sandbox kill is
+    bounded by ``kill_timeout_seconds``. The kill still running then is
+    logged, cancelled and held until it ends, and the close returns."""
+    service, client = make_e2b_service_with_kill_timeout(0.1)
+    release = make_kills_hang_ignoring_cancels(client)
+
+    with capture_logs() as logs:
+        await asyncio.wait_for(
+            open_and_close_session(service, "ups-hung"), timeout=5,
+        )
+
+    timed_out = [
+        line for line in logs if line["event"] == "sandbox.e2b.kill_timed_out"
+    ]
+    assert [(line["sandbox_id"], line["timeout_seconds"]) for line in timed_out] == [
+        ("sbx-0", 0.1),
+    ]
+    assert len(service._overdue_kills) == 1  # pyright: ignore[reportPrivateUsage]
+
+    release.set()
+    await overdue_kills_end(service)
+    assert [k.sandbox_id for k in client.kills] == ["sbx-0"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_close_with_a_hung_kill_ends_at_the_time_limit() -> None:
+    """The kill's time limit also bounds a close that is cancelled while
+    E2B hangs, and the cancel then ends the close."""
+    service, client = make_e2b_service_with_kill_timeout(0.1)
+    release = make_kills_hang_ignoring_cancels(client)
+    opened, stop = asyncio.Event(), asyncio.Event()
+    session_task = asyncio.create_task(
+        open_until(service, "ups-hung", opened=opened, stop=stop),
+    )
+    await asyncio.wait_for(opened.wait(), timeout=5)
+
+    stop.set()
+    await asyncio.wait_for(client.kill_started.wait(), timeout=5)
+    session_task.cancel()
+    outcome = await asyncio.wait_for(
+        asyncio.gather(session_task, return_exceptions=True), timeout=5,
+    )
+
+    assert isinstance(outcome[0], asyncio.CancelledError), outcome
+    assert len(service._overdue_kills) == 1  # pyright: ignore[reportPrivateUsage]
+    release.set()
+    await overdue_kills_end(service)
+
+
+@pytest.mark.asyncio
+async def test_a_kill_failing_in_an_unexpected_way_is_logged_not_raised() -> None:
+    """A failure nothing in the kill expects (neither an E2B nor a network
+    error) is logged, and the close still ends normally."""
+    service, client = make_e2b_service()
+    client.kill_raises = RuntimeError("unexpected")
+
+    with capture_logs() as logs:
+        await open_and_close_session(service, "ups-broken")
+
+    failed = [
+        line for line in logs
+        if line["event"] == "sandbox.e2b.kill_cleanup_failed"
+    ]
+    assert [line["sandbox_id"] for line in failed] == ["sbx-0"]
+    assert isinstance(failed[0]["exc_info"], RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_a_shutdown_with_reuse_off_kills_the_sandbox() -> None:
+    """With reuse on restart off, no boot ever looks for a sandbox kept at
+    shutdown: keeping it only leaves it to pause and wait for a
+    reconcile. The shutdown kills it like any other close."""
+    service, mock = make_e2b_service(
+        persistence=InMemorySandboxPersistenceRepository(),
+    )
+    async with service.session(
+        session_id="no-reuse", org_id="acme",
+        upstream=make_upstream_definition(id="ups-no-reuse", command="npx"),
+        resources=make_default_resources(), denylist=(),
+    ):
+        assert service.mark_all_active_sessions_preserve_on_close() == 0
+
+    assert [k.sandbox_id for k in mock.kills] == ["sbx-0"]
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_that_cannot_reach_its_sandbox_kills_it() -> None:
+    """The ref names a sandbox E2B will not connect to (an API error, not
+    a missing sandbox). The fresh create is about to overwrite that ref,
+    after which nothing points at the sandbox: it must be killed."""
+    persistence = InMemorySandboxPersistenceRepository()
+    upstream = make_upstream_definition(id="ups-unreachable", command="npx")
+    service, mock = make_e2b_service(
+        persistence=persistence, reuse_sandboxes_on_restart=True,
+    )
+    async with service.session(
+        session_id="warmup", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ):
+        service.mark_session_preserve_on_close("warmup")
+    mock.connect_raises = E2BSDKError("E2BSDKError", "502 Bad Gateway")
+
+    async with service.session(
+        session_id="reopen", org_id="acme", upstream=upstream,
+        resources=make_default_resources(), denylist=(),
+    ):
+        service.mark_session_preserve_on_close("reopen")
+
+    assert [k.sandbox_id for k in mock.kills] == ["sbx-0"], (
+        "the sandbox the failed reconnect gave up on was left running"
+    )
+    assert [info.sandbox_id for info in mock.live_infos] == ["sbx-1"]
+
+
+@pytest.mark.asyncio
+async def test_stop_of_a_sandbox_already_gone_still_clears_its_ref() -> None:
+    """E2B answers "not found" for a sandbox that is already gone (it
+    used to read as a successful kill). Stop treats it as done: the ref
+    goes, and the log says the sandbox was already gone."""
+    persistence = InMemorySandboxPersistenceRepository()
+    await persistence.upsert(SandboxPersistedRef(
+        provider="e2b",
+        org_id="acme",
+        upstream_id="ups-gone",
+        mcpolis_instance="test-instance",
+        sandbox_id="sbx-gone",
+        paused_snapshot_id=None,
+        pid=4242,
+        metadata={},
+        cached_server_info=None,
+        cached_self_description=None,
+        last_updated=datetime.now(UTC),
+    ))
+    service, mock = make_e2b_service(persistence=persistence)
+    mock.kill_raises = E2BNotFoundError(
+        "SandboxNotFoundException", "sandbox sbx-gone not found",
+    )
+
+    with capture_logs() as logs:
+        await service.kill_persisted_session(
+            org_id="acme", upstream_id="ups-gone",
+        )
+
+    assert await persistence.get(org_id="acme", upstream_id="ups-gone") is None
+    assert [e["event"] for e in logs if e["event"].startswith(
+        "sandbox.e2b.persisted_session.",
+    )] == ["sandbox.e2b.persisted_session.kill_not_found"]
+
+
 @pytest.mark.asyncio
 async def test_try_reconnect_succeeds_with_drifted_config() -> None:
     """Boot reconnect contract: a config edit on disk does NOT take
@@ -1832,13 +2378,14 @@ async def test_try_reconnect_succeeds_with_drifted_config() -> None:
     # Service B: same persistence, same upstream id, but the live
     # upstream definition has DIFFERENT args + env (a config edit
     # made while service A was down). The reconnect must still
-    # reattach — no kill, no fresh-create.
+    # reattach — no kill, no fresh-create. Same instance id: it is
+    # one value per database, so a restart keeps it.
     upstream_v2 = make_upstream_definition(id="ups-drift", command="npx")
     upstream_v2.stdio.args = ["-y", "package-v2"]  # type: ignore[union-attr]
     upstream_v2.stdio.env = {"FEATURE_FLAG": "on"}  # type: ignore[union-attr]
     service_b = E2BSandboxService(
         mock,
-        mcpolis_instance="test-instance-b",
+        mcpolis_instance="test-instance",
         on_timeout_seconds=60,
         persistence=persistence,
         volumes_enabled=True,
@@ -2414,6 +2961,8 @@ async def test_reuse_is_refused_when_the_size_changed() -> None:
 
     assert mock.creates[-1].template == "mcpolis-node-cpu1-ram1024"
     creates_before = len(mock.creates)
+    old_ref = await persistence.get(org_id="acme", upstream_id=upstream.id)
+    assert old_ref is not None and old_ref.sandbox_id is not None
 
     # The operator raises memory and the upstream is reopened.
     async with service.session(
@@ -2430,6 +2979,10 @@ async def test_reuse_is_refused_when_the_size_changed() -> None:
     assert mock.creates[-1].template == "mcpolis-node-cpu2-ram2048", (
         f"the new sandbox must use the requested size; got "
         f"{mock.creates[-1].template}"
+    )
+    assert old_ref.sandbox_id in {k.sandbox_id for k in mock.kills}, (
+        "the old-size sandbox must be killed: the fresh create overwrites "
+        "its ref, after which nothing points at it and it leaks"
     )
 
 

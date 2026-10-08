@@ -9,7 +9,6 @@ import type { UpstreamSummary } from "../api/types";
 
 vi.mock("../api/admin", () => ({
   fetchUpstreams: vi.fn(),
-  refreshUpstreamStatus: vi.fn(),
 }));
 // useUpstreams -> useOrgSlug -> useAuth. The route slug is what we test;
 // the user fallback isn't exercised here, so a null user is fine.
@@ -28,6 +27,7 @@ function makeSummary(id: string): UpstreamSummary {
     tool_count: 0,
     refreshing: false,
     starting: false,
+    stopped: false,
     url: "http://localhost/mcp",
     disconnect_reason: null,
   };

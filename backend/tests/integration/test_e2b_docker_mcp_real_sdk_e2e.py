@@ -91,9 +91,9 @@ async def test_docker_mcp_initialize_and_list_tools() -> None:
     bridged stdio streams, ``tools/list``, close cleanly.
 
     The sandbox boot is slower than node/python because:
-    1. ``dockerd`` must start and pass the TCP ready probe before the
-       sandbox is reported ready (handled by the template's
-       ``set_start_cmd``).
+    1. ``dockerd`` must be up and answering before the MCP command
+       runs (handled after boot by
+       ``E2BSandboxService._start_docker_daemon``).
     2. ``docker run`` cold-pulls ``mcp/everything`` from Docker Hub on
        first use inside a fresh sandbox.
 

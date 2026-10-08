@@ -56,11 +56,13 @@ class SandboxPersistedRef(BaseModel):
       ``sandbox_id`` ``None``.
     - **Pause-in-flight**: both populated transiently while the pause
       verb returns and the live ref is being cleared.
+    - **Volume only**: both ``None``, ``metadata`` keeps the persistent
+      volume id (a stopped upstream with a persistent disk).
 
-    ``mcpolis_instance`` carries the backend-process UUID minted at
-    startup so reconcilers can distinguish "my sandboxes" from another
-    instance's (multi-instance / blue-green safety, see plan §
-    Resilience).
+    ``mcpolis_instance`` carries the instance id of the writer: one value
+    per database (:meth:`SandboxPersistenceRepository.get_or_create_instance_id`),
+    so the boot reconciler can tell this environment's sandboxes from
+    another environment's sharing the E2B account.
 
     Phase E note: every field is required at construction. Domain
     nullability stays where lifecycle states allow (``sandbox_id``,
@@ -139,6 +141,19 @@ class SandboxPersistenceRepository(Protocol):
     async def list_for_org(self, *, org_id: str) -> list[SandboxPersistedRef]:
         """Return every ref for a single org. Used by org-scoped
         reconciliation paths."""
+        ...
+
+    async def get_or_create_instance_id(self) -> str:
+        """Return this store's sandbox instance id, minting it on first use.
+
+        Sandboxes are tagged with it (``mcpolis_instance``) so the boot
+        reconciler can tell "sandboxes whose refs live in this store"
+        from another environment's sharing the same E2B account. It
+        must outlive the process: a per-process id would hide every
+        orphan a previous process left behind. Durable stores mint it
+        once and return the same value forever; the in-memory store
+        returns one value for its own lifetime.
+        """
         ...
 
     async def list_all_unscoped(self) -> list[SandboxPersistedRef]:

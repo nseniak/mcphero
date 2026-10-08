@@ -2,12 +2,14 @@ import { useUpstreamActions } from "../hooks/useUpstreamActions";
 import { useTranslation, type TranslationKey } from "../i18n/index";
 import {
   Loader2,
+  LogOut,
   Unplug,
   Square,
   KeyRound,
   Play,
   PlugZap,
 } from "lucide-react";
+import { ConfirmDialog, useConfirm } from "./ConfirmDialog";
 import { ActionButton } from "./ui/action-button";
 
 interface UpstreamActionButtonsProps {
@@ -25,6 +27,11 @@ interface UpstreamActionButtonsProps {
    *  (the HTTP response returns in ms; the real connect can take 1–60s
    *  for a sandbox cold pull). */
   starting?: boolean;
+  /** An admin's Stop holds (``UpstreamSummary.stopped``). */
+  stopped?: boolean;
+  /** Admin whose saved sign-in serves an OAuth MCP, or, while stopped,
+   *  the one Start reuses (``UpstreamSummary.slot_owner``). */
+  slotOwner?: string | null;
 
   reload: () => void;
   /** Forwarded to ``useUpstreamActions``. Fires synchronously on
@@ -50,12 +57,20 @@ export function UpstreamActionButtons({
   transport,
   authMode,
   starting,
+  stopped,
+  slotOwner,
   reload,
   onOptimisticReset,
 }: UpstreamActionButtonsProps) {
   const { t } = useTranslation();
-  const { busyAction, handleConnect, handleDisconnect, handleReconnect } =
-    useUpstreamActions({ id, reload, onOptimisticReset });
+  const {
+    busyAction,
+    handleConnect,
+    handleDisconnect,
+    handleReconnect,
+    handleSignOut,
+  } = useUpstreamActions({ id, reload, onOptimisticReset });
+  const { confirm, dialogProps } = useConfirm();
 
   const isOAuth = authMode === "admin_oauth" || authMode === "per_user_oauth";
   // Server-driven "Starting…": after the fire-and-forget reconnect
@@ -68,17 +83,92 @@ export function UpstreamActionButtons({
   const serverStarting = !ready && !!starting;
   const isBusy = busyAction !== null || serverStarting;
 
-  // Not Ready: OAuth modes ⇒ Authenticate; service_account ⇒
-  // Connect/Start (no OAuth flow needed, just open the session).
-  if (!ready) {
+  const stop = stopLabel(transport);
+  const stopButton = (
+    <ActionButton variant="warning" onClick={handleDisconnect} disabled={isBusy}>
+      {busyAction === "disconnect" ? <Loader2 size={12} className="animate-spin" /> : transport === "stdio" ? <Square size={12} /> : <Unplug size={12} />}
+      {busyAction === "disconnect" ? t(stop.busy) : t(stop.label)}
+    </ActionButton>
+  );
+
+  // Remove sign-in deletes the admin sign-in that serves the MCP,
+  // whoever holds it, so another admin can sign in with Authenticate
+  // (the take-over: Disconnect keeps every sign-in). Not "Sign out":
+  // the page header already has that, for leaving MCP Hero. The dialog
+  // names the admin, and the request carries that name, so a sign-in
+  // that changed meanwhile is never the one removed.
+  const onRemoveSignIn = async () => {
+    if (!slotOwner) return;
+    const ok = await confirm({
+      title: t("upstreams.removeSignIn"),
+      message: t("upstreams.confirmSignOutOwner", { email: slotOwner }),
+      confirmLabel: t("upstreams.removeSignIn"),
+      cancelLabel: t("common.cancel"),
+      destructive: true,
+    });
+    if (!ok) return;
+    const error = await handleSignOut(slotOwner);
+    if (error) {
+      await confirm({
+        title: t("upstreams.removeSignIn"),
+        message: error,
+        confirmLabel: t("common.close"),
+        cancelLabel: "",
+      });
+    }
+  };
+  const removeSignInButton = isOAuth && slotOwner ? (
+    <ActionButton onClick={onRemoveSignIn} disabled={isBusy}>
+      {busyAction === "signout" ? <Loader2 size={12} className="animate-spin" /> : <LogOut size={12} />}
+      {busyAction === "signout" ? t("upstreams.removingSignIn") : t("upstreams.removeSignIn")}
+    </ActionButton>
+  ) : null;
+
+  return (
+    <>
+      {renderMain()}
+      {removeSignInButton}
+      <ConfirmDialog {...dialogProps} />
+    </>
+  );
+
+  function renderMain() {
+    // Ready: always Disconnect, regardless of who owns the slot. It
+    // closes every live session and keeps every saved sign-in, so the
+    // Connect that appears next brings the MCP back with no sign-in.
+    // The slot owner's identity is surfaced inside the Status pill
+    // ("Ready, by <email>").
+    if (ready) return stopButton;
     if (isOAuth) {
-      return (
+      // Stopped with the admin sign-in kept: Start reuses it.
+      if (stopped && slotOwner) {
+        return (
+          <ActionButton variant="success" onClick={handleConnect} disabled={isBusy}>
+            {busyAction === "connect" ? <Loader2 size={12} className="animate-spin" /> : <PlugZap size={12} />}
+            {busyAction === "connect" ? t("common.connecting") : t("common.connect")}
+          </ActionButton>
+        );
+      }
+      const authenticate = (
         <ActionButton variant="success" onClick={handleConnect} disabled={isBusy}>
           {busyAction === "connect" ? <Loader2 size={12} className="animate-spin" /> : <KeyRound size={12} />}
           {busyAction === "connect" ? t("common.connecting") : t("common.authenticate")}
         </ActionButton>
       );
+      // Running without an admin sign-in (members' own sign-ins may
+      // still serve calls): it can still be stopped.
+      if (!stopped) {
+        return (
+          <>
+            {authenticate}
+            {stopButton}
+          </>
+        );
+      }
+      return authenticate;
     }
+    // service_account ⇒ Connect/Start (no OAuth flow needed, just open
+    // the session).
     const start = startLabel(transport);
     const StartIcon = start.icon;
     const showStarting = busyAction === "reconnect" || serverStarting;
@@ -89,19 +179,4 @@ export function UpstreamActionButtons({
       </ActionButton>
     );
   }
-
-  // Ready: always Disconnect, regardless of who owns the slot.
-  // For OAuth modes the admin-tab disconnect endpoint clears the
-  // slot owner's row (whoever they are) — so a second admin who
-  // wants to claim the slot just clicks Disconnect, then the
-  // Authenticate button that appears next. The slot owner's
-  // identity is surfaced inside the Status pill ("Connected by
-  // <email>") rather than a special take-over button here.
-  const stop = stopLabel(transport);
-  return (
-    <ActionButton variant="warning" onClick={handleDisconnect} disabled={isBusy}>
-      {busyAction === "disconnect" ? <Loader2 size={12} className="animate-spin" /> : transport === "stdio" ? <Square size={12} /> : <Unplug size={12} />}
-      {busyAction === "disconnect" ? t(stop.busy) : t(stop.label)}
-    </ActionButton>
-  );
 }

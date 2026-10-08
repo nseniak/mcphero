@@ -11,29 +11,53 @@ so it must be run-on-demand, not in CI. The output table at the end
 gives operator-friendly per-scenario timing and a single PASS/FAIL
 banner.
 
-Coverage at V1 (matches the conversation in 2026-05-01):
+Coverage (the 20 scenarios, in run order):
 
-* ``smoke_npx`` — happy path with ``server-everything`` via npx.
-* ``smoke_uvx`` — happy path with a Python MCP via uvx (cold-install
-  timing is meaningfully different from npx and exposes a different
-  template).
-* ``reattach_after_idle_pause`` — **the headline regression.** Opens
-  a session with ``MCPOLIS_E2B_IDLE_PAUSE_SECONDS=30``, waits past
-  the window, makes a tool call, and asserts both that the call
-  succeeds AND that ``sandbox.e2b.reattach.ok`` was emitted (the
-  bug fixed in this PR: streaming RPC severed at pause, never
-  reattached without the new code path).
-* ``bad_command`` — wrong npm package name → ``initialize`` times
-  out → status reflects an error rather than "Connected".
-* ``concurrent_calls`` — three parallel ``call_tool`` requests on a
-  single session, verifies the JSON-RPC id demux delivers responses
-  to the right caller.
+* ``bad_api_key_auth_failed`` — an invalid key raises ``E2BAuthError``
+  and ``map_exit`` reads it as ``AUTH_FAILED``.
+* ``smoke_npx`` / ``smoke_uvx`` — happy path with ``server-everything``
+  via npx, and a Python MCP via uvx (another template, another
+  cold-install timing).
 * ``status_reflects_connection`` — ``client_manager.is_connected``
-  flips True→False as the session opens/closes (this is the same
+  flips False→True→False as the session opens and closes (the
   predicate the admin upstreams route renders for the UI).
 * ``sse_log_stream`` — ``LogBuffer.subscribe`` (the async iterator
-  the ``/logs/stream`` SSE endpoint forwards verbatim) emits the
-  npm/uvx cold-install chatter as it arrives.
+  the ``/logs/stream`` SSE endpoint forwards verbatim) replays and
+  fans out the npm/uvx cold-install chatter.
+* ``concurrent_calls`` — three parallel ``call_tool`` requests on a
+  single session; the JSON-RPC id demux answers each caller.
+* ``subprocess_crashes_mid_session`` / ``bad_command`` — a process that
+  dies, or a package that does not exist, fails ``initialize`` cleanly
+  instead of hanging or reporting "Connected".
+* ``mcpolis_driven_pause_resume`` — explicit ``service.pause`` then a
+  reopen with ``resume_from``.
+* ``wake_after_idle_pause`` — **the headline regression.** After E2B
+  auto-pauses an idle sandbox (``MCPOLIS_E2B_IDLE_PAUSE_SECONDS=30``),
+  the next tool call runs on a fresh MCP process in the SAME sandbox.
+* ``wake_via_ucm`` — the same wake through ``UpstreamClientManager``
+  and the session lookup the gateway's tool router uses.
+* ``wake_during_concurrent_calls`` — three calls arriving together as
+  the first traffic after a pause share one rebuild and all get
+  answers.
+* ``restart_with_reuse`` / ``restart_with_fresh`` — a restart reuses
+  the persisted sandbox; the fresh-sandboxes override wipes it.
+* ``restart_skips_wakeup`` / ``restart_skips_never_ready_upstream`` — a
+  boot wakes no paused sandbox, and none whose MCP never got ready.
+* ``restart_recovers_from_killed_sandbox`` /
+  ``restart_recovers_from_dead_mcp_process`` /
+  ``restart_reattaches_through_stale_config`` — the first call after a
+  boot when the sandbox is gone (fresh sandbox), when only its MCP
+  process is gone (same sandbox, fresh process), and when the config
+  changed meanwhile.
+* ``double_wake`` — two pause/wake cycles in a row; the second pause
+  proves the idle window is re-applied after a resume.
+
+The wake scenarios check the design in place since 2026-09-20 (CLAUDE.md,
+"Waking a paused sandbox never reuses its MCP process"): a pause ends the
+session, and the rebuild keeps the sandbox but starts a new MCP process.
+They replace the ``reattach_*`` / ``double_reattach`` scenarios, which
+expected the session to survive the pause by reattaching to the frozen
+process (``sandbox.e2b.reattach.ok``), the design retired that day.
 
 Simplifications worth knowing:
 
@@ -53,11 +77,14 @@ Run with::
     export MCPOLIS_E2B_API_KEY=...
     bash backend/tests/integration/run-e2b-real-e2e.sh
 
-Total wall clock: ~3-5 min; estimated cost: ~$0.05 of E2B compute.
+Wall clock: several minutes, most of it idle time (five scenarios each
+wait at least 40 s for E2B to pause a sandbox, ``double_wake`` twice);
+estimated cost: ~$0.05 of E2B compute.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sys
 import time
@@ -72,9 +99,10 @@ from unittest.mock import AsyncMock, MagicMock
 import structlog
 from structlog.typing import EventDict, WrappedLogger
 
-# Make ``src`` importable when run directly (``python integration/e2b_real_e2e.py``).
+# Make ``src`` importable when run directly, ahead of an editable install
+# that may point at another checkout (``backend/tests/integration`` → ``backend/src``).
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SRC = os.path.normpath(os.path.join(_HERE, "..", "src"))
+_SRC = os.path.normpath(os.path.join(_HERE, "..", "..", "src"))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 _TESTS = os.path.normpath(os.path.join(_HERE, "..", "tests"))
@@ -82,6 +110,7 @@ if _TESTS not in sys.path:
     sys.path.insert(0, _TESTS)
 
 from mcp.client.session import ClientSession  # noqa: E402
+from mcp.types import CallToolResult  # noqa: E402
 
 from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (  # noqa: E402
     InMemorySandboxPersistenceRepository,
@@ -103,8 +132,17 @@ from mcpolis.domain.model.upstream import (  # noqa: E402
     TransportType,
     UpstreamDefinition,
 )
+# Imported as a module: several functions below import
+# ``SandboxPersistedRef`` locally, and a module-level name would make
+# pyright report those imports as unused.
+from mcpolis.domain.ports import (  # noqa: E402
+    sandbox_persistence_repository as persistence_port,
+)
 from mcpolis.domain.services.sandbox_resolver import SandboxResolver  # noqa: E402
 from mcpolis.domain.services.sandbox_service import SandboxResources  # noqa: E402
+from mcpolis.domain.services.upstream_connection_service import (  # noqa: E402
+    acquire_upstream_session,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -112,14 +150,17 @@ from mcpolis.domain.services.sandbox_service import SandboxResources  # noqa: E4
 
 API_KEY = os.environ.get("MCPOLIS_E2B_API_KEY") or os.environ.get("E2B_API_KEY")
 RUN_ID = uuid.uuid4().hex[:8]
-# Idle-pause override. Short enough that the reattach scenario takes
+# Idle-pause override. Short enough that the wake scenarios take
 # seconds, not the production-default 5 min. Anything below ~10s
 # risks the box snapshotting mid-init on a slow cold-pull.
 IDLE_PAUSE_SECONDS = 30
-# Buffer past the idle window. The pause timer re-arms the window on
-# traffic, at most once per refresh gap, so the deadline lands up to
+# How long the wake scenarios (and ``restart_skips_wakeup``) send
+# nothing so E2B pauses the sandbox. The pause timer re-arms the window
+# on traffic, at most once per refresh gap, so the deadline lands up to
 # one gap after the last traffic; empirically auto-pause fires within a
-# few seconds of the deadline; +5s gives consistent reproc.
+# few seconds of the deadline; +5s gives consistent reproduction. The
+# name predates the wake design (2026-09-20) and matches the pytest
+# integration suite's.
 REATTACH_WAIT_SECONDS = IDLE_PAUSE_SECONDS + MIN_REFRESH_GAP_SECONDS + 5
 # Bound on how long ``initialize`` may take. Cold npm/uvx installs
 # inside a fresh sandbox can stretch — the existing real-SDK suite
@@ -129,9 +170,9 @@ TOOL_CALL_TIMEOUT = 30.0
 
 
 # ---------------------------------------------------------------------------
-# Structlog: route the service's logs into a buffer so the reattach
-# assertion can grep for ``sandbox.e2b.reattach.ok`` without parsing
-# stderr text.
+# Structlog: route the service's logs into a buffer so the scenarios can
+# assert on events (``sandbox.e2b.stream_dead``, ``sandbox.e2b.reconnect.ok``
+# ...) without parsing stderr text.
 # ---------------------------------------------------------------------------
 
 
@@ -140,7 +181,7 @@ class _LogCapture:
 
     Implemented as a structlog processor so it sees the same event
     dict the production logger does — including the hand-typed event
-    keys we assert on (``sandbox.e2b.reattach.ok`` etc.). Keeping a
+    keys we assert on (``sandbox.e2b.reconnect.ok`` etc.). Keeping a
     list rather than a queue lets per-scenario assertions slice by
     timestamp.
     """
@@ -173,9 +214,9 @@ class _LogCapture:
         self, name: str, *, since_ns: int | None = None,
     ) -> list[dict[str, Any]]:
         """Return all matching events captured at or after
-        ``since_ns``. Used by reattach scenarios to extract per-event
-        timing fields (e.g. ``reattach_duration_ms``) into the
-        scenario's timings table."""
+        ``since_ns``. Used by the wake and restart scenarios to read
+        event fields (``sandbox_id``, ``pid``, ``total_duration_ms``)
+        into their assertions and timings table."""
         out: list[dict[str, Any]] = []
         for ev in self.events:
             if ev.get("event") != name:
@@ -185,6 +226,22 @@ class _LogCapture:
                 if not (isinstance(ts, int) and ts >= since_ns):
                     continue
             out.append(ev)
+        return out
+
+    def event_names(self, *, prefix: str, since_ns: int) -> list[str]:
+        """Names of the events captured at or after ``since_ns`` that
+        start with ``prefix``, in the order they were logged."""
+        out: list[str] = []
+        for ev in self.events:
+            name = ev.get("event")
+            ts = ev.get("_recorded_ns")
+            if (
+                isinstance(name, str)
+                and name.startswith(prefix)
+                and isinstance(ts, int)
+                and ts >= since_ns
+            ):
+                out.append(name)
         return out
 
 
@@ -218,12 +275,27 @@ def _resources() -> SandboxResources:
     return SandboxResources(cpu_vcpus=1.0, memory_mb=1024, disk_gb=0)
 
 
-def _make_service(*, on_timeout_seconds: int = IDLE_PAUSE_SECONDS) -> E2BSandboxService:
+def _make_service(
+    *,
+    on_timeout_seconds: int = IDLE_PAUSE_SECONDS,
+    persistence: persistence_port.SandboxPersistenceRepository | None = None,
+) -> E2BSandboxService:
+    """The E2B service under test.
+
+    With ``persistence`` it is wired the way production runs it
+    (``MCPOLIS_E2B_REUSE_SANDBOXES_ON_RESTART`` defaults to true): the
+    live sandbox is recorded, so a reopen reuses it instead of creating
+    a new one. That reuse is what keeps a wake cheap, so the wake
+    scenarios need it. Without ``persistence`` (the default) every
+    session creates its own sandbox and kills it on close.
+    """
     assert API_KEY, "API_KEY must be checked before calling _make_service()"
     return E2BSandboxService(
         RealE2BClient(api_key=API_KEY),
         mcpolis_instance=f"e2e-{RUN_ID}",
         on_timeout_seconds=on_timeout_seconds,
+        persistence=persistence,
+        reuse_sandboxes_on_restart=persistence is not None,
     )
 
 
@@ -462,214 +534,581 @@ async def smoke_uvx() -> ScenarioResult:
         )
 
 
-async def reattach_after_idle_pause() -> ScenarioResult:
-    """**Headline regression.** The bug fixed in this PR: after E2B
-    auto-pauses the sandbox, the SDK's streaming RPC for stdout is
-    severed; ``send_stdin`` on the next tool call would succeed and
-    the response would never arrive. Fixed by detecting the dead
-    stream and reattaching via ``commands.connect(pid)``. This
-    scenario sleeps past the idle window, then asserts both that the
-    tool call succeeds AND that ``sandbox.e2b.reattach.ok`` fired.
+# ---------------------------------------------------------------------------
+# Wake helpers. A wake is the first traffic after E2B paused an idle
+# sandbox. Since 2026-09-20 (CLAUDE.md, "Waking a paused sandbox never
+# reuses its MCP process") the pause ENDS the session, and the rebuild
+# keeps the sandbox but replaces the MCP process inside it.
+# ---------------------------------------------------------------------------
+
+# Events that tell a wake's story, for the results table.
+_WAKE_EVENTS: frozenset[str] = frozenset({
+    "sandbox.e2b.stream_dead",
+    "sandbox.e2b.wake.process_retired",
+    "sandbox.e2b.pause_timer.sandbox_gone",
+    "upstream.client.shared_session.dead_reconnecting",
+    "sandbox.e2b.preserve_for_heal",
+    "sandbox.e2b.create",
+    "upstream.client.lazy_connect.success",
+    "upstream.client.lazy_connect.failed",
+})
+
+_NO_PAUSE_ERROR = (
+    f"no sandbox.e2b.stream_dead (cause 'severed') within "
+    f"{REATTACH_WAIT_SECONDS:.0f}s of idle: either E2B did not pause the "
+    f"sandbox in the window, or it paused without severing the output "
+    f"stream, the case the session's watcher cannot see (LIMIT note at "
+    f"watch_stream in the E2B service)"
+)
+
+
+async def _idle_past_pause_window(label: str) -> int:
+    """Send nothing for ``REATTACH_WAIT_SECONDS``, so E2B pauses the
+    sandbox. Returns the log cursor taken just before the idle window,
+    for :func:`_pause_seen_since`."""
+    cursor_ns = time.monotonic_ns()
+    print(
+        f"  [{label}] idle {REATTACH_WAIT_SECONDS:.0f}s so E2B pauses "
+        f"the sandbox...",
+        flush=True,
+    )
+    await asyncio.sleep(REATTACH_WAIT_SECONDS)
+    return cursor_ns
+
+
+def _pause_seen_since(since_ns: int) -> dict[str, Any] | None:
+    """The watcher's record of a pause since ``since_ns``, or ``None``.
+
+    E2B severs a process's output stream when it pauses the sandbox.
+    The session's watcher logs ``sandbox.e2b.stream_dead`` with cause
+    ``severed`` at that moment and marks the transport dead, before any
+    request arrives. (A close logs cause ``closed``.) Read it over an
+    idle window in which nothing touched the session, so a severed
+    stream can only mean the pause.
     """
-    service = _make_service(on_timeout_seconds=IDLE_PAUSE_SECONDS)
+    for event in _log_capture.find_events(
+        "sandbox.e2b.stream_dead", since_ns=since_ns,
+    ):
+        if event.get("cause") == "severed":
+            return event
+    return None
+
+
+def _ms_since_event(event: dict[str, Any], until_ns: int) -> float | None:
+    """Milliseconds from ``event`` to ``until_ns``, for the timings."""
+    recorded = event.get("_recorded_ns")
+    if not isinstance(recorded, int):
+        return None
+    return (until_ns - recorded) / 1_000_000
+
+
+def _wake_trace(since_ns: int) -> str:
+    """The wake's events since ``since_ns``, in order, repeats folded:
+    what the watcher, the client manager and the service did. A stream
+    death carries its cause: ``severed`` at a pause, ``closed`` at a
+    session close."""
+    names: list[str] = []
+    for event in _log_capture.events:
+        name = event.get("event")
+        recorded = event.get("_recorded_ns")
+        if not (
+            isinstance(name, str)
+            and isinstance(recorded, int)
+            and recorded >= since_ns
+            and (
+                name in _WAKE_EVENTS
+                or name.startswith("sandbox.e2b.reconnect.")
+            )
+        ):
+            continue
+        short = name.removeprefix("sandbox.e2b.").removeprefix(
+            "upstream.client.",
+        )
+        if name == "sandbox.e2b.stream_dead":
+            short = f"{short}({event.get('cause')})"
+        names.append(short)
+    folded: list[str] = []
+    count = 0
+    for index, name in enumerate(names):
+        count += 1
+        if index + 1 < len(names) and names[index + 1] == name:
+            continue
+        folded.append(f"{name} x{count}" if count > 1 else name)
+        count = 0
+    return ", ".join(folded) or "none"
+
+
+def _kept_sandbox_problem(
+    *,
+    since_ns: int,
+    sandbox_id: str | None,
+    old_pid: int | None,
+    ref: persistence_port.SandboxPersistedRef | None,
+) -> str | None:
+    """Why the reopen since ``since_ns`` did NOT keep ``sandbox_id`` and
+    start a new MCP process in it, or ``None`` when it did.
+
+    Every reopen of a usable sandbox (a wake, a restart reuse) must log
+    exactly one ``sandbox.e2b.reconnect.ok`` on the same sandbox, save
+    the new pid, and create no sandbox: a fresh one re-downloads the
+    MCP's package (7-22 s in production, against ~3 s to respawn).
+    """
+    if sandbox_id is None:
+        return "no sandbox was recorded before the reopen"
+    reconnect_events = ", ".join(
+        _log_capture.event_names(
+            prefix="sandbox.e2b.reconnect.", since_ns=since_ns,
+        ),
+    ) or "none"
+    creates = _log_capture.find_events("sandbox.e2b.create", since_ns=since_ns)
+    if creates:
+        return (
+            f"a fresh sandbox was created instead of reusing {sandbox_id} "
+            f"(reconnect events: {reconnect_events})"
+        )
+    reconnects = _log_capture.find_events(
+        "sandbox.e2b.reconnect.ok", since_ns=since_ns,
+    )
+    if len(reconnects) != 1:
+        return (
+            f"expected one sandbox.e2b.reconnect.ok, got {len(reconnects)} "
+            f"(reconnect events: {reconnect_events})"
+        )
+    reconnect = reconnects[0]
+    if reconnect.get("sandbox_id") != sandbox_id:
+        return (
+            f"the reopen reconnected to {reconnect.get('sandbox_id')!r}, "
+            f"expected {sandbox_id!r}"
+        )
+    if ref is None or ref.sandbox_id != sandbox_id:
+        return (
+            f"the saved record points at "
+            f"{ref.sandbox_id if ref is not None else None!r}, expected "
+            f"{sandbox_id!r}"
+        )
+    if ref.pid is None or ref.pid == old_pid:
+        return (
+            f"the MCP process was not replaced: the saved pid is still "
+            f"{ref.pid}. A process that went through a pause holds pooled "
+            f"connections that were cut while it slept; reusing it is the "
+            f"bug the wake fix removed"
+        )
+    if reconnect.get("pid") != ref.pid:
+        return (
+            f"sandbox.e2b.reconnect.ok names pid {reconnect.get('pid')}, "
+            f"the saved record pid {ref.pid}"
+        )
+    return None
+
+
+def _reopen_warnings(since_ns: int) -> list[str]:
+    """Notes for the reopen's non-fatal problems: the idle window not
+    re-applied at once (the pause timer re-arms it on the next call
+    anyway), or the old MCP process not killed (it stays resident in
+    the sandbox)."""
+    return [
+        f"warning: {name} (non-fatal)"
+        for name in _log_capture.event_names(
+            prefix="sandbox.e2b.reconnect.", since_ns=since_ns,
+        )
+        if name in (
+            "sandbox.e2b.reconnect.set_timeout_failed",
+            "sandbox.e2b.reconnect.kill_stale_process_failed",
+        )
+    ]
+
+
+async def _idle_until_paused(
+    manager: UpstreamClientManager, upstream: UpstreamDefinition, label: str,
+) -> tuple[int, str | None]:
+    """Idle past the pause window, then check what the gateway relies on
+    for the next call: the watcher saw the pause and marked the shared
+    session dead BEFORE any request, so the next call is rebuilt onto a
+    fresh process instead of being written to the frozen one, and the
+    dashboard still shows the MCP as Ready.
+
+    Returns the idle cursor and the problem found, if any.
+    """
+    state = manager.get_state(upstream.id)
+    task = state.shared_task if state is not None else None
+    if task is None or not task.is_transport_alive():
+        return time.monotonic_ns(), "no live shared session before idling"
+    idle_ns = await _idle_past_pause_window(label)
+    if _pause_seen_since(idle_ns) is None:
+        return idle_ns, _NO_PAUSE_ERROR
+    if task.is_transport_alive():
+        return idle_ns, (
+            "the watcher saw the pause but the shared session still reads "
+            "alive: the next call would be written to the frozen process"
+        )
+    if not manager.is_connected(upstream.id):
+        return idle_ns, (
+            "is_connected turned False across the pause: the dashboard "
+            "would show an idle MCP as not Ready"
+        )
+    return idle_ns, None
+
+
+async def _echo_through_gateway(
+    manager: UpstreamClientManager,
+    upstream: UpstreamDefinition,
+    payload: str,
+) -> tuple[ClientSession, str]:
+    """One ``echo`` call made the way the gateway's tool router makes it:
+    the session comes from ``acquire_upstream_session``, which reuses a
+    live session and replaces a dead one before anything is written to
+    it. Returns the session used and the answer's text."""
+    session = await acquire_upstream_session(
+        org_id=f"acme-{RUN_ID}",
+        upstream=upstream,
+        effective_user="",
+        connection_store=None,
+        client_manager=manager,
+        server_url="http://localhost:8080",
+    )
+    result = await session.call_tool("echo", {"message": payload})
+    return session, _result_text(result)
+
+
+def _result_text(result: CallToolResult) -> str:
+    return " ".join(
+        getattr(c, "text", "")
+        for c in result.content
+        if getattr(c, "type", None) == "text"
+    )
+
+
+def _error_text(exc: BaseException) -> str:
+    """One line naming an error and up to two causes. A TaskGroup's own
+    message only counts its errors, so the first one inside is named
+    instead (what hid ``ClosedResourceError`` behind "unhandled errors
+    in a TaskGroup (1 sub-exception)" in the old reattach scenarios)."""
+    parts: list[str] = []
+    current: BaseException | None = exc
+    while current is not None and len(parts) < 3:
+        parts.append(f"{type(current).__name__}: {current}")
+        if isinstance(current, BaseExceptionGroup) and current.exceptions:
+            current = current.exceptions[0]
+        else:
+            current = current.__cause__
+    return " <- ".join(parts)
+
+
+def _failed(
+    name: str, timings: dict[str, float], error: str,
+) -> ScenarioResult:
+    return ScenarioResult(
+        name=name, passed=False, timings_ms=timings, error=error,
+    )
+
+
+async def wake_after_idle_pause() -> ScenarioResult:
+    """**Headline regression.** After E2B auto-pauses an idle sandbox,
+    the next tool call must run on a FRESH MCP process in the SAME
+    sandbox.
+
+    The contract since 2026-09-20 (CLAUDE.md, "Waking a paused sandbox
+    never reuses its MCP process"):
+
+    1. The pause severs the process's output stream. The session's
+       watcher sees it during the idle window, logs
+       ``sandbox.e2b.stream_dead`` (cause ``severed``) and marks the
+       transport dead before any request. The session is over by
+       design: a process frozen in a snapshot writes into the TCP
+       connections that were cut while it slept (Sentry
+       MCPOLIS-BACKEND-16).
+    2. The rebuild reopens the SAME sandbox: ``connect_sandbox`` wakes
+       it, ``set_timeout`` re-applies the idle window, the old pid is
+       killed and a fresh process starts: one
+       ``sandbox.e2b.reconnect.ok`` with the same ``sandbox_id`` and a
+       new ``pid``, and no ``sandbox.e2b.create``.
+    3. The first tool call on the fresh process succeeds.
+
+    Drives the service directly, doing by hand what the client manager
+    does before it reopens (``preserve_sessions_for_upstream``, close,
+    open again); ``wake_via_ucm`` drives the manager itself.
+
+    Replaces ``reattach_after_idle_pause``, which made the call on the
+    SAME session and expected ``sandbox.e2b.reattach.ok`` from a
+    reattach to the frozen pid. That call now fails by design: the MCP
+    client closed the session when the watcher closed its read side, so
+    it raises ``ClosedResourceError`` and nothing reaches the sandbox.
+    """
+    name = "wake_after_idle_pause"
+    persistence = InMemorySandboxPersistenceRepository()
+    service = _make_service(persistence=persistence)
+    cleanup_client = RealE2BClient(api_key=cast(str, API_KEY))
     upstream = _upstream(
-        f"reattach-{RUN_ID}",
+        f"wake-{RUN_ID}",
         command="npx",
         args=["-y", "@modelcontextprotocol/server-everything"],
     )
+    org_id = f"acme-{RUN_ID}"
     timings: dict[str, float] = {}
     errlog = LogBuffer()
-    session_id = f"e2e-{RUN_ID}-reattach"
+    sandbox_id: str | None = None
+    old_pid: int | None = None
+    ref_after: persistence_port.SandboxPersistedRef | None = None
+    idle_ns = time.monotonic_ns()
     try:
+        # ---- Session 1: the one the pause ends. ----
         async with service.session(
-            session_id=session_id,
-            org_id=f"acme-{RUN_ID}",
+            session_id=f"e2e-{RUN_ID}-wake-1",
+            org_id=org_id,
             upstream=upstream,
             resources=_resources(),
             denylist=(),
             errlog=cast(StringIO, errlog),
-        ) as session:
-            read_stream, write_stream = session.read_stream, session.write_stream
-            session = ClientSession(read_stream, write_stream)
-            async with session:
+        ) as sandbox_session:
+            client = ClientSession(
+                sandbox_session.read_stream, sandbox_session.write_stream,
+            )
+            async with client:
                 init_t = time.monotonic()
-                init_result = await asyncio.wait_for(
-                    session.initialize(), timeout=INITIALIZE_TIMEOUT,
+                await asyncio.wait_for(
+                    client.initialize(), timeout=INITIALIZE_TIMEOUT,
                 )
                 timings["initialize_ms"] = (time.monotonic() - init_t) * 1000
-                tools = await session.list_tools()
-
-                # Sleep past the idle window — E2B auto-pauses, the
-                # SDK's events stream behind run_command dies. Watch
-                # task in service.py sets stream_dead.
-                wait_start_ns = time.monotonic_ns()
-                print(
-                    f"  [reattach] sleeping {REATTACH_WAIT_SECONDS}s "
-                    f"to provoke E2B auto-pause...",
-                    flush=True,
+                ref = await persistence.get(
+                    org_id=org_id, upstream_id=upstream.id,
                 )
-                await asyncio.sleep(REATTACH_WAIT_SECONDS)
-
-                # First call after the pause. With the fix in place,
-                # the pump notices stream_dead and reattaches before
-                # send_stdin. Without the fix, this hangs forever
-                # (which is why we have a TOOL_CALL_TIMEOUT below).
-                callable_tool = next(
-                    (
-                        t for t in tools.tools
-                        if not t.inputSchema.get("required")
-                    ),
-                    None,
-                )
-                if callable_tool is None:
-                    return ScenarioResult(
-                        name="reattach_after_idle_pause", passed=False,
-                        timings_ms=timings, error="no zero-arg tool found",
+                if ref is None or ref.sandbox_id is None or ref.pid is None:
+                    return _failed(
+                        name, timings,
+                        "the session saved no sandbox id and pid",
                     )
-                # Generous timeout: ``commands.connect`` may itself
-                # trigger the resume; resume can take several seconds.
-                call_t = time.monotonic()
-                await asyncio.wait_for(
-                    session.call_tool(callable_tool.name, {}),
-                    timeout=TOOL_CALL_TIMEOUT * 2,
+                sandbox_id, old_pid = ref.sandbox_id, ref.pid
+                idle_ns = await _idle_past_pause_window(name)
+                if _pause_seen_since(idle_ns) is None:
+                    return _failed(name, timings, _NO_PAUSE_ERROR)
+                transport_failed = sandbox_session.transport_failed
+                if transport_failed is None or not transport_failed.is_set():
+                    return _failed(
+                        name, timings,
+                        "the pause did not mark the session's transport "
+                        "dead: the next request would be written to the "
+                        "frozen process",
+                    )
+            # What the client manager does before it reopens: keep the
+            # sandbox when this session closes.
+            kept = service.preserve_sessions_for_upstream(
+                org_id=org_id, upstream_id=upstream.id,
+            )
+            if kept != 1:
+                return _failed(
+                    name, timings,
+                    f"preserve_sessions_for_upstream marked {kept} sessions, "
+                    f"expected 1: the close would kill the sandbox",
                 )
-                timings["call_tool_post_pause_ms"] = (
+
+        # ---- Session 2: the rebuild, on the same sandbox. ----
+        wake_ns = time.monotonic_ns()
+        open_t = time.monotonic()
+        async with service.session(
+            session_id=f"e2e-{RUN_ID}-wake-2",
+            org_id=org_id,
+            upstream=upstream,
+            resources=_resources(),
+            denylist=(),
+            errlog=cast(StringIO, errlog),
+        ) as sandbox_session:
+            timings["wake_open_ms"] = (time.monotonic() - open_t) * 1000
+            client = ClientSession(
+                sandbox_session.read_stream, sandbox_session.write_stream,
+            )
+            async with client:
+                init_t = time.monotonic()
+                await asyncio.wait_for(
+                    client.initialize(), timeout=INITIALIZE_TIMEOUT,
+                )
+                timings["wake_initialize_ms"] = (
+                    (time.monotonic() - init_t) * 1000
+                )
+                payload = f"after-wake-{RUN_ID}"
+                call_t = time.monotonic()
+                result = await asyncio.wait_for(
+                    client.call_tool("echo", {"message": payload}),
+                    timeout=TOOL_CALL_TIMEOUT,
+                )
+                timings["first_call_after_wake_ms"] = (
                     (time.monotonic() - call_t) * 1000
                 )
-
-        # Did the reattach actually fire? If the test passed without
-        # ``reattach.ok``, the box never auto-paused and the scenario
-        # isn't actually exercising the bug — flag it.
-        reattach_events = _log_capture.find_events(
-            "sandbox.e2b.reattach.ok", since_ns=wait_start_ns,
-        )
-        if not reattach_events:
-            return ScenarioResult(
-                name="reattach_after_idle_pause", passed=False,
-                timings_ms=timings,
-                error=(
-                    "tool call succeeded but sandbox.e2b.reattach.ok "
-                    "never fired — sandbox likely didn't auto-pause "
-                    "in this window. Try increasing the wait or "
-                    "lowering MCPOLIS_E2B_IDLE_PAUSE_SECONDS."
-                ),
+                text = _result_text(result)
+                if payload not in text:
+                    return _failed(
+                        name, timings,
+                        f"the first call after the wake answered "
+                        f"{text[:120]!r}",
+                    )
+            # Read before the close, which kills the sandbox and forgets
+            # its record.
+            ref_after = await persistence.get(
+                org_id=org_id, upstream_id=upstream.id,
             )
-        wake_ms = reattach_events[0].get("reattach_duration_ms")
-        if isinstance(wake_ms, (int, float)):
-            timings["wake_from_paused_ms"] = float(wake_ms)
+        problem = _kept_sandbox_problem(
+            since_ns=wake_ns, sandbox_id=sandbox_id, old_pid=old_pid,
+            ref=ref_after,
+        )
+        if problem is not None:
+            return _failed(
+                name, timings, f"{problem} | events: {_wake_trace(idle_ns)}",
+            )
+        assert ref_after is not None  # checked by _kept_sandbox_problem
         return ScenarioResult(
-            name="reattach_after_idle_pause", passed=True,
-            timings_ms=timings,
+            name=name, passed=True, timings_ms=timings,
             notes=[
-                f"reattach.ok fired after {REATTACH_WAIT_SECONDS}s sleep",
-                f"server: {init_result.serverInfo.name}",
+                f"same sandbox, pid {old_pid} -> {ref_after.pid}",
+                f"events: {_wake_trace(idle_ns)}",
+                *_reopen_warnings(wake_ns),
             ],
         )
     except Exception as exc:
-        return ScenarioResult(
-            name="reattach_after_idle_pause", passed=False,
-            timings_ms=timings,
-            error=f"{type(exc).__name__}: {exc}",
+        return _failed(
+            name, timings,
+            f"{_error_text(exc)} | events: {_wake_trace(idle_ns)}",
         )
+    finally:
+        # Session 2's close kills the sandbox; this covers an early exit.
+        if sandbox_id is not None:
+            with contextlib.suppress(Exception):
+                await cleanup_client.kill_sandbox(sandbox_id)
 
 
-async def reattach_via_ucm() -> ScenarioResult:
-    """Same regression as ``reattach_after_idle_pause`` but exercised
-    through ``UpstreamClientManager.connect_shared`` — the production
-    code path. The other scenario opens ``service.session()``
-    directly; this one drives the long-lived shared-session pattern
-    that prod actually uses, including post-reattach status
-    verification (``is_connected`` must STAY True across the auto-
-    pause → reattach cycle).
+async def wake_via_ucm() -> ScenarioResult:
+    """The wake through :class:`UpstreamClientManager` and the session
+    lookup the gateway's tool router makes (``acquire_upstream_session``
+    → ``ensure_shared_connected``), on a manager wired as in production
+    (persistence, reuse on).
+
+    Asserts, in order:
+
+    - during the idle window the watcher marks the shared session dead
+      on its own, with no request sent, and ``is_connected`` stays True
+      (the dashboard keeps showing the MCP as Ready);
+    - the next call's session lookup refuses the dead session BEFORE
+      writing anything and rebuilds: a NEW session, one lazy attach
+      (``upstream.client.lazy_connect.success``), the same sandbox with a
+      new pid (``sandbox.e2b.reconnect.ok``), no ``sandbox.e2b.create``;
+    - that first call after the wake succeeds, and ``is_connected`` is
+      still True.
+
+    Replaces ``reattach_via_ucm``, which made its call on the shared
+    session object it read before the pause. That session is dead by
+    design now (``ClosedResourceError``); the gateway never uses it,
+    because it asks the manager for a session on every call.
     """
-    service = _make_service(on_timeout_seconds=IDLE_PAUSE_SECONDS)
+    name = "wake_via_ucm"
+    persistence = InMemorySandboxPersistenceRepository()
+    service = _make_service(persistence=persistence)
+    cleanup_client = RealE2BClient(api_key=cast(str, API_KEY))
     upstream = _upstream(
-        f"reattach-ucm-{RUN_ID}",
+        f"wake-ucm-{RUN_ID}",
         command="npx",
         args=["-y", "@modelcontextprotocol/server-everything"],
     )
-    manager = _make_ucm(upstream=upstream, service=service)
+    manager = _make_ucm(
+        upstream=upstream, service=service, persistence=persistence,
+    )
+    org_id = f"acme-{RUN_ID}"
     timings: dict[str, float] = {}
+    sandbox_id: str | None = None
+    idle_ns = time.monotonic_ns()
     try:
+        connect_t = time.monotonic()
         await asyncio.wait_for(
             manager.connect_shared(upstream), timeout=INITIALIZE_TIMEOUT,
         )
-        if not manager.is_connected(upstream.id):
-            return ScenarioResult(
-                name="reattach_via_ucm", passed=False,
-                error="not connected after connect_shared",
+        timings["connect_ms"] = (time.monotonic() - connect_t) * 1000
+        ref = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        if ref is None or ref.sandbox_id is None or ref.pid is None:
+            return _failed(
+                name, timings, "connect_shared saved no sandbox id and pid",
             )
-
-        wait_start_ns = time.monotonic_ns()
-        print(
-            f"  [reattach_via_ucm] sleeping {REATTACH_WAIT_SECONDS}s "
-            f"to provoke E2B auto-pause...",
-            flush=True,
-        )
-        await asyncio.sleep(REATTACH_WAIT_SECONDS)
-
-        # Drive a tool call via the live ClientSession that
-        # ``connect_shared`` parked on the upstream's state-machine
-        # record. ``list_tools`` is the cheapest round-trip —
-        # assertion is "the streaming RPC came back, response
-        # arrived" not "this specific tool exists".
+        sandbox_id, old_pid = ref.sandbox_id, ref.pid
         state = manager.get_state(upstream.id)
-        if state is None or state.shared_session is None:
-            return ScenarioResult(
-                name="reattach_via_ucm", passed=False, timings_ms=timings,
-                error=(
-                    "no live shared_session on the manager state-machine "
-                    "record after connect_shared"
-                ),
+        old_session = state.shared_session if state is not None else None
+
+        idle_ns, problem = await _idle_until_paused(manager, upstream, name)
+        if problem is not None:
+            return _failed(
+                name, timings, f"{problem} | events: {_wake_trace(idle_ns)}",
             )
-        live_session = state.shared_session
+
+        wake_ns = time.monotonic_ns()
+        pause = _pause_seen_since(idle_ns)
+        if pause is not None:
+            ahead_ms = _ms_since_event(pause, wake_ns)
+            if ahead_ms is not None:
+                timings["pause_seen_before_call_ms"] = ahead_ms
+        payload = f"after-wake-ucm-{RUN_ID}"
         call_t = time.monotonic()
-        await asyncio.wait_for(
-            live_session.list_tools(), timeout=TOOL_CALL_TIMEOUT * 2,
+        session, text = await asyncio.wait_for(
+            _echo_through_gateway(manager, upstream, payload),
+            timeout=INITIALIZE_TIMEOUT,
         )
-        timings["call_tool_post_pause_ms"] = (
+        # The rebuild plus the call: what the user waits for.
+        timings["wake_and_first_call_ms"] = (
             (time.monotonic() - call_t) * 1000
         )
-
-        # ``is_connected`` must stay True — UCM should not flip
-        # the badge to Disconnected just because we paused.
+        if payload not in text:
+            return _failed(
+                name, timings,
+                f"the first call after the wake answered {text[:120]!r}",
+            )
+        if session is old_session:
+            return _failed(
+                name, timings,
+                "the gateway was handed the session the pause ended",
+            )
         if not manager.is_connected(upstream.id):
-            return ScenarioResult(
-                name="reattach_via_ucm", passed=False, timings_ms=timings,
-                error=(
-                    "is_connected flipped to False after auto-pause "
-                    "+ reattach — UI would render Disconnected for a "
-                    "session that's actually serving requests"
-                ),
+            return _failed(
+                name, timings, "is_connected is False after the wake",
             )
-        reattach_events = _log_capture.find_events(
-            "sandbox.e2b.reattach.ok", since_ns=wait_start_ns,
+        ref_after = await persistence.get(
+            org_id=org_id, upstream_id=upstream.id,
         )
-        if not reattach_events:
-            return ScenarioResult(
-                name="reattach_via_ucm", passed=False, timings_ms=timings,
-                error="reattach.ok did not fire — sandbox didn't pause",
+        problem = _kept_sandbox_problem(
+            since_ns=wake_ns, sandbox_id=sandbox_id, old_pid=old_pid,
+            ref=ref_after,
+        )
+        if problem is not None:
+            return _failed(
+                name, timings, f"{problem} | events: {_wake_trace(idle_ns)}",
             )
-        wake_ms = reattach_events[0].get("reattach_duration_ms")
-        if isinstance(wake_ms, (int, float)):
-            timings["wake_from_paused_ms"] = float(wake_ms)
+        lazy = _log_capture.find_events(
+            "upstream.client.lazy_connect.success", since_ns=wake_ns,
+        )
+        if len(lazy) != 1:
+            return _failed(
+                name, timings,
+                f"expected one upstream.client.lazy_connect.success (the "
+                f"gateway's rebuild), got {len(lazy)} | events: "
+                f"{_wake_trace(idle_ns)}",
+            )
+        lazy_ms = lazy[0].get("total_duration_ms")
+        if isinstance(lazy_ms, (int, float)):
+            timings["wake_rebuild_ms"] = float(lazy_ms)
+        assert ref_after is not None  # checked by _kept_sandbox_problem
         return ScenarioResult(
-            name="reattach_via_ucm", passed=True, timings_ms=timings,
+            name=name, passed=True, timings_ms=timings,
             notes=[
-                "connect_shared → idle 35s → tools/list via live "
-                "session → is_connected stayed True",
+                f"same sandbox, pid {old_pid} -> {ref_after.pid}; "
+                f"is_connected stayed True",
+                f"events: {_wake_trace(idle_ns)}",
+                *_reopen_warnings(wake_ns),
             ],
         )
     except Exception as exc:
-        return ScenarioResult(
-            name="reattach_via_ucm", passed=False, timings_ms=timings,
-            error=f"{type(exc).__name__}: {exc}",
+        return _failed(
+            name, timings,
+            f"{_error_text(exc)} | events: {_wake_trace(idle_ns)}",
         )
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await manager.stop_all()
-        except Exception:
-            pass
+        if sandbox_id is not None:
+            with contextlib.suppress(Exception):
+                await cleanup_client.kill_sandbox(sandbox_id)
 
 
 async def restart_with_reuse() -> ScenarioResult:
@@ -765,7 +1204,10 @@ async def restart_with_reuse() -> ScenarioResult:
         # ---- Service B: simulated restart, same persistence ----
         service_b = E2BSandboxService(
             client,
-            mcpolis_instance=f"e2e-{RUN_ID}-b",  # different UUID, like a real restart
+            # Same id as service A: it is one value per database, so a
+            # real restart keeps it, and a sandbox carrying another id
+            # is never reused.
+            mcpolis_instance=f"e2e-{RUN_ID}",
             on_timeout_seconds=IDLE_PAUSE_SECONDS,
             persistence=persistence,
             reuse_sandboxes_on_restart=True,
@@ -1145,10 +1587,12 @@ async def restart_skips_wakeup() -> ScenarioResult:
         await asyncio.sleep(REATTACH_WAIT_SECONDS)
 
         # ---- Manager B: simulated restart, cursor-captured boot ----
+        # Same instance id as manager A: one value per database, so a
+        # restart keeps it (another id would refuse the reuse below).
         cursor_ns = time.monotonic_ns()
         service_b = E2BSandboxService(
             client,
-            mcpolis_instance=f"e2e-{RUN_ID}-b",
+            mcpolis_instance=f"e2e-{RUN_ID}",
             on_timeout_seconds=IDLE_PAUSE_SECONDS,
             persistence=persistence,
             reuse_sandboxes_on_restart=True,
@@ -1159,7 +1603,7 @@ async def restart_skips_wakeup() -> ScenarioResult:
             sandbox_resolver=SandboxResolver(global_provider="e2b"),
             sandbox_services={"e2b": service_b},
             sandbox_persistence=persistence,
-            mcpolis_instance=f"e2e-{RUN_ID}-b",
+            mcpolis_instance=f"e2e-{RUN_ID}",
         )
         # Drive the same helper that ``OrgRuntimeManager.connect_runtime``
         # invokes in prod — ``start_all`` is dev-stack-only, and a prior
@@ -1344,13 +1788,16 @@ def _build_org_runtime_for_restart(
     upstream: UpstreamDefinition,
     persistence: object,
     e2b_client: RealE2BClient,
-    instance_suffix: str = "restart",
 ):  # type: ignore[no-untyped-def]
     """Build the OrgRuntimeManager + OrgRuntime harness used by the
     restart scenarios. Single source of truth so each scenario tests
     the *same* prod boot path (``OrgRuntimeManager.connect_runtime``)
     rather than each one drifting toward an inner helper that
     happens to work but might miss the actual bug class.
+
+    Uses the same instance id as ``_make_cached_upstream_alive_on_e2b``:
+    the id is one value per database, so a restart keeps it, and a
+    sandbox carrying another id is never reused.
 
     Returns ``(org_manager, runtime, manager)`` — the caller drives
     ``org_manager.connect_runtime(runtime)`` and asserts on
@@ -1373,7 +1820,7 @@ def _build_org_runtime_for_restart(
 
     service = E2BSandboxService(
         e2b_client,
-        mcpolis_instance=f"e2e-{RUN_ID}-{instance_suffix}",
+        mcpolis_instance=f"e2e-{RUN_ID}",
         on_timeout_seconds=IDLE_PAUSE_SECONDS,
         persistence=cast(Any, persistence),
         reuse_sandboxes_on_restart=True,
@@ -1384,7 +1831,7 @@ def _build_org_runtime_for_restart(
         sandbox_resolver=SandboxResolver(global_provider="e2b"),
         sandbox_services={"e2b": service},
         sandbox_persistence=cast(Any, persistence),
-        mcpolis_instance=f"e2e-{RUN_ID}-{instance_suffix}",
+        mcpolis_instance=f"e2e-{RUN_ID}",
     )
     config = SettingsConfig(
         roles={"admin": RoleDefinition(is_admin=True)},
@@ -1441,7 +1888,7 @@ async def _make_cached_upstream_alive_on_e2b(
     )
     service_warmup = E2BSandboxService(
         e2b_client,
-        mcpolis_instance=f"e2e-{RUN_ID}-warmup",
+        mcpolis_instance=f"e2e-{RUN_ID}",
         on_timeout_seconds=IDLE_PAUSE_SECONDS,
         persistence=cast(Any, persistence),
         reuse_sandboxes_on_restart=True,
@@ -1452,7 +1899,7 @@ async def _make_cached_upstream_alive_on_e2b(
         sandbox_resolver=SandboxResolver(global_provider="e2b"),
         sandbox_services={"e2b": service_warmup},
         sandbox_persistence=cast(Any, persistence),
-        mcpolis_instance=f"e2e-{RUN_ID}-warmup",
+        mcpolis_instance=f"e2e-{RUN_ID}",
     )
     await asyncio.wait_for(
         manager_warmup.connect_shared(upstream),
@@ -1594,24 +2041,34 @@ async def restart_recovers_from_killed_sandbox() -> ScenarioResult:
 
 
 async def restart_recovers_from_dead_mcp_process() -> ScenarioResult:
-    """Option-A loose semantics, dead-MCP-process case. The
-    persisted sandbox is alive on E2B but the MCP subprocess
-    inside has died (crashed mid-run, OOM-killed, etc.). The
-    lazy reattach hits ``connect_command_failed`` → kills the
-    stuck sandbox + fresh-creates a replacement → tool call
-    works.
+    """Option-A loose semantics, dead-MCP-process case. The persisted
+    sandbox is alive on E2B but the MCP process its record names is gone
+    (crashed, OOM-killed). "Ready" at boot promises a working call, so
+    the first connect after the restart must recover.
 
-    Simulated by corrupting the persisted pid to a value the
-    sandbox doesn't have. Same observable behaviour as a real
-    crash from the SDK's perspective.
+    Today's design keeps the sandbox and replaces only the process
+    (``_try_reconnect`` since 2026-09-20): it reconnects to the sandbox,
+    kills the recorded pid (a pid that names no process is the end
+    state wanted, not an error), starts a fresh process and saves its
+    pid. Kill + fresh create is kept for a sandbox that cannot be used
+    (gone, unreachable, a failed respawn, another size or instance tag),
+    which ``restart_recovers_from_killed_sandbox`` covers. Asserts:
+    the same sandbox, a new pid, one ``sandbox.e2b.reconnect.ok``, no
+    ``sandbox.e2b.create``, and a working ``tools/list``.
+
+    The old expectation here (``connect_command`` fails on the dead pid,
+    so the "stuck" sandbox is killed and a new one created) belonged to
+    the retired reattach design: the service no longer reattaches to a
+    pid, so a dead one no longer costs the sandbox and its package
+    cache.
+
+    Simulated by corrupting the persisted pid to one the sandbox doesn't
+    have: to the service that is what a crash looks like, a recorded pid
+    that names no process. (The original process actually keeps running;
+    nothing reads its output.)
     """
-    from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (
-        InMemorySandboxPersistenceRepository,
-    )
-    from mcpolis.domain.ports.sandbox_persistence_repository import (
-        SandboxPersistedRef,
-    )
-
+    name = "restart_recovers_from_dead_mcp_process"
+    dead_pid = 999_999_999
     upstream = _upstream(
         f"recover-deadpid-{RUN_ID}",
         command="npx",
@@ -1621,8 +2078,9 @@ async def restart_recovers_from_dead_mcp_process() -> ScenarioResult:
     e2b_client = RealE2BClient(api_key=cast(str, API_KEY))
     org_id = f"acme-{RUN_ID}"
     timings: dict[str, float] = {}
-    new_sandbox_id: str | None = None
     original_sandbox_id: str | None = None
+    ref_after: persistence_port.SandboxPersistedRef | None = None
+    manager: UpstreamClientManager | None = None
 
     try:
         t0 = time.monotonic()
@@ -1632,15 +2090,11 @@ async def restart_recovers_from_dead_mcp_process() -> ScenarioResult:
         )
         timings["warmup_ms"] = (time.monotonic() - t0) * 1000
 
-        # Perturbation: corrupt the pid. The sandbox stays alive
-        # on E2B; the SDK's ``commands.connect(99999)`` will
-        # raise NotFoundException — same behaviour as a real
-        # MCP process crash.
-        ref: SandboxPersistedRef | None = await persistence.get(
-            org_id=org_id, upstream_id=upstream.id,
-        )
+        # Perturbation: the record now names a pid the sandbox doesn't
+        # have, which is what a crashed MCP process leaves behind.
+        ref = await persistence.get(org_id=org_id, upstream_id=upstream.id)
         assert ref is not None
-        await persistence.upsert(ref.model_copy(update={"pid": 999_999_999}))
+        await persistence.upsert(ref.model_copy(update={"pid": dead_pid}))
 
         org_manager, runtime, manager = _build_org_runtime_for_restart(
             org_id=org_id, upstream=upstream,
@@ -1649,59 +2103,65 @@ async def restart_recovers_from_dead_mcp_process() -> ScenarioResult:
         await org_manager.connect_runtime(runtime)
 
         if not manager.is_connected(upstream.id):
-            return ScenarioResult(
-                name="restart_recovers_from_dead_mcp_process", passed=False,
-                timings_ms=timings,
-                error="is_connected=False after boot — loose contract broken",
+            return _failed(
+                name, timings,
+                "is_connected=False after boot — loose contract broken",
             )
 
-        # Tool call: lazy reattach → connect_command fails → kill
-        # stuck sandbox → fresh-create.
+        # The first connect after the restart: reconnect to the live
+        # sandbox, kill the dead pid, start a fresh process.
+        recover_ns = time.monotonic_ns()
         t2 = time.monotonic()
-        await asyncio.wait_for(
+        session = await asyncio.wait_for(
             manager.connect_shared(upstream),
             timeout=INITIALIZE_TIMEOUT,
         )
         timings["recover_ms"] = (time.monotonic() - t2) * 1000
+        tools = await asyncio.wait_for(
+            session.list_tools(), timeout=TOOL_CALL_TIMEOUT,
+        )
+        if not tools.tools:
+            return _failed(
+                name, timings, "tools/list after the recovery came back empty",
+            )
 
         ref_after = await persistence.get(
             org_id=org_id, upstream_id=upstream.id,
         )
-        if ref_after is None or ref_after.sandbox_id is None:
-            return ScenarioResult(
-                name="restart_recovers_from_dead_mcp_process", passed=False,
-                timings_ms=timings,
-                error="post-recovery ref is missing or has no sandbox_id",
+        problem = _kept_sandbox_problem(
+            since_ns=recover_ns, sandbox_id=original_sandbox_id,
+            old_pid=dead_pid, ref=ref_after,
+        )
+        if problem is not None:
+            return _failed(
+                name, timings,
+                f"{problem} (a sandbox that is alive must be kept when "
+                f"only its MCP process is gone)",
             )
-        if ref_after.sandbox_id == original_sandbox_id:
-            return ScenarioResult(
-                name="restart_recovers_from_dead_mcp_process", passed=False,
-                timings_ms=timings,
-                error=(
-                    "ref still points at the original sandbox — the "
-                    "stuck-process kill+fresh-create path didn't fire"
-                ),
-            )
-        new_sandbox_id = ref_after.sandbox_id
-
+        assert ref_after is not None  # checked by _kept_sandbox_problem
         return ScenarioResult(
-            name="restart_recovers_from_dead_mcp_process", passed=True,
-            timings_ms=timings,
+            name=name, passed=True, timings_ms=timings,
             notes=[
                 "is_connected=True at boot",
-                f"recovery killed {original_sandbox_id} + "
-                f"fresh-created {new_sandbox_id}",
+                f"recovery kept sandbox {original_sandbox_id}; dead pid "
+                f"{dead_pid} -> fresh pid {ref_after.pid}; "
+                f"{len(tools.tools)} tools",
+                *_reopen_warnings(recover_ns),
             ],
         )
     finally:
-        # Cleanup both the stuck sandbox (the kill in recovery may
-        # have been best-effort) and the fresh one.
-        for sbx_id in (original_sandbox_id, new_sandbox_id):
+        if manager is not None:
+            with contextlib.suppress(Exception):
+                await manager.stop_all()
+        # The stop kills the sandbox; this covers a failure before it,
+        # and a fresh sandbox if the recovery wrongly made one.
+        sandbox_ids = {original_sandbox_id}
+        if ref_after is not None:
+            sandbox_ids.add(ref_after.sandbox_id)
+        for sbx_id in sandbox_ids:
             if sbx_id is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await e2b_client.kill_sandbox(sbx_id)
-                except Exception:
-                    pass
 
 
 async def restart_reattaches_through_stale_config() -> ScenarioResult:
@@ -2063,251 +2523,275 @@ async def restart_skips_never_ready_upstream() -> ScenarioResult:
                 pass
 
 
-async def double_reattach() -> ScenarioResult:
-    """Two consecutive auto-pause/reattach cycles on the same
-    session. Verifies that ``MCPOLIS_E2B_IDLE_PAUSE_SECONDS`` holds
-    across cycles — i.e., that the post-reattach ``set_timeout``
-    fix in ``E2BSandboxService._session_cm`` correctly re-applies
-    our configured idle window.
+async def double_wake() -> ScenarioResult:
+    """Two pause/wake cycles in a row on one sandbox, through the client
+    manager and the gateway's session lookup. Both wakes must keep the
+    sandbox, replace the MCP process and answer the first call.
 
-    Background: E2B's ``commands.connect(pid)`` triggers an
-    ``auto_resume`` that resets the sandbox's idle timeout to the
-    SDK default (``default_sandbox_timeout`` = 300s as of e2b
-    2.20.x), NOT the value passed to ``Sandbox.create``. Without
-    re-application, the second cycle's sleep window of
-    ``IDLE_PAUSE_SECONDS + 5`` seconds (35s) never reaches the new
-    timeout (300s) and no second pause fires. Verified empirically
-    2026-05-01 via
-    ``backend/tests/integration/diagnose_double_reattach.py``.
+    Cycle 2 is the check on the idle window. E2B resets it to its SDK
+    default (300 s) whenever a call resumes a paused sandbox, NOT to the
+    value given at create (measured 2026-05-01 with
+    ``diagnose_double_reattach.py``). After the cycle-1 wake the service
+    re-applies ``set_timeout(IDLE_PAUSE_SECONDS)`` in
+    ``_try_reconnect``, and the new session's pause timer re-arms it on
+    the first call. Without that, cycle 2's 40 s of idle would end with
+    no pause, and every woken sandbox would stay up 300 s instead of
+    ``MCPOLIS_E2B_IDLE_PAUSE_SECONDS``.
 
-    With the fix in place: after each reattach we call
-    ``sandbox.set_timeout(IDLE_PAUSE_SECONDS)``, the timer goes
-    back to 30s, and the next 35s sleep correctly provokes the
-    second pause. This scenario fails (cycle 2 reattach.ok does
-    not fire) if the fix regresses.
+    Replaces ``double_reattach``, which ran both cycles on ONE session
+    and expected ``sandbox.e2b.reattach.ok`` each time; a pause now ends
+    the session, and the manager opens a new one at each wake.
     """
-    service = _make_service(on_timeout_seconds=IDLE_PAUSE_SECONDS)
+    name = "double_wake"
+    persistence = InMemorySandboxPersistenceRepository()
+    service = _make_service(persistence=persistence)
+    cleanup_client = RealE2BClient(api_key=cast(str, API_KEY))
     upstream = _upstream(
         f"double-{RUN_ID}",
         command="npx",
         args=["-y", "@modelcontextprotocol/server-everything"],
     )
+    manager = _make_ucm(
+        upstream=upstream, service=service, persistence=persistence,
+    )
+    org_id = f"acme-{RUN_ID}"
     timings: dict[str, float] = {}
-    errlog = LogBuffer()
-    session_id = f"e2e-{RUN_ID}-double"
+    notes: list[str] = []
+    sandbox_id: str | None = None
+    first_idle_ns = time.monotonic_ns()
     try:
-        async with service.session(
-            session_id=session_id,
-            org_id=f"acme-{RUN_ID}",
-            upstream=upstream,
-            resources=_resources(),
-            denylist=(),
-            errlog=cast(StringIO, errlog),
-        ) as session:
-            read_stream, write_stream = session.read_stream, session.write_stream
-            session = ClientSession(read_stream, write_stream)
-            async with session:
-                await asyncio.wait_for(
-                    session.initialize(), timeout=INITIALIZE_TIMEOUT,
-                )
+        connect_t = time.monotonic()
+        await asyncio.wait_for(
+            manager.connect_shared(upstream), timeout=INITIALIZE_TIMEOUT,
+        )
+        timings["connect_ms"] = (time.monotonic() - connect_t) * 1000
+        ref = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        if ref is None or ref.sandbox_id is None or ref.pid is None:
+            return _failed(
+                name, timings, "connect_shared saved no sandbox id and pid",
+            )
+        sandbox_id, pid = ref.sandbox_id, ref.pid
+        pids = [pid]
 
-                # Cycle 1
-                wait1_ns = time.monotonic_ns()
-                print(
-                    f"  [double_reattach] cycle 1: sleeping "
-                    f"{REATTACH_WAIT_SECONDS}s...",
-                    flush=True,
-                )
-                await asyncio.sleep(REATTACH_WAIT_SECONDS)
-                t1 = time.monotonic()
-                await asyncio.wait_for(
-                    session.list_tools(), timeout=TOOL_CALL_TIMEOUT * 2,
-                )
-                timings["cycle_1_ms"] = (time.monotonic() - t1) * 1000
-                cycle_1_events = _log_capture.find_events(
-                    "sandbox.e2b.reattach.ok", since_ns=wait1_ns,
-                )
-                if not cycle_1_events:
-                    return ScenarioResult(
-                        name="double_reattach", passed=False,
-                        timings_ms=timings,
-                        error="cycle 1: reattach.ok did not fire",
+        for cycle in (1, 2):
+            label = f"{name} cycle {cycle}"
+            state = manager.get_state(upstream.id)
+            old_session = state.shared_session if state is not None else None
+            idle_ns, problem = await _idle_until_paused(
+                manager, upstream, label,
+            )
+            if cycle == 1:
+                first_idle_ns = idle_ns
+            if problem is not None:
+                if cycle == 2 and _pause_seen_since(idle_ns) is None:
+                    problem += (
+                        ". After the cycle-1 wake the likely cause is the "
+                        "idle window not being re-applied (E2B resets it "
+                        "to 300 s on a resume)"
                     )
-                wake1 = cycle_1_events[0].get("reattach_duration_ms")
-                if isinstance(wake1, (int, float)):
-                    timings["wake_cycle_1_ms"] = float(wake1)
-
-                # Cycle 2 — only passes when set_timeout re-apply
-                # correctly resets the idle window after reattach.
-                wait2_ns = time.monotonic_ns()
-                print(
-                    f"  [double_reattach] cycle 2: sleeping "
-                    f"{REATTACH_WAIT_SECONDS}s...",
-                    flush=True,
+                return _failed(
+                    name, timings,
+                    f"cycle {cycle}: {problem} | events: "
+                    f"{_wake_trace(first_idle_ns)}",
                 )
-                await asyncio.sleep(REATTACH_WAIT_SECONDS)
-                t2 = time.monotonic()
-                await asyncio.wait_for(
-                    session.list_tools(), timeout=TOOL_CALL_TIMEOUT * 2,
+            wake_ns = time.monotonic_ns()
+            payload = f"after-wake-{cycle}-{RUN_ID}"
+            call_t = time.monotonic()
+            session, text = await asyncio.wait_for(
+                _echo_through_gateway(manager, upstream, payload),
+                timeout=INITIALIZE_TIMEOUT,
+            )
+            timings[f"cycle_{cycle}_wake_and_call_ms"] = (
+                (time.monotonic() - call_t) * 1000
+            )
+            if payload not in text:
+                return _failed(
+                    name, timings,
+                    f"cycle {cycle}: the first call after the wake "
+                    f"answered {text[:120]!r}",
                 )
-                timings["cycle_2_ms"] = (time.monotonic() - t2) * 1000
-                cycle_2_events = _log_capture.find_events(
-                    "sandbox.e2b.reattach.ok", since_ns=wait2_ns,
+            if session is old_session:
+                return _failed(
+                    name, timings,
+                    f"cycle {cycle}: the gateway was handed the session "
+                    f"the pause ended",
                 )
-                if not cycle_2_events:
-                    return ScenarioResult(
-                        name="double_reattach", passed=False,
-                        timings_ms=timings,
-                        error=(
-                            "cycle 2: reattach.ok did not fire — "
-                            "post-reattach set_timeout regression "
-                            "(E2B reset to 300s default, our 35s "
-                            "sleep didn't reach the new deadline)"
-                        ),
-                    )
-                wake2 = cycle_2_events[0].get("reattach_duration_ms")
-                if isinstance(wake2, (int, float)):
-                    timings["wake_cycle_2_ms"] = float(wake2)
+            ref_after = await persistence.get(
+                org_id=org_id, upstream_id=upstream.id,
+            )
+            problem = _kept_sandbox_problem(
+                since_ns=wake_ns, sandbox_id=sandbox_id, old_pid=pid,
+                ref=ref_after,
+            )
+            if problem is not None:
+                return _failed(
+                    name, timings,
+                    f"cycle {cycle}: {problem} | events: "
+                    f"{_wake_trace(first_idle_ns)}",
+                )
+            assert ref_after is not None and ref_after.pid is not None
+            pid = ref_after.pid
+            pids.append(pid)
+            notes.extend(
+                f"cycle {cycle}: {warning}"
+                for warning in _reopen_warnings(wake_ns)
+            )
         return ScenarioResult(
-            name="double_reattach", passed=True, timings_ms=timings,
+            name=name, passed=True, timings_ms=timings,
             notes=[
-                "two consecutive auto-pause/reattach cycles passed — "
-                "set_timeout re-apply preserves the cost knob",
+                f"two wakes kept sandbox {sandbox_id}; pids "
+                f"{' -> '.join(str(p) for p in pids)}",
+                "cycle 2 paused within the window: the idle window was "
+                "re-applied after the cycle-1 resume",
+                *notes,
             ],
         )
     except Exception as exc:
-        return ScenarioResult(
-            name="double_reattach", passed=False, timings_ms=timings,
-            error=f"{type(exc).__name__}: {exc}",
+        return _failed(
+            name, timings,
+            f"{_error_text(exc)} | events: {_wake_trace(first_idle_ns)}",
         )
+    finally:
+        with contextlib.suppress(Exception):
+            await manager.stop_all()
+        if sandbox_id is not None:
+            with contextlib.suppress(Exception):
+                await cleanup_client.kill_sandbox(sandbox_id)
 
 
-async def reattach_during_concurrent_calls() -> ScenarioResult:
-    """Three tool calls fired in parallel as the FIRST traffic after
-    the idle window. The pump must observe ``stream_dead`` before
-    the first send_stdin and reattach exactly once — not three times,
-    not zero times. Then all three calls must round-trip correctly.
+async def wake_during_concurrent_calls() -> ScenarioResult:
+    """Three tool calls fired together as the FIRST traffic after a
+    pause, each through the gateway's session lookup. They must share
+    ONE rebuild (one lazy attach, one ``sandbox.e2b.reconnect.ok``, one
+    new session, same sandbox) and every call must get its own answer.
 
-    This is the worst-case race for the new pump branch: multiple
-    queued messages arrive before the pump has a chance to drain
-    them serially. If the reattach branch isn't idempotent within a
-    single iteration, we'd see redundant ``connect_command`` calls
-    or, worse, half the calls sent to a dead handle.
+    Concurrent lookups of one upstream coalesce into a single connect
+    (``SessionSingleFlight``): the first caller starts the rebuild, the
+    others wait for it instead of opening sandboxes of their own.
+
+    No call may fail here. CLAUDE.md's "the caller eats one error" (the
+    stdin pump's backstop, ``sandbox.e2b.wake.process_retired``) only
+    covers a call that passed the liveness check in the instant before
+    the watcher fired. This scenario first waits until the watcher has
+    declared the session dead, so all three calls are refused that
+    session before anything is written, and all three land on the
+    rebuilt one.
+
+    Replaces ``reattach_during_concurrent_calls``, which fired the calls
+    on the paused session itself and expected exactly one reattach to
+    the frozen pid.
     """
-    service = _make_service(on_timeout_seconds=IDLE_PAUSE_SECONDS)
+    name = "wake_during_concurrent_calls"
+    persistence = InMemorySandboxPersistenceRepository()
+    service = _make_service(persistence=persistence)
+    cleanup_client = RealE2BClient(api_key=cast(str, API_KEY))
     upstream = _upstream(
-        f"reattach-concurrent-{RUN_ID}",
+        f"wake-concurrent-{RUN_ID}",
         command="npx",
         args=["-y", "@modelcontextprotocol/server-everything"],
     )
-    timings: dict[str, float] = {}
-    errlog = LogBuffer()
-    session_id = f"e2e-{RUN_ID}-reattach-concurrent"
+    manager = _make_ucm(
+        upstream=upstream, service=service, persistence=persistence,
+    )
+    org_id = f"acme-{RUN_ID}"
     payloads = [
         f"after-pause-A-{RUN_ID}",
         f"after-pause-B-{RUN_ID}",
         f"after-pause-C-{RUN_ID}",
     ]
+    timings: dict[str, float] = {}
+    sandbox_id: str | None = None
+    idle_ns = time.monotonic_ns()
     try:
-        async with service.session(
-            session_id=session_id,
-            org_id=f"acme-{RUN_ID}",
-            upstream=upstream,
-            resources=_resources(),
-            denylist=(),
-            errlog=cast(StringIO, errlog),
-        ) as session:
-            read_stream, write_stream = session.read_stream, session.write_stream
-            session = ClientSession(read_stream, write_stream)
-            async with session:
-                await asyncio.wait_for(
-                    session.initialize(), timeout=INITIALIZE_TIMEOUT,
-                )
-                tools = await session.list_tools()
-                if not any(t.name == "echo" for t in tools.tools):
-                    return ScenarioResult(
-                        name="reattach_during_concurrent_calls",
-                        passed=False,
-                        error="server-everything no longer exposes 'echo'",
-                    )
+        await asyncio.wait_for(
+            manager.connect_shared(upstream), timeout=INITIALIZE_TIMEOUT,
+        )
+        ref = await persistence.get(org_id=org_id, upstream_id=upstream.id)
+        if ref is None or ref.sandbox_id is None or ref.pid is None:
+            return _failed(
+                name, timings, "connect_shared saved no sandbox id and pid",
+            )
+        sandbox_id, old_pid = ref.sandbox_id, ref.pid
+        state = manager.get_state(upstream.id)
+        old_session = state.shared_session if state is not None else None
 
-                wait_start_ns = time.monotonic_ns()
-                print(
-                    f"  [reattach_during_concurrent] sleeping "
-                    f"{REATTACH_WAIT_SECONDS}s...",
-                    flush=True,
-                )
-                await asyncio.sleep(REATTACH_WAIT_SECONDS)
+        idle_ns, problem = await _idle_until_paused(manager, upstream, name)
+        if problem is not None:
+            return _failed(
+                name, timings, f"{problem} | events: {_wake_trace(idle_ns)}",
+            )
 
-                start = time.monotonic()
-                results = await asyncio.gather(
-                    session.call_tool("echo", {"message": payloads[0]}),
-                    session.call_tool("echo", {"message": payloads[1]}),
-                    session.call_tool("echo", {"message": payloads[2]}),
+        wake_ns = time.monotonic_ns()
+        start = time.monotonic()
+        results = await asyncio.wait_for(
+            asyncio.gather(*(
+                _echo_through_gateway(manager, upstream, payload)
+                for payload in payloads
+            )),
+            timeout=INITIALIZE_TIMEOUT,
+        )
+        timings["wake_and_three_calls_ms"] = (
+            (time.monotonic() - start) * 1000
+        )
+        for index, (expected, (_, text)) in enumerate(zip(payloads, results)):
+            if expected not in text:
+                return _failed(
+                    name, timings,
+                    f"call #{index} did not get its own answer after the "
+                    f"wake: {text[:120]!r}",
                 )
-                timings["three_post_pause_ms"] = (
-                    (time.monotonic() - start) * 1000
-                )
-
-                # Each response must contain its own payload —
-                # response correlation must hold across the
-                # reattach.
-                for i, (expected, result) in enumerate(zip(payloads, results)):
-                    blob = " ".join(
-                        getattr(c, "text", "")
-                        for c in result.content
-                        if getattr(c, "type", None) == "text"
-                    )
-                    if expected not in blob:
-                        return ScenarioResult(
-                            name="reattach_during_concurrent_calls",
-                            passed=False, timings_ms=timings,
-                            error=(
-                                f"response #{i} did not contain "
-                                f"{expected!r} after reattach "
-                                f"(got: {blob[:120]!r})"
-                            ),
-                        )
-
-                # Reattach should fire **exactly once** for the
-                # whole batch — not once per concurrent call.
-                reattach_events = _log_capture.find_events(
-                    "sandbox.e2b.reattach.ok", since_ns=wait_start_ns,
-                )
-                reattach_count = len(reattach_events)
-                if reattach_count == 0:
-                    return ScenarioResult(
-                        name="reattach_during_concurrent_calls",
-                        passed=False, timings_ms=timings,
-                        error="reattach.ok never fired",
-                    )
-                if reattach_count > 1:
-                    return ScenarioResult(
-                        name="reattach_during_concurrent_calls",
-                        passed=False, timings_ms=timings,
-                        error=(
-                            f"reattach.ok fired {reattach_count}× — "
-                            "expected exactly 1 for a batch of "
-                            "concurrent calls"
-                        ),
-                    )
-                wake_ms = reattach_events[0].get("reattach_duration_ms")
-                if isinstance(wake_ms, (int, float)):
-                    timings["wake_from_paused_ms"] = float(wake_ms)
+        sessions = {id(session) for session, _ in results}
+        if len(sessions) != 1:
+            return _failed(
+                name, timings,
+                f"the three calls ran on {len(sessions)} sessions: calls "
+                f"arriving together after a wake must share one rebuild",
+            )
+        if results[0][0] is old_session:
+            return _failed(
+                name, timings,
+                "the calls were handed the session the pause ended",
+            )
+        ref_after = await persistence.get(
+            org_id=org_id, upstream_id=upstream.id,
+        )
+        problem = _kept_sandbox_problem(
+            since_ns=wake_ns, sandbox_id=sandbox_id, old_pid=old_pid,
+            ref=ref_after,
+        )
+        if problem is not None:
+            return _failed(
+                name, timings, f"{problem} | events: {_wake_trace(idle_ns)}",
+            )
+        lazy = _log_capture.find_events(
+            "upstream.client.lazy_connect.success", since_ns=wake_ns,
+        )
+        if len(lazy) != 1:
+            return _failed(
+                name, timings,
+                f"expected one lazy attach for the three calls, got "
+                f"{len(lazy)} | events: {_wake_trace(idle_ns)}",
+            )
         return ScenarioResult(
-            name="reattach_during_concurrent_calls", passed=True,
-            timings_ms=timings,
+            name=name, passed=True, timings_ms=timings,
             notes=[
-                "3 concurrent echoes after pause — all routed correctly",
-                "reattach.ok fired exactly once for the batch",
+                "3 calls after the wake shared one rebuild; each got its "
+                "own answer",
+                f"events: {_wake_trace(idle_ns)}",
+                *_reopen_warnings(wake_ns),
             ],
         )
     except Exception as exc:
-        return ScenarioResult(
-            name="reattach_during_concurrent_calls", passed=False,
-            timings_ms=timings,
-            error=f"{type(exc).__name__}: {exc}",
+        return _failed(
+            name, timings,
+            f"{_error_text(exc)} | events: {_wake_trace(idle_ns)}",
         )
+    finally:
+        with contextlib.suppress(Exception):
+            await manager.stop_all()
+        if sandbox_id is not None:
+            with contextlib.suppress(Exception):
+                await cleanup_client.kill_sandbox(sandbox_id)
 
 
 async def bad_api_key_auth_failed() -> ScenarioResult:
@@ -2734,7 +3218,10 @@ async def concurrent_calls() -> ScenarioResult:
 
 
 def _make_ucm(
-    *, upstream: UpstreamDefinition, service: E2BSandboxService,
+    *,
+    upstream: UpstreamDefinition,
+    service: E2BSandboxService,
+    persistence: persistence_port.SandboxPersistenceRepository | None = None,
 ) -> UpstreamClientManager:
     """Build an :class:`UpstreamClientManager` wired to a real E2B
     service — the same shape ``_build_sandbox_provider_plumbing`` in
@@ -2742,12 +3229,16 @@ def _make_ucm(
     every scenario that needs UCM goes through the prod constructor
     contract; if that signature changes, the integration suite
     breaks loudly rather than silently drifting.
+
+    Pass the service's ``persistence`` too when the service has one,
+    as production does (the manager caches the MCP's identity in it).
     """
     return UpstreamClientManager(
         upstreams=[upstream],
         org_id=f"acme-{RUN_ID}",
         sandbox_resolver=SandboxResolver(global_provider="e2b"),
         sandbox_services={"e2b": service},
+        sandbox_persistence=persistence,
         mcpolis_instance=f"e2e-{RUN_ID}",
     )
 
@@ -3013,13 +3504,13 @@ SCENARIOS: list[tuple[str, Scenario]] = [
     ("subprocess_crashes_mid_session", subprocess_crashes_mid_session),
     ("bad_command", bad_command),
     ("mcpolis_driven_pause_resume", mcpolis_driven_pause_resume),
-    # Reattach scenarios last — each sleeps past the idle window
-    # (30s+); back-to-back they dominate wall clock. Running them
-    # at the end means a fast failure in earlier scenarios doesn't
-    # cost the operator the reattach budget.
-    ("reattach_after_idle_pause", reattach_after_idle_pause),
-    ("reattach_via_ucm", reattach_via_ucm),
-    ("reattach_during_concurrent_calls", reattach_during_concurrent_calls),
+    # Wake scenarios after the fast ones — each idles past the pause
+    # window (40s); back-to-back they dominate wall clock. Running them
+    # later means a fast failure in earlier scenarios doesn't cost the
+    # operator the idle budget.
+    ("wake_after_idle_pause", wake_after_idle_pause),
+    ("wake_via_ucm", wake_via_ucm),
+    ("wake_during_concurrent_calls", wake_during_concurrent_calls),
     # Stop/start scenarios (reuse + fresh) — exercise the
     # reuse-on-restart code path (`E2BSandboxService` with
     # ``reuse_sandboxes_on_restart=True``) and its
@@ -3039,17 +3530,17 @@ SCENARIOS: list[tuple[str, Scenario]] = [
     # Option-A loose semantics: when "Ready" is true at boot for
     # a cached upstream, the first user request must succeed even
     # if the underlying E2B-side state diverged since shutdown.
-    # Three perturbations that all promise the same recovery
-    # contract: kill+fresh-create transparently, tool call works.
+    # A killed sandbox is replaced by a fresh one; a live sandbox whose
+    # MCP process died is kept, and only the process is replaced.
     ("restart_recovers_from_killed_sandbox", restart_recovers_from_killed_sandbox),
     ("restart_recovers_from_dead_mcp_process", restart_recovers_from_dead_mcp_process),
     # The "stale-config" scenario inverts under kill-on-stop: drift
     # is now ignored on boot reconnect (must reattach), not killed +
     # fresh-created. Renamed accordingly.
     ("restart_reattaches_through_stale_config", restart_reattaches_through_stale_config),
-    # ``double_reattach`` is the slowest single scenario (~75s of
-    # sleep alone). Goes last.
-    ("double_reattach", double_reattach),
+    # ``double_wake`` is the slowest single scenario (two 40s idle
+    # windows). Goes last.
+    ("double_wake", double_wake),
 ]
 
 

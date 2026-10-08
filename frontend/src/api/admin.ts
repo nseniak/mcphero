@@ -20,12 +20,6 @@ export function fetchUpstreams(): Promise<UpstreamSummary[]> {
   return apiFetch<UpstreamSummary[]>("/api/admin/upstreams");
 }
 
-export function refreshUpstreamStatus(): Promise<UpstreamSummary[]> {
-  return apiFetch<UpstreamSummary[]>("/api/admin/upstreams/refresh-status", {
-    method: "POST",
-  });
-}
-
 export function fetchUpstream(id: string): Promise<UpstreamDetail> {
   return apiFetch<UpstreamDetail>(`/api/admin/upstreams/${id}`);
 }
@@ -192,6 +186,27 @@ export function disconnectUpstream(id: string): Promise<void> {
   return apiFetch<void>(
     `/api/admin/upstreams/${id}/disconnect`,
     { method: "POST" },
+  );
+}
+
+export interface SignOutResponse {
+  status: string;
+  /** The admin whose saved sign-in was deleted; null when it was
+   *  already gone (another admin removed it first). */
+  email: string | null;
+}
+
+/** Remove sign-in: delete the admin sign-in the admin tab shows for an
+ *  OAuth MCP, so another admin can sign in with Authenticate. ``email``
+ *  is the admin the confirm dialog named; the backend refuses (409)
+ *  when another admin's sign-in is shown by now. */
+export function signOutUpstream(
+  id: string,
+  email: string,
+): Promise<SignOutResponse> {
+  return apiFetch<SignOutResponse>(
+    `/api/admin/upstreams/${id}/sign-out`,
+    { method: "POST", body: JSON.stringify({ email }) },
   );
 }
 

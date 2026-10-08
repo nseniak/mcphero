@@ -13,6 +13,7 @@ sake of zero-infra dev. Cloud mode wires in the Mongo impl.
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 from mcpolis.domain.ports.sandbox_persistence_repository import (
     SandboxPersistedRef,
@@ -26,6 +27,8 @@ class InMemorySandboxPersistenceRepository(SandboxPersistenceRepository):
     def __init__(self) -> None:
         self._refs: dict[tuple[str, str], SandboxPersistedRef] = {}
         self._lock = asyncio.Lock()
+        # Refs die with the process, so the id does too.
+        self._instance_id = uuid.uuid4().hex
 
     async def upsert(self, ref: SandboxPersistedRef) -> None:
         async with self._lock:
@@ -57,6 +60,9 @@ class InMemorySandboxPersistenceRepository(SandboxPersistenceRepository):
                 ref for (oid, _), ref in self._refs.items()
                 if oid == org_id
             ]
+
+    async def get_or_create_instance_id(self) -> str:
+        return self._instance_id
 
     async def list_all_unscoped(self) -> list[SandboxPersistedRef]:
         async with self._lock:

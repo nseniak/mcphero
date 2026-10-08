@@ -15,7 +15,7 @@ working.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import APIRouter
@@ -23,13 +23,18 @@ from fastapi import APIRouter
 from mcpolis.adapters.auth.pending_auth import PendingAuthCoordinator
 from mcpolis.adapters.repositories.audit_repository import AuditRepository
 from mcpolis.adapters.repositories.connection_store import ConnectionStore
+from mcpolis.domain.model.email_allowlist import EmailAllowlist
 from mcpolis.domain.ports.config_repository import ConfigRepository
 from mcpolis.domain.ports.event_stream import EventStream
 from mcpolis.domain.ports.sandbox_file_repository import SandboxFileRepository
 from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
 from mcpolis.domain.ports.organization_repository import OrganizationRepository
+from mcpolis.domain.services.admin_actions import AdminActionDeps
 from mcpolis.domain.services.org_runtime import OrgRuntimeManager
+from mcpolis.domain.services.role_admin_service import RoleAdminService
 from mcpolis.domain.services.service_token_service import ServiceTokenService
+from mcpolis.domain.services.upstream_admin_service import UpstreamAdminService
+from mcpolis.domain.services.user_admin_service import UserAdminService
 from mcpolis.entrypoints.routes.dashboard._deps import DashboardDeps
 from mcpolis.entrypoints.routes.dashboard.audit import create_audit_router
 from mcpolis.entrypoints.routes.dashboard.auth_connect import (
@@ -37,6 +42,9 @@ from mcpolis.entrypoints.routes.dashboard.auth_connect import (
 )
 from mcpolis.entrypoints.routes.dashboard.config import create_config_router
 from mcpolis.entrypoints.routes.dashboard.events import create_events_router
+from mcpolis.entrypoints.routes.dashboard.invitations import (
+    create_invitations_router,
+)
 from mcpolis.entrypoints.routes.dashboard.gateway_admin import (
     create_gateway_admin_router,
 )
@@ -82,7 +90,7 @@ def create_dashboard_api_router(
     get_startup_status: Callable[[], StartupStatusResponse] | None = None,
     get_gateway_connected_users: Callable[[], list[str]] | None = None,
     revoke_gateway_user: Callable[[str], int] | None = None,
-    terminate_gateway_sessions: Callable[[str, str], int] | None = None,
+    terminate_gateway_sessions: Callable[[str, str], Awaitable[int]] | None = None,
     event_bus: EventStream | None = None,
     list_admin_mcp_tools: Callable[[], Any] | None = None,
     allow_stdio_mcp: bool = True,
@@ -92,6 +100,8 @@ def create_dashboard_api_router(
     sandbox_file_repo: SandboxFileRepository | None = None,
     gateway_url: str | None = None,
     service_token_service: ServiceTokenService | None = None,
+    superadmin_emails: EmailAllowlist | None = None,
+    get_session_user: Callable[..., str] | None = None,
 ) -> APIRouter:
     if template_var_repo is None:
         raise RuntimeError(
@@ -102,6 +112,21 @@ def create_dashboard_api_router(
         raise RuntimeError(
             "create_dashboard_api_router requires service_token_service"
         )
+    action_deps = AdminActionDeps(
+        runtime_manager=runtime_manager,
+        policy_store=policy_store,
+        audit_repo=audit_repo,
+        connection_store=connection_store,
+        auth_coordinator=auth_coordinator,
+        server_url=server_url,
+        event_bus=event_bus,
+        org_repo=org_repo,
+        allow_stdio_mcp=allow_stdio_mcp,
+        revoke_gateway_user=revoke_gateway_user,
+        terminate_gateway_sessions=terminate_gateway_sessions,
+        template_var_repo=template_var_repo,
+        service_token_service=service_token_service,
+    )
     deps = DashboardDeps(
         runtime_manager=runtime_manager,
         policy_store=policy_store,
@@ -122,8 +147,16 @@ def create_dashboard_api_router(
         org_repo=org_repo,
         is_cloud_mode=is_cloud_mode,
         template_var_repo=template_var_repo,
+        user_admin=UserAdminService(action_deps),
+        upstream_admin=UpstreamAdminService(action_deps),
+        role_admin=RoleAdminService(action_deps),
         sandbox_file_repo=sandbox_file_repo,
         service_token_service=service_token_service,
+        superadmin_emails=(
+            superadmin_emails if superadmin_emails is not None
+            else EmailAllowlist()
+        ),
+        get_session_user=get_session_user,
     )
 
     combined = APIRouter()
@@ -145,4 +178,5 @@ def create_dashboard_api_router(
     combined.include_router(create_auth_connect_router(deps))
     combined.include_router(create_config_router(deps))
     combined.include_router(create_events_router(deps))
+    combined.include_router(create_invitations_router(deps))
     return combined

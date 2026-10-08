@@ -18,10 +18,12 @@ Coverage:
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from mcpolis.adapters.event_stream_inprocess import InProcessEventStream
 from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (
@@ -102,9 +104,6 @@ def make_persisted_ref(
         cached_self_description=None,
         last_updated=datetime.now(tz=timezone.utc),
     )
-
-
-import asyncio
 
 
 def make_wildcard_subscriber(
@@ -332,7 +331,7 @@ async def test_reconcile_runs_and_publishes_event_under_default_org() -> None:
     # Orphan got killed.
     assert any(k.sandbox_id == "sbx-orphan" for k in mock.kills)
     # Known paused snapshot survived.
-    assert "snap-known" not in mock.deleted_snapshots
+    assert all(k.sandbox_id != "snap-known" for k in mock.kills)
     # Event landed on the wildcard subscriber.
     events = drain(subscriber)
     assert len(events) == 1
@@ -345,3 +344,43 @@ async def test_reconcile_runs_and_publishes_event_under_default_org() -> None:
     assert p["mcpolis_instance"] == "instance-A"
     assert p["killed_orphan_sandboxes"] == 1
     assert p["kept_paused_snapshots"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_hung_reconcile_does_not_hold_the_boot() -> None:
+    """The boot waits for the reconcile before it serves anything. An
+    E2B API that never answers must not hold it: past its bound the
+    reconcile is cut, the cut is logged, and the boot goes on without a
+    report."""
+    service, mock = make_e2b_service(instance="instance-A")
+    never = asyncio.Event()
+
+    async def list_that_hangs(
+        *, metadata_filter: dict[str, str] | None = None,
+    ) -> list[MockE2BSandboxInfo]:
+        del metadata_filter
+        await never.wait()
+        return []
+
+    mock.list_sandboxes = list_that_hangs  # type: ignore[method-assign,assignment]
+    persistence = _FakeMongoSandboxPersistenceRepository()
+    event_stream = InProcessEventStream()
+    subscriber = make_wildcard_subscriber(event_stream)
+
+    with capture_logs() as logs:
+        await asyncio.wait_for(
+            _run_sandbox_reconcile_at_boot(
+                settings=make_settings(provider="e2b"),
+                storage=make_storage_stub(persistence, event_stream),
+                sandbox_services={"e2b": service},
+                mcpolis_instance="instance-A",
+                event_stream=event_stream,
+                timeout_seconds=0.05,
+            ),
+            timeout=5,
+        )
+
+    assert drain(subscriber) == []
+    assert [e["event"] for e in logs if e["event"] == "sandbox.reconcile.timed_out"] == [
+        "sandbox.reconcile.timed_out",
+    ]

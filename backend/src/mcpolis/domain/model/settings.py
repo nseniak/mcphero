@@ -23,7 +23,8 @@ class ToolAccessConfig(BaseModel):
     Resolution order:
     1. Category defaults in ``category_defaults`` (deny wins)
     2. Explicit per-tool setting in ``tools``
-    3. Catch-all ``fallback_enabled`` (True if None = allow unknown tools)
+    3. Catch-all ``fallback_enabled``; unset (None) denies every tool not
+       listed in ``tools``
     """
 
     fallback_enabled: bool | None = None
@@ -52,6 +53,16 @@ class RoleDefinition(BaseModel):
 
 class UserDefinition(BaseModel):
     role: str
+
+
+class OrgUserEntry(BaseModel):
+    """One org's entry for an address in its users: a member, or an
+    invitation not accepted yet. ``email`` is spelled as the org stores
+    it."""
+
+    org_id: str
+    email: str
+    user: UserDefinition
 
 
 class UpstreamOptions(BaseModel):

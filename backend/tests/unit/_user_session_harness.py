@@ -53,6 +53,10 @@ class ConnectionGate:
         self.opened = 0
         self.hold: set[int] = hold if hold is not None else set()
         self.release = asyncio.Event()
+        # The ``hold`` tool: set once a call is inside it, which then
+        # waits for ``tool_release``.
+        self.tool_entered = asyncio.Event()
+        self.tool_release = asyncio.Event()
 
 def make_upstream_server(gate: ConnectionGate) -> FastMCP:
     """A remote MCP server shaped like ``drop``: an ``echo`` tool, plus a
@@ -71,6 +75,12 @@ def make_upstream_server(gate: ConnectionGate) -> FastMCP:
     @server.tool(name="echo", description="Echo back the message")
     def echo(message: str) -> str:  # pyright: ignore[reportUnusedFunction]
         return f"echo:{message}"
+
+    @server.tool(name="hold", description="Wait until the test releases it")
+    async def hold() -> str:  # pyright: ignore[reportUnusedFunction]
+        gate.tool_entered.set()
+        await gate.tool_release.wait()
+        return "released"
 
     @server.tool(name="whoami", description="The bearer this session uses")
     def whoami(ctx: Context) -> str:  # type: ignore[type-arg]  # pyright: ignore[reportUnusedFunction, reportMissingTypeArgument, reportUnknownParameterType]

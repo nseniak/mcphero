@@ -1,0 +1,20 @@
+{
+  "about": "Pairs of addresses that the dashboard (sameEmail in frontend/src/lib/email-address.ts) and the backend (same_email in backend/src/mcpolis/domain/model/email_address.py) must both call one person, or both call two people. Only ASCII letter case and ASCII white space at the ends are ignored.",
+  "same": [
+    ["Bob@Acme.com", "bob@acme.com"],
+    ["BOB@ACME.COM", "bob@acme.com"],
+    [" bob@acme.com ", "bob@acme.com"],
+    ["\tBob@Acme.com\r\n", "bob@acme.com"],
+    ["Ünal@Example.COM", "Ünal@example.com"]
+  ],
+  "different": [
+    ["bob@acme.com", "rob@acme.com"],
+    ["strasse@example.de", "straße@example.de"],
+    ["sam@example.com", "ſam@example.com"],
+    ["kate@example.com", "Kate@example.com"],
+    ["ünal@example.com", "Ünal@example.com"],
+    [" bob@acme.com", "bob@acme.com"],
+    ["bob@acme.com﻿", "bob@acme.com"],
+    ["bob@acme.com\u001c", "bob@acme.com"]
+  ]
+}

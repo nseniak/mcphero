@@ -26,6 +26,7 @@ class AuditRepository:
 
     async def search_cross_org(
         self,
+        org_id: str | None = None,
         user_id: str | None = None,
         mcp_id: str | None = None,
         tool: str | None = None,

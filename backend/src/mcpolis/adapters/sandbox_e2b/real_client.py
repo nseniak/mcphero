@@ -19,7 +19,6 @@ API mapping (E2BClient → e2b SDK):
   handle (the SDK's class-method variant takes per-call api_key
   opts; routing through a freshly-connected handle lets the
   per-key auth path stay uniform).
-- ``delete_snapshot`` → ``AsyncSandbox.delete_snapshot(snapshot_id)``.
 
 SDK exceptions (``AuthenticationException``, ``RateLimitException``,
 ``NotFoundException``) are wrapped as :class:`E2BAuthError` /
@@ -629,20 +628,18 @@ class RealE2BClient:
             # takes a sandbox id. Routing through ``connect`` would
             # require an extra round-trip; the class-method form
             # is one HTTP call.
-            await e2b.AsyncSandbox._cls_kill(  # pyright: ignore[reportPrivateUsage]
+            killed: bool = await e2b.AsyncSandbox._cls_kill(  # pyright: ignore[reportPrivateUsage]
                 sandbox_id=sandbox_id, **self._opts,
             )
         except Exception as exc:
             raise _wrap_sdk_error(exc) from exc
-
-    async def delete_snapshot(self, snapshot_id: str) -> None:
-        e2b = _import_sdk()
-        try:
-            await e2b.AsyncSandbox.delete_snapshot(
-                snapshot_id=snapshot_id, **self._opts,
+        # The SDK answers a 404 with ``False`` instead of raising. Say so,
+        # or "already gone" reads as "killed" to every caller.
+        if not killed:
+            raise E2BNotFoundError(
+                "SandboxNotFoundException",
+                f"sandbox {sandbox_id} not found",
             )
-        except Exception as exc:
-            raise _wrap_sdk_error(exc) from exc
 
     async def create_volume(self, *, name: str) -> str:
         e2b = _import_sdk()

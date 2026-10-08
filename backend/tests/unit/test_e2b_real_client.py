@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import e2b
 import pytest
 
 from mcpolis.adapters.sandbox_e2b import (
@@ -650,6 +651,52 @@ async def test_destroy_volume_routes_to_async_volume_destroy() -> None:
     assert call_args is not None
     assert call_args.args == ("vol-bye",)
     assert call_args.kwargs["api_key"] == "key-abc"
+
+
+def make_sdk_with_kill_answer(killed: bool) -> MagicMock:
+    """A stand-in ``e2b`` module whose class-method kill answers
+    ``killed``, as the SDK does: ``False`` for a 404 (no such sandbox),
+    instead of raising."""
+    e2b_mod = MagicMock()
+    e2b_mod.AsyncSandbox._cls_kill = AsyncMock(return_value=killed)
+    e2b_mod.AuthenticationException = e2b.AuthenticationException
+    e2b_mod.RateLimitException = e2b.RateLimitException
+    e2b_mod.NotFoundException = e2b.NotFoundException
+    return e2b_mod
+
+
+@pytest.mark.asyncio
+async def test_kill_sandbox_reports_a_missing_sandbox_as_not_found() -> None:
+    """Killing a sandbox that is already gone must say so. Read as a
+    success, "already gone" looked like "killed" to every caller, and
+    Stop's not-found branch never ran."""
+    e2b_mod = make_sdk_with_kill_answer(False)
+    with patch(
+        "mcpolis.adapters.sandbox_e2b.real_client._import_sdk",
+        return_value=e2b_mod,
+    ):
+        client = RealE2BClient(api_key="key-abc")
+        with pytest.raises(E2BNotFoundError):
+            await client.kill_sandbox("sbx-gone")
+
+    e2b_mod.AsyncSandbox._cls_kill.assert_awaited_once_with(
+        sandbox_id="sbx-gone", api_key="key-abc",
+    )
+
+
+@pytest.mark.asyncio
+async def test_kill_sandbox_returns_quietly_when_the_sdk_killed_it() -> None:
+    e2b_mod = make_sdk_with_kill_answer(True)
+    with patch(
+        "mcpolis.adapters.sandbox_e2b.real_client._import_sdk",
+        return_value=e2b_mod,
+    ):
+        client = RealE2BClient(api_key="key-abc")
+        await client.kill_sandbox("sbx-live")
+
+    e2b_mod.AsyncSandbox._cls_kill.assert_awaited_once_with(
+        sandbox_id="sbx-live", api_key="key-abc",
+    )
 
 
 # ---------- import-error path ----------

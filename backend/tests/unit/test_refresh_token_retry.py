@@ -51,6 +51,8 @@ from mcpolis.domain.services.oauth_refresh import (
     TOKEN_REFRESH_RETRY_DELAY,
     refresh_token_for_user,
 )
+from mcpolis.domain.services.sign_in_refresh_lock import SignInRefreshLock
+from tests.unit.factories import make_sign_in_warner
 
 UPSTREAM_ID = "notion"
 USER_ID = "__admin__"
@@ -59,13 +61,13 @@ SERVER_URL = "https://gateway.example.invalid"
 CALLBACK_URL = f"{SERVER_URL}/api/oauth/upstream/callback"
 
 
-def _make_upstream() -> UpstreamDefinition:
+def _make_upstream(mode: AuthMode = AuthMode.admin_oauth) -> UpstreamDefinition:
     return UpstreamDefinition(
         id=UPSTREAM_ID,
         display_name="Notion",
         transport=TransportType.streamable_http,
         http=HttpTransportConfig(url=UPSTREAM_URL),
-        auth=UpstreamAuthConfig(mode=AuthMode.admin_oauth),
+        auth=UpstreamAuthConfig(mode=mode),
     )
 
 
@@ -80,11 +82,13 @@ def _make_expiring_token() -> OAuthToken:
     )
 
 
-async def _seed(store: FileConnectionStore) -> OAuthToken:
+async def _seed(
+    store: FileConnectionStore, user_id: str = USER_ID,
+) -> OAuthToken:
     token = _make_expiring_token()
-    await store.put_user_token(DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID, token)
+    await store.put_user_token(DEFAULT_ORG_ID, user_id, UPSTREAM_ID, token)
     await store.put_client_info(
-        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
+        DEFAULT_ORG_ID, UPSTREAM_ID, user_id,
         OAuthClientInformationFull(
             client_id="cid",
             client_secret="csec",
@@ -1157,17 +1161,33 @@ async def test_silent_reconnect_auth_required_detected_inside_exception_group(
 
 
 @pytest.mark.asyncio
-async def test_invalid_grant_notifies_user_inline_before_deleting(
+@pytest.mark.parametrize("error_code", ["invalid_grant", "invalid_client"])
+@pytest.mark.parametrize(
+    ("mode", "user_id", "recipient", "page"),
+    [
+        # An admin sign-in: every admin is told, sent to the admin page.
+        (AuthMode.admin_oauth, USER_ID, "admin@example.invalid",
+         f"/orgs/acme/admin/upstream/{UPSTREAM_ID}"),
+        # A member's own sign-in: that member is told, sent to My Tools.
+        (AuthMode.per_user_oauth, "alice@example.invalid",
+         "alice@example.invalid", "/orgs/acme/my-tools"),
+    ],
+)
+async def test_terminal_rejection_deletes_then_warns_inline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    mode: AuthMode,
+    user_id: str,
+    recipient: str,
+    page: str,
 ) -> None:
-    """With the §5.2 notifier wired in, an ``invalid_grant`` verdict must
-    send the re-auth email AND delete the token. The send has to happen
-    while the signature + token still exist — the delete (and
-    ``reset_refresh_failures``) tears down exactly the state the notifier
-    reads, so a send deferred to the hourly sweep would find nothing.
-    Proven by a ``StubEmailSender`` recording one message and the token
-    being gone afterward."""
+    """With the §5.2 warner wired in, a terminal verdict
+    (``invalid_grant`` or ``invalid_client``: both delete the sign-in at
+    once) must delete the token AND send the re-auth email right then.
+    The hourly sweep walks stored tokens, so it would never find this
+    deleted pair. Proven by a ``StubEmailSender`` recording one message
+    and the token being gone afterward."""
     from mcp.client.auth import OAuthClientProvider
 
     from mcpolis.adapters.email.stub_email_sender import StubEmailSender
@@ -1178,7 +1198,7 @@ async def test_invalid_grant_notifies_user_inline_before_deleting(
     )
 
     store = FileConnectionStore(tmp_path)
-    await _seed(store)
+    await _seed(store, user_id)
     _install_fake_client(monkeypatch, [None])
     _install_fake_sleep(monkeypatch)
 
@@ -1190,8 +1210,8 @@ async def test_invalid_grant_notifies_user_inline_before_deleting(
         if isinstance(provider, _InitializingOAuthClientProvider):
             provider.last_refresh_failure = RefreshFailureSignature(
                 status_code=400,
-                body_excerpt='{"error":"invalid_grant"}',
-                error_code="invalid_grant",
+                body_excerpt=f'{{"error":"{error_code}"}}',
+                error_code=error_code,
                 timestamp=now,
             )
         return provider
@@ -1199,32 +1219,30 @@ async def test_invalid_grant_notifies_user_inline_before_deleting(
     monkeypatch.setattr(oauth_refresh, "_build_oauth_provider", _build_with_sig)
 
     sender = StubEmailSender()
-
-    async def _resolver(_org_id: str) -> list[str]:
-        return ["admin@example.invalid"]
+    warner = make_sign_in_warner(sender, ["admin@example.invalid"])
 
     await refresh_token_for_user(
         org_id=DEFAULT_ORG_ID,
-        upstream=_make_upstream(),  # admin_oauth → resolver supplies recipient
-        user_id=USER_ID,
+        upstream=_make_upstream(mode),
+        user_id=user_id,
         connection_store=store,
         server_url=SERVER_URL,
-        email_sender=sender,
-        admin_email_resolver=_resolver,
-        hmac_key=b"test-hmac-key",
+        warner=warner,
     )
+    await warner.drain()
 
-    # Exactly one re-auth email, to the resolved admin recipient.
-    assert len(sender.sent) == 1
-    assert sender.sent[0].to == "admin@example.invalid"
+    # Exactly one re-auth email, to the right person and page.
+    assert [m.to for m in sender.sent] == [recipient]
+    assert f"{SERVER_URL}{page}" in sender.sent[0].body_text
     # Token still deleted — the loop converges.
     assert await store.get_user_token(
-        DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
+        DEFAULT_ORG_ID, user_id, UPSTREAM_ID,
     ) is None
-    # Notified marker set so the hourly sweep won't double-send.
+    # The inline warning leaves the sweep's "already notified" marker
+    # alone: that marker is about stored sign-ins, and this one is gone.
     assert await store.was_notified(
-        DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
-    ) is True
+        DEFAULT_ORG_ID, UPSTREAM_ID, user_id,
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -1253,9 +1271,7 @@ async def test_silent_reconnect_auth_required_notifies_user_inline(
     _install_fake_sleep(monkeypatch)
 
     sender = StubEmailSender()
-
-    async def _resolver(_org_id: str) -> list[str]:
-        return ["admin@example.invalid"]
+    warner = make_sign_in_warner(sender, ["admin@example.invalid"])
 
     await refresh_token_for_user(
         org_id=DEFAULT_ORG_ID,
@@ -1263,10 +1279,9 @@ async def test_silent_reconnect_auth_required_notifies_user_inline(
         user_id=USER_ID,
         connection_store=store,
         server_url=SERVER_URL,
-        email_sender=sender,
-        admin_email_resolver=_resolver,
-        hmac_key=b"test-hmac-key",
+        warner=warner,
     )
+    await warner.drain()
 
     assert len(sender.sent) == 1
     assert await store.get_user_token(
@@ -1279,12 +1294,12 @@ async def test_invalid_grant_notify_error_is_swallowed_and_token_still_deleted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The inline-notify guard is best-effort. Note *what* can actually
+    """The inline warning is best-effort. Note *what* can actually
     raise: per-recipient send failures are swallowed inside
-    ``check_and_notify_upstream`` itself, so the realistic way to make
-    the notify path raise is the ``admin_email_resolver`` (a policy /
-    membership lookup) — exercised here. When it does, the error is
-    logged as ``notify_failed`` and the token is STILL deleted. A flaky
+    ``SignInWarner.send`` itself, so the realistic way to make the
+    warning raise is the admin lookup (a policy / membership lookup)
+    — exercised here. When it does, the error is
+    logged as ``warn_failed`` and the token is STILL deleted. A flaky
     lookup must not strand the doomed token in storage and keep the
     10-min loop (and its per-tick Sentry ``OAuth flow error``) alive."""
     from mcp.client.auth import OAuthClientProvider
@@ -1317,26 +1332,27 @@ async def test_invalid_grant_notify_error_is_swallowed_and_token_still_deleted(
 
     monkeypatch.setattr(oauth_refresh, "_build_oauth_provider", _build_with_sig)
 
-    async def _boom_resolver(_org_id: str) -> list[str]:
-        raise RuntimeError("policy engine unavailable")
+    warner = make_sign_in_warner(
+        StubEmailSender(),
+        admin_lookup_error=RuntimeError("policy engine unavailable"),
+    )
 
     with structlog.testing.capture_logs() as logs:
         await refresh_token_for_user(
             org_id=DEFAULT_ORG_ID,
-            upstream=_make_upstream(),  # admin_oauth → resolver is consulted
+            upstream=_make_upstream(),  # admin_oauth → admins are looked up
             user_id=USER_ID,
             connection_store=store,
             server_url=SERVER_URL,
-            email_sender=StubEmailSender(),
-            admin_email_resolver=_boom_resolver,
-            hmac_key=b"test-hmac-key",
+            warner=warner,
         )
+        await warner.drain()
 
-    # The notify failure was logged ...
+    # The warning failure was logged ...
     assert [
         e for e in logs
-        if e.get("event") == "oauth.token.refresh.notify_failed"
-    ], f"expected notify_failed log, got: {logs}"
+        if e.get("event") == "upstream.health.sign_in_deleted.warn_failed"
+    ], f"expected warn_failed log, got: {logs}"
     # ... and the token was deleted anyway → the loop still converges.
     assert await store.get_user_token(
         DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
@@ -1455,7 +1471,7 @@ async def test_distributed_lock_released_after_refresh_completes(
         user_id=USER_ID,
         connection_store=store,
         server_url=SERVER_URL,
-        distributed_lock=lock,
+        refresh_lock=SignInRefreshLock(lock),
     )
 
     lock.acquire.assert_awaited_once()
@@ -1463,14 +1479,16 @@ async def test_distributed_lock_released_after_refresh_completes(
 
 
 @pytest.mark.asyncio
-async def test_a_sign_in_saved_while_a_rejected_refresh_notifies_is_kept(
+async def test_a_sign_in_saved_while_a_rejected_refresh_is_handled_is_kept_and_not_emailed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The periodic refresh of the stored sign-in is rejected
-    (``invalid_grant``) and emails the user, who signs in again right
-    then. The cleanup that follows must delete only the rejected sign-in,
-    never the new one."""
+    (``invalid_grant``), and the user signs in again just before the
+    cleanup deletes it (here: while the failure is being recorded). The
+    cleanup must delete only the rejected sign-in, never the new one,
+    and must not tell the user to sign in again: the warning goes out
+    only for a sign-in actually deleted."""
     from mcp.client.auth import OAuthClientProvider
 
     from mcpolis.adapters.email.stub_email_sender import StubEmailSender
@@ -1499,7 +1517,11 @@ async def test_a_sign_in_saved_while_a_rejected_refresh_notifies_is_kept(
 
     monkeypatch.setattr(oauth_refresh, "_build_oauth_provider", _build_with_sig)
 
-    async def _resolver_while_the_user_signs_in(_org_id: str) -> list[str]:
+    real_record = store.record_refresh_failure
+
+    async def _record_while_the_user_signs_in(
+        *args: Any, **kwargs: Any,
+    ) -> tuple[int, datetime]:
         await store.put_user_token(
             DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
             OAuthToken(
@@ -1509,23 +1531,29 @@ async def test_a_sign_in_saved_while_a_rejected_refresh_notifies_is_kept(
                 scopes=[],
             ),
         )
-        return ["admin@example.invalid"]
+        return await real_record(*args, **kwargs)
 
+    monkeypatch.setattr(
+        store, "record_refresh_failure", _record_while_the_user_signs_in,
+    )
+
+    sender = StubEmailSender()
+    warner = make_sign_in_warner(sender, ["admin@example.invalid"])
     await refresh_token_for_user(
         org_id=DEFAULT_ORG_ID,
         upstream=_make_upstream(),
         user_id=USER_ID,
         connection_store=store,
         server_url=SERVER_URL,
-        email_sender=StubEmailSender(),
-        admin_email_resolver=_resolver_while_the_user_signs_in,
-        hmac_key=b"test-hmac-key",
+        warner=warner,
     )
+    await warner.drain()
 
     stored = await store.get_user_token(DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID)
     assert stored is not None and stored.access_token == "new-at", (
         "the rejected refresh's cleanup deleted the sign-in made meanwhile"
     )
+    assert sender.sent == [], "the user was told to sign in again after doing so"
 
 
 @pytest.mark.asyncio
@@ -1589,9 +1617,7 @@ async def test_a_rejection_of_a_replaced_sign_in_is_not_counted_or_emailed(
 
     monkeypatch.setattr(oauth_refresh, "_build_oauth_provider", _build_with_sig)
     sender = StubEmailSender()
-
-    async def _resolver(_org_id: str) -> list[str]:
-        return ["admin@example.invalid"]
+    warner = make_sign_in_warner(sender, ["admin@example.invalid"])
 
     await refresh_token_for_user(
         org_id=DEFAULT_ORG_ID,
@@ -1599,10 +1625,9 @@ async def test_a_rejection_of_a_replaced_sign_in_is_not_counted_or_emailed(
         user_id=USER_ID,
         connection_store=store,
         server_url=SERVER_URL,
-        email_sender=sender,
-        admin_email_resolver=_resolver,
-        hmac_key=b"test-hmac-key",
+        warner=warner,
     )
+    await warner.drain()
 
     assert sender.sent == [], "the user was emailed about a sign-in they replaced"
     assert await store.get_refresh_failures(

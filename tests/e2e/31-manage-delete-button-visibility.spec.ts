@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { BACKEND_URL, createOrg, loginAs } from "./helpers";
+import { BACKEND_URL, acceptInvitation, createOrg, loginAs } from "./helpers";
 
 /**
  * The /orgs/manage table renders a Trash2 (``title="Delete
@@ -31,10 +31,11 @@ test("manage-page delete button visible only on admin rows", async ({
   });
   expect([200, 201]).toContain(resp.status());
 
-  // User signs in (membership materializes) and creates ORG_OWN
-  // (admin there).
+  // User signs in, accepts the invitation (now a member of ORG_USER)
+  // and creates ORG_OWN (admin there).
   await loginAs(page, USER);
   const pageReq = page.context().request;
+  await acceptInvitation(pageReq, ORG_USER);
   resp = await pageReq.post(`${BACKEND_URL}/api/orgs`, {
     data: {
       slug: ORG_OWN,

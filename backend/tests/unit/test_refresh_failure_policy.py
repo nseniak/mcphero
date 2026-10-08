@@ -30,6 +30,9 @@ work end-to-end — same rationale.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -38,6 +41,7 @@ from unittest.mock import AsyncMock
 import pytest
 from mcp.client.auth import OAuthClientProvider
 
+from mcpolis.adapters.email.stub_email_sender import StubEmailSender
 from mcpolis.adapters.repositories.connection_store import OAuthToken
 from mcpolis.adapters.repositories.file_connection_store import (
     FileConnectionStore,
@@ -45,8 +49,13 @@ from mcpolis.adapters.repositories.file_connection_store import (
 from mcpolis.adapters.upstream_clients.client_manager import (
     UpstreamClientManager,
 )
+from mcpolis.adapters.upstream_clients.session_single_flight import (
+    ConnectAborted,
+)
+from mcpolis.domain.model.policy import AuthMode
 from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.domain.ports import DEFAULT_ORG_ID
+from mcpolis.domain.ports.email_sender import EmailSender
 from mcpolis.domain.services import upstream_connection_service
 from mcpolis.domain.services.upstream_connection_service import (  # pyright: ignore[reportPrivateUsage]
     MAX_CONSECUTIVE_TRANSIENT_FAILURES,
@@ -58,11 +67,14 @@ from mcpolis.domain.services.upstream_connection_service import (  # pyright: ig
     purge_user_oauth_state,
     reconnect_with_stored_tokens,
 )
+from mcpolis.domain.services.upstream_health_check import SignInWarner
 from tests.unit.factories import (
     make_oauth_metadata,
     make_oauth_upstream,
     make_refresh_failure_signature,
+    make_sign_in_warner,
     seed_oauth_storage,
+    seed_refresh_failure_streak,
 )
 
 
@@ -295,6 +307,7 @@ async def _seed(
     store: FileConnectionStore,
     *,
     expired: bool = True,
+    refresh_token: str | None = "stored-rt",
 ) -> "OAuthToken":
     """Thin wrapper over ``seed_oauth_storage`` that keeps the
     existing ``expired`` kwarg shape local tests use."""
@@ -304,6 +317,7 @@ async def _seed(
         user_id=USER_ID,
         callback_url=CALLBACK_URL,
         expires_in_minutes=-5 if expired else 30,
+        refresh_token=refresh_token,
     )
 
 
@@ -484,17 +498,7 @@ async def test_reconnect_transient_threshold_eventually_deletes(
 
     # Backdate the initial failure record so subsequent increments
     # land outside the window by the time we hit threshold count.
-    old = datetime.now(UTC) - timedelta(
-        seconds=MIN_TRANSIENT_FAILURE_WINDOW_SECONDS + 60,
-    )
-    key = FileConnectionStore._failures_key(UPSTREAM_ID, USER_ID)  # pyright: ignore[reportPrivateUsage]
-    async with store._lock:  # pyright: ignore[reportPrivateUsage]
-        data = store._read()  # pyright: ignore[reportPrivateUsage]
-        data[key] = {
-            "count": MAX_CONSECUTIVE_TRANSIENT_FAILURES - 1,
-            "first_failure_at": old.isoformat(),
-        }
-        store._write(data)  # pyright: ignore[reportPrivateUsage]
+    await _backdate_failures_to_the_threshold(store)
 
     # The Nth failure crosses the threshold.
     result = await reconnect_with_stored_tokens(
@@ -514,6 +518,289 @@ async def test_reconnect_transient_threshold_eventually_deletes(
     assert await store.get_refresh_failures(
         DEFAULT_ORG_ID, UPSTREAM_ID, USER_ID,
     ) is None
+
+
+ORG_ADMINS = ["owner@example.com"]
+MEMBER = "member@example.com"
+
+
+def make_warning_client_manager(
+    sender: EmailSender,
+) -> tuple[UpstreamClientManager, SignInWarner]:
+    """A client manager whose reconnects fail at connect time, wired to
+    warn by email (health emails on) into ``sender``. Warnings go out in
+    the background: drain the returned warner before asserting."""
+    cm = _make_failing_client_manager()
+    warner = make_sign_in_warner(sender, ORG_ADMINS)
+    cm.set_sign_in_warner(warner)
+    return cm, warner
+
+
+async def _backdate_failures_to_the_threshold(store: FileConnectionStore) -> None:
+    """One more failure crosses the transient-failure threshold."""
+    await seed_refresh_failure_streak(
+        store,
+        upstream_id=UPSTREAM_ID,
+        user_id=USER_ID,
+        failures=MAX_CONSECUTIVE_TRANSIENT_FAILURES - 1,
+        started_ago=timedelta(seconds=MIN_TRANSIENT_FAILURE_WINDOW_SECONDS + 60),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["invalid_grant", "invalid_client"])
+async def test_reconnect_that_deletes_a_refused_sign_in_warns_by_email(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_code: str,
+) -> None:
+    """A reconnect (boot, Start, the hourly probe, a stalled tool call)
+    that deletes a refused sign-in must email the people who can sign in
+    again, as the periodic refresh does. It used to delete with no email,
+    signing the member out silently."""
+    store = FileConnectionStore(tmp_path)
+    await _seed(store)
+    _install_failing_reconnect(monkeypatch, _make_signature(error_code))
+    sender = StubEmailSender()
+    cm, warner = make_warning_client_manager(sender)
+
+    await reconnect_with_stored_tokens(
+        org_id=DEFAULT_ORG_ID,
+        upstream=_make_upstream(),
+        effective_user=USER_ID,
+        connection_store=store,
+        client_manager=cm,
+        server_url=SERVER_URL,
+    )
+    await warner.drain()
+
+    assert await store.get_user_token(
+        DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
+    ) is None
+    assert [m.to for m in sender.sent] == ORG_ADMINS
+    assert (
+        f"{SERVER_URL}/orgs/acme/admin/upstream/{UPSTREAM_ID}"
+        in sender.sent[0].body_text
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconnect_that_deletes_a_member_sign_in_warns_that_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-user sign-in: the member it belongs to is told, and sent to
+    My Tools, where they sign in again."""
+    store = FileConnectionStore(tmp_path)
+    await seed_oauth_storage(
+        store,
+        upstream_id=UPSTREAM_ID,
+        user_id=MEMBER,
+        callback_url=CALLBACK_URL,
+        expires_in_minutes=-5,
+    )
+    _install_failing_reconnect(monkeypatch, _make_signature("invalid_grant"))
+    sender = StubEmailSender()
+    cm, warner = make_warning_client_manager(sender)
+
+    await reconnect_with_stored_tokens(
+        org_id=DEFAULT_ORG_ID,
+        upstream=make_oauth_upstream(
+            id=UPSTREAM_ID, display_name="Notion",
+            mode=AuthMode.per_user_oauth,
+        ),
+        effective_user=MEMBER,
+        connection_store=store,
+        client_manager=cm,
+        server_url=SERVER_URL,
+    )
+    await warner.drain()
+
+    assert await store.get_user_token(DEFAULT_ORG_ID, MEMBER, UPSTREAM_ID) is None
+    assert [m.to for m in sender.sent] == [MEMBER]
+    assert f"{SERVER_URL}/orgs/acme/my-tools" in sender.sent[0].body_text
+
+
+@pytest.mark.asyncio
+async def test_reconnect_deletion_sends_no_second_email_after_the_sweep_sent_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hourly sweep can email about a refused sign-in between the
+    failure being recorded and the delete. The delete then must not send
+    a second email about the same failure."""
+    store = FileConnectionStore(tmp_path)
+    await seed_oauth_storage(
+        store,
+        upstream_id=UPSTREAM_ID,
+        user_id=MEMBER,
+        callback_url=CALLBACK_URL,
+        expires_in_minutes=-5,
+    )
+    await store.mark_notified(DEFAULT_ORG_ID, UPSTREAM_ID, MEMBER)
+    _install_failing_reconnect(monkeypatch, _make_signature("invalid_grant"))
+    sender = StubEmailSender()
+    cm, warner = make_warning_client_manager(sender)
+
+    await reconnect_with_stored_tokens(
+        org_id=DEFAULT_ORG_ID,
+        upstream=make_oauth_upstream(
+            id=UPSTREAM_ID, display_name="Notion",
+            mode=AuthMode.per_user_oauth,
+        ),
+        effective_user=MEMBER,
+        connection_store=store,
+        client_manager=cm,
+        server_url=SERVER_URL,
+    )
+    await warner.drain()
+
+    assert await store.get_user_token(DEFAULT_ORG_ID, MEMBER, UPSTREAM_ID) is None
+    assert sender.sent == []
+
+
+@pytest.mark.asyncio
+async def test_reconnect_that_deletes_after_repeated_failures_sends_no_email(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transient-failure threshold also counts network failures and
+    upstream 5xx, not only refused sign-ins. During a long outage it
+    deletes many sign-ins at once; telling every member to sign in again
+    then, while signing in cannot work, would be wrong. Only a refusal
+    warns."""
+    store = FileConnectionStore(tmp_path)
+    await _seed(store)
+    _install_failing_reconnect(monkeypatch, _make_signature(None))
+    await _backdate_failures_to_the_threshold(store)
+    sender = StubEmailSender()
+    cm, warner = make_warning_client_manager(sender)
+
+    await reconnect_with_stored_tokens(
+        org_id=DEFAULT_ORG_ID,
+        upstream=_make_upstream(),
+        effective_user=USER_ID,
+        connection_store=store,
+        client_manager=cm,
+        server_url=SERVER_URL,
+    )
+    await warner.drain()
+
+    assert await store.get_user_token(
+        DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
+    ) is None
+    assert sender.sent == []
+
+
+@pytest.mark.asyncio
+async def test_reconnect_that_keeps_the_sign_in_sends_no_email(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient failure below the threshold keeps the sign-in, so
+    nobody is told to sign in again."""
+    store = FileConnectionStore(tmp_path)
+    await _seed(store)
+    _install_failing_reconnect(monkeypatch, _make_signature(None))
+    sender = StubEmailSender()
+    cm, warner = make_warning_client_manager(sender)
+
+    await reconnect_with_stored_tokens(
+        org_id=DEFAULT_ORG_ID,
+        upstream=_make_upstream(),
+        effective_user=USER_ID,
+        connection_store=store,
+        client_manager=cm,
+        server_url=SERVER_URL,
+    )
+    await warner.drain()
+
+    assert await store.get_user_token(
+        DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
+    ) is not None
+    assert sender.sent == []
+
+
+@dataclass
+class SlowSender:
+    """A mail server that takes ``delay`` seconds per message."""
+    delay: float
+    sent: list[str] = field(default_factory=list)
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def send_email(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body_text: str,
+        body_html: str | None = None,
+    ) -> None:
+        del subject, body_text, body_html
+        self.started.set()
+        await asyncio.sleep(self.delay)
+        self.sent.append(to)
+
+
+@pytest.mark.asyncio
+async def test_a_slow_mail_server_does_not_hold_the_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconnect is shared: gateway tool calls and dashboard actions
+    wait on it. The warning goes out in the background, so a slow mail
+    server (aiosmtplib waits up to 60 s per step) cannot hold it.
+    (Found by the 2026-10-07 independent review.)"""
+    store = FileConnectionStore(tmp_path)
+    await _seed(store)
+    _install_failing_reconnect(monkeypatch, _make_signature("invalid_grant"))
+    sender = SlowSender(delay=3.0)
+    cm, warner = make_warning_client_manager(sender)
+
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    reason = await reconnect_with_stored_tokens(
+        org_id=DEFAULT_ORG_ID,
+        upstream=_make_upstream(),
+        effective_user=USER_ID,
+        connection_store=store,
+        client_manager=cm,
+        server_url=SERVER_URL,
+    )
+    elapsed = loop.time() - started_at
+    await warner.drain()
+
+    assert reason is DisconnectReason.token_refresh_failed
+    assert elapsed < 1.0, f"the reconnect waited {elapsed:.1f}s for the email"
+    assert sender.sent == ORG_ADMINS
+
+
+@pytest.mark.asyncio
+async def test_the_warning_survives_the_only_caller_giving_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the only request waiting on a reconnect gives up (the MCP
+    client cancels its tool call), the shared reconnect is cancelled. The
+    sign-in is already deleted by then, and nothing would retry the
+    email, so the email must not be cancelled with it.
+    (Found by the 2026-10-07 independent review.)"""
+    store = FileConnectionStore(tmp_path)
+    await _seed(store)
+    _install_failing_reconnect(monkeypatch, _make_signature("invalid_grant"))
+    sender = SlowSender(delay=0.5)
+    cm, warner = make_warning_client_manager(sender)
+
+    caller = asyncio.create_task(reconnect_with_stored_tokens(
+        org_id=DEFAULT_ORG_ID,
+        upstream=_make_upstream(),
+        effective_user=USER_ID,
+        connection_store=store,
+        client_manager=cm,
+        server_url=SERVER_URL,
+    ))
+    await asyncio.wait_for(sender.started.wait(), timeout=5)
+    caller.cancel()
+    with contextlib.suppress(asyncio.CancelledError, ConnectAborted):
+        await caller
+    await asyncio.wait_for(warner.drain(), timeout=5)
+
+    assert await store.get_user_token(
+        DEFAULT_ORG_ID, USER_ID, UPSTREAM_ID,
+    ) is None
+    assert sender.sent == ORG_ADMINS
 
 
 @pytest.mark.asyncio
@@ -610,12 +897,15 @@ async def test_silent_reconnect_auth_required_synthesizes_invalid_grant_and_dele
 ) -> None:
     """When the SDK's 401 handler falls into authorization_code grant
     during a silent reconnect, our ``_noop_callback`` raises
-    ``SilentReconnectAuthRequired``. The outer except detects this
+    ``SilentReconnectAuthRequired``. For a sign-in that has no refresh
+    token (nothing can bring it back), the outer except detects this
     even when wrapped in an ``ExceptionGroup`` (anyio task groups)
     and synthesizes an ``invalid_grant`` signature so §5.1 deletes
     the token immediately and §5.2's email pipeline notifies the
     user — instead of accumulating five identical "transient"
     failures over half an hour while the user wonders what's wrong.
+    (A sign-in WITH a refresh token first gets one forced refresh:
+    ``test_upstream_401_burst_policy.py``.)
 
     This test replicates the 2026-04-25 Mixpanel incident: the probe
     tore down a zombie session, the reconnect's first request got
@@ -630,7 +920,7 @@ async def test_silent_reconnect_auth_required_synthesizes_invalid_grant_and_dele
     )
 
     store = FileConnectionStore(tmp_path)
-    await _seed(store)
+    await _seed(store, refresh_token=None)
 
     # Step-1 trigger: benign — just lets reconnect proceed to Step 3.
     class _DummyClient:
@@ -796,17 +1086,7 @@ async def test_tokens_deleted_log_emits_reason_transient_threshold(
 
     # Backdate the failure record so this Nth call lands outside the
     # window with count == threshold.
-    old = datetime.now(UTC) - timedelta(
-        seconds=MIN_TRANSIENT_FAILURE_WINDOW_SECONDS + 60,
-    )
-    key = FileConnectionStore._failures_key(UPSTREAM_ID, USER_ID)  # pyright: ignore[reportPrivateUsage]
-    async with store._lock:  # pyright: ignore[reportPrivateUsage]
-        data = store._read()  # pyright: ignore[reportPrivateUsage]
-        data[key] = {
-            "count": MAX_CONSECUTIVE_TRANSIENT_FAILURES - 1,
-            "first_failure_at": old.isoformat(),
-        }
-        store._write(data)  # pyright: ignore[reportPrivateUsage]
+    await _backdate_failures_to_the_threshold(store)
 
     with structlog.testing.capture_logs() as logs:
         await reconnect_with_stored_tokens(

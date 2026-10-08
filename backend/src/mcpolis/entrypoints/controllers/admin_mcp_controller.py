@@ -2,75 +2,65 @@
 # NOTE: no `from __future__ import annotations` — FastMCP tool registration
 # uses issubclass() on annotations which breaks with stringified annotations.
 
+import asyncio
 import json
-import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-import structlog
 from mcp.server.fastmcp import FastMCP
 from mcp.server.lowlevel.server import NotificationOptions
 from mcp.server.models import InitializationOptions
 from mcp.types import ToolAnnotations
-from pydantic import ValidationError
 
 from mcpolis.adapters.auth.pending_auth import PendingAuthCoordinator
 from mcpolis.adapters.repositories.connection_store import ConnectionStore
-from mcpolis.domain.model.events import Event
-from mcpolis.domain.model.policy import AuthMode, UpstreamAuthConfig
-from mcpolis.domain.model.settings import (
-    ArgumentConstraint,
-    SettingsConfig,
-    UserDefinition,
-)
+from mcpolis.domain.model.policy import AuthMode
+from mcpolis.domain.model.settings import SettingsConfig
 from mcpolis.domain.model.upstream import (
-    HttpTransportConfig,
-    StdioTransportConfig,
     TransportType,
     UpstreamDefinition,
+    has_service_account_token,
 )
 from mcpolis.adapters.repositories.audit_repository import AuditRepository
 from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.domain.ports.config_repository import ConfigRepository
 from mcpolis.domain.ports.event_stream import EventStream
 from mcpolis.domain.ports.organization_repository import OrganizationRepository
+from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
+from mcpolis.entrypoints.controllers.admin_action_errors import refusal_text
+from mcpolis.entrypoints.controllers.admin_tool_calls import (
+    install_call_tool_wrapper,
+)
 from mcpolis.entrypoints.controllers.gateway_controller import (
+    current_caller_id,
     current_org_id,
-    current_user_id,
 )
-from mcpolis.domain.services.org_runtime import OrgRuntimeManager
-from mcpolis.domain.services.plan_gates import (
-    assert_argument_constraints_allowed,
-    assert_custom_role_capacity,
-    assert_http_upstream_capacity,
-    assert_sandbox_combo_allowed,
-    assert_seat_capacity,
-    assert_stdio_upstream_capacity,
-    resolve_plan,
+from mcpolis.domain.services.admin_actions import (
+    AdminActionDeps,
+    AdminActionRefused,
+    Conflict,
+    NoSignInNeeded,
 )
+from mcpolis.entrypoints.mcp_transport_security import mcp_transport_security
+from mcpolis.domain.services.org_runtime import OrgRuntime, OrgRuntimeManager
+from mcpolis.domain.services.plan_gates import audit_retention_since
 from mcpolis.domain.services.plan_policy import PlanLimitExceeded
-from mcpolis.domain.services.policy_engine import PolicyEngine
+from mcpolis.domain.services.rate_limit_service import RateLimitService
+from mcpolis.domain.services.role_admin_service import RoleAdminService
+from mcpolis.domain.services.secret_scanner import (
+    hide_secret_args,
+    hide_secret_values,
+    hide_secrets_in_text,
+)
 from mcpolis.domain.services.service_token_service import ServiceTokenService
-from mcpolis.domain.services.sandbox_service import (
-    ResourcesUnsupported,
-    SandboxResources,
+from mcpolis.domain.services.upstream_admin_service import (
+    NewUpstreamRequest,
+    UpstreamAdminService,
 )
-from mcpolis.domain.services.settings_resolver import (
-    LAST_ADMIN_DEMOTE_ERROR,
-    LAST_ADMIN_REMOVE_ERROR,
-    resolve_settings,
-    would_remove_last_admin,
-)
+from mcpolis.domain.services.user_admin_service import UserAdminService
 from mcpolis.domain.services.upstream_connection_service import (
-    SessionUnavailable,
-    acquire_and_refresh_with_recovery,
-    initiate_oauth_connection,
-    recovery_effective_user,
+    OAuthConnectResult,
     refresh_all_with_recovery,
-)
-from mcpolis.domain.services.url_safety import (
-    UnsafeUpstreamUrl,
-    validate_upstream_url,
 )
 
 _DEFAULT_ADMIN_INSTRUCTIONS = (
@@ -94,7 +84,40 @@ def _admin_instructions_for_org(
         f"do not use them to perform end-user tasks."
     )
 
-logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
+
+# How long ``start_upstream`` waits for a service-account Start, and a
+# sign-in for its tool discovery, before answering "still running". The
+# action itself keeps going either way. Both stay under the 60 s default
+# request timeout of the MCP SDK clients, so the answer reaches them.
+_START_WAIT_SECONDS = 45.0
+_TOOL_DISCOVERY_WAIT_SECONDS = 40.0
+
+
+class _ToolDiscovery:
+    """The outcome of the tool discovery a sign-in starts."""
+
+    def __init__(self) -> None:
+        self._done = asyncio.Event()
+        self.error: str | None = None
+
+    def finished(self, error: str | None) -> None:
+        self.error = error
+        self._done.set()
+
+    async def wait(self) -> bool:
+        """Wait for the outcome; False if it is still running."""
+        try:
+            await asyncio.wait_for(
+                self._done.wait(), timeout=_TOOL_DISCOVERY_WAIT_SECONDS,
+            )
+        except TimeoutError:
+            return False
+        return True
+
+
+def _split_list(value: str) -> list[str]:
+    """Split a comma-separated tool argument, dropping empty items."""
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 # --- Annotation presets ---
 
@@ -109,17 +132,26 @@ def create_admin_mcp_server(
     runtime_manager: OrgRuntimeManager,
     audit_repo: AuditRepository,
     policy_store: ConfigRepository,
+    *,
+    # Required, so no door forgets it: an ``auth_token`` is saved as
+    # the secret Variable MCP_AUTH_TOKEN.
+    template_var_repo: TemplateVarRepository,
     connection_store: ConnectionStore | None = None,
     auth_coordinator: PendingAuthCoordinator | None = None,
     server_url: str = "http://localhost:8000",
     event_bus: EventStream | None = None,
     revoke_gateway_user: Callable[[str], int] | None = None,
-    terminate_gateway_sessions: Callable[[str, str], int] | None = None,
+    terminate_gateway_sessions: Callable[[str, str], Awaitable[int]] | None = None,
     allow_stdio_mcp: bool = True,
     org_repo: OrganizationRepository | None = None,
     service_token_service: ServiceTokenService | None = None,
+    rate_limits: RateLimitService | None = None,
 ) -> FastMCP:
-    server = FastMCP(name="MCP Hero Admin", streamable_http_path="/")
+    server = FastMCP(
+        name="MCP Hero Admin",
+        streamable_http_path="/",
+        transport_security=mcp_transport_security(),
+    )
 
     # Inject org-scoped ``instructions`` into each new session's
     # ``initialize`` response. Mirrors the gateway controller; we reach
@@ -161,63 +193,84 @@ def create_admin_mcp_server(
 
     # --- Helpers ---
 
-    def _notify_policy_change(
-        *, role: str | None = None, user: str | None = None,
-    ) -> None:
-        """Publish a policy_changed event so gateway sessions get updated tool lists."""
-        if event_bus is None:
-            return
-        payload: dict[str, object] = {}
-        if role is not None:
-            payload["role"] = role
-        if user is not None:
-            payload["user"] = user
-        event_bus.publish(current_org_id.get(), Event(type="policy_changed", payload=payload))
+    # The actions the dashboard shares (see ``domain.services.admin_actions``).
+    action_deps = AdminActionDeps(
+        runtime_manager=runtime_manager,
+        policy_store=policy_store,
+        audit_repo=audit_repo,
+        connection_store=connection_store,
+        auth_coordinator=auth_coordinator,
+        server_url=server_url,
+        event_bus=event_bus,
+        org_repo=org_repo,
+        allow_stdio_mcp=allow_stdio_mcp,
+        revoke_gateway_user=revoke_gateway_user,
+        terminate_gateway_sessions=terminate_gateway_sessions,
+        service_token_service=service_token_service,
+        template_var_repo=template_var_repo,
+    )
+    user_admin = UserAdminService(action_deps)
+    upstream_admin = UpstreamAdminService(action_deps)
+    role_admin = RoleAdminService(action_deps)
 
-    async def _ensure_oauth_session(mcp_id: str) -> None:
-        """If an OAuth upstream has stored tokens but no session, connect.
-
-        Auto-establishes a session under the calling admin's email so
-        ``refresh_upstream_tools`` can list tools immediately after
-        ``connect_upstream``. Skips if any per-user session already
-        exists for the upstream — discovery only needs one live MCP
-        session, regardless of which user owns it.
-        """
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        if connection_store is None or auth_coordinator is None:
-            return
-        upstream = await runtime.config_service.get_upstream(org_id, mcp_id)
-        if upstream is None:
-            return
-        if upstream.auth.mode == AuthMode.service_account:
-            return
-        # Any per-user session for the upstream is enough for
-        # discovery — discovery is identity-agnostic.
-        if runtime.client_manager.any_user_session_for_upstream(
-            mcp_id,
-        ) is not None:
-            return
-        caller_email = current_user_id.get()
-        result = await initiate_oauth_connection(
-            org_id=org_id,
-            upstream=upstream,
-            effective_user=caller_email,
-            connection_store=connection_store,
-            auth_coordinator=auth_coordinator,
-            client_manager=runtime.client_manager,
-            server_url=server_url,
-        )
-        if not result.connected:
-            logger.debug(
-                "admin.mcp.oauth.auto_connect.failed",
-                upstream_id=mcp_id,
-                org_id=org_id,
+    async def _sign_in_text(
+        mcp_id: str, result: OAuthConnectResult, discovery: _ToolDiscovery,
+    ) -> str:
+        """Answer a sign-in. Once connected, wait for the tool discovery
+        the sign-in started, so the answer can give the tool count."""
+        if result.connected:
+            if not await discovery.wait():
+                return (
+                    f"MCP '{mcp_id}' is connected; tool discovery is still "
+                    "running. Run list_upstream_tools in a moment."
+                )
+            if discovery.error is not None:
+                return (
+                    f"MCP '{mcp_id}' is connected but tool discovery "
+                    f"failed: {discovery.error}"
+                )
+            return (
+                f"MCP '{mcp_id}' is connected. "
+                f"Discovered {await _tool_count(mcp_id)} tools."
             )
+        if result.aborted:
+            return (
+                f"The start of '{mcp_id}' was interrupted by a stop."
+            )
+        if result.authorization_url:
+            return (
+                f"Please open this URL in your browser to "
+                f"authorize '{mcp_id}':\n\n"
+                f"{result.authorization_url}\n\n"
+                "After authorizing, run "
+                f"refresh_upstream_tools(mcp_id=\"{mcp_id}\") "
+                "to discover tools."
+            )
+        return f"Error: {result.error or 'connection failed'}"
 
-    def _role_access_json(policy_engine: PolicyEngine, role_name: str) -> str:
+    async def _tool_count(mcp_id: str) -> int:
+        runtime = await runtime_manager.get(current_org_id.get())
+        return len(runtime.tool_registry.get_tools_for_upstreams([mcp_id]))
+
+    async def _status_label(
+        org_id: str, runtime: OrgRuntime, upstream_id: str, connected: bool,
+    ) -> str:
+        if runtime.client_manager.is_starting(upstream_id):
+            return "starting"
+        if connected:
+            return "connected"
+        if connection_store is not None:
+            error = await connection_store.get_connection_error(
+                org_id, upstream_id,
+            )
+            if error:
+                return f"failed: {error}"
+            if not await connection_store.is_enabled(org_id, upstream_id):
+                return "stopped"
+        return "disconnected"
+
+    def _role_access_json(config: SettingsConfig, role_name: str) -> str:
         """Return JSON summary of a role's access config."""
-        config = policy_engine.config
         role_def = config.roles.get(role_name)
         if role_def is None:
             return json.dumps({"error": f"Role '{role_name}' not found."})
@@ -265,7 +318,13 @@ def create_admin_mcp_server(
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="get_upstream",
         description=(
-            "Get full configuration for a specific upstream MCP."
+            "Get full configuration for a specific upstream MCP. "
+            "Credentials are not shown: has_token and "
+            "has_client_secret say whether one is set, every header "
+            "and env var value reads [hidden] unless it is only "
+            "${NAME} Variable references, and a URL part, command "
+            "part or argument that may hold a credential reads "
+            "[hidden]."
         ),
         annotations=READONLY,
     )
@@ -275,7 +334,7 @@ def create_admin_mcp_server(
         upstream = await runtime.config_service.get_upstream(org_id, mcp_id)
         if upstream is None:
             return f"Upstream MCP '{mcp_id}' not found."
-        return upstream.model_dump_json(indent=2, exclude_none=True)
+        return json.dumps(_upstream_view(upstream), indent=2)
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="add_upstream",
@@ -287,10 +346,15 @@ def create_admin_mcp_server(
             "For streamable_http: provide url. "
             "auth_mode: 'service_account' (default), 'admin_oauth', "
             "or 'per_user_oauth'. "
-            "For service_account: provide auth_token. "
+            "For service_account: provide auth_token; it is saved as "
+            "the secret Variable MCP_AUTH_TOKEN, which the "
+            "'Authorization: Bearer' header (streamable_http) or the "
+            "MCP_AUTH_TOKEN env var (stdio) refers to. "
             "For OAuth modes: optionally provide scopes "
             "(comma-separated). The MCP SDK discovers OAuth "
-            "endpoints automatically from the upstream."
+            "endpoints automatically from the upstream. "
+            "A new MCP starts stopped: start it with start_upstream "
+            "(or sign in with connect_upstream for an OAuth MCP)."
         ),
         annotations=ADDITIVE,
     )
@@ -305,129 +369,44 @@ def create_admin_mcp_server(
         auth_token: str = "",
         scopes: str = "",
     ) -> str:
-        org_id = current_org_id.get()
-        actor_email = current_user_id.get()
-        runtime = await runtime_manager.get(org_id)
-        transport_type = TransportType(transport)
-        stdio_config = None
-        http_config = None
-        if transport_type == TransportType.stdio:
-            if not allow_stdio_mcp:
-                return "Error: Stdio MCP servers are disabled."
-            if not command:
-                return "Error: 'command' required for stdio."
-            arg_list = [
-                a.strip() for a in args.split(",") if a.strip()
-            ] if args else []
-            stdio_config = StdioTransportConfig(
-                command=command, args=arg_list
-            )
-        else:
-            if not url:
-                return "Error: 'url' required for streamable_http."
-            try:
-                validate_upstream_url(url)
-            except UnsafeUpstreamUrl as exc:
-                return (
-                    f"Error: UNSAFE_UPSTREAM_URL — {exc.reason}. "
-                    "Upstream MCPs cannot target private/loopback ranges."
-                )
-            http_config = HttpTransportConfig(url=url)
-
-        # Plan gate: count existing upstreams by transport before any
-        # work happens. Sandbox-combo gate runs after the provider
-        # validator below so off-grid values still get the more
-        # specific error.
         try:
-            plan = await resolve_plan(org_repo, org_id)
-            existing = await runtime.config_service.list_upstreams(org_id)
-            if transport_type == TransportType.stdio:
-                current_stdio = sum(
-                    1 for u in existing
-                    if u.transport == TransportType.stdio
-                )
-                assert_stdio_upstream_capacity(
-                    plan, current_stdio,
-                    source="admin_mcp.add_upstream",
-                    org_id=org_id,
-                    actor_email=actor_email,
-                )
-            else:
-                current_http = sum(
-                    1 for u in existing
-                    if u.transport == TransportType.streamable_http
-                )
-                assert_http_upstream_capacity(
-                    plan, current_http,
-                    source="admin_mcp.add_upstream",
-                    org_id=org_id,
-                    actor_email=actor_email,
-                )
-
-            # Sandbox-combo plan gate for stdio. The admin MCP tool
-            # signature doesn't yet expose CPU / memory knobs, so the
-            # combo is always the model defaults
-            # (1 vCPU / 1024 MB) which Free supports — guard the
-            # default explicitly anyway so a future signature change
-            # doesn't silently bypass the gate. Provider-grid
-            # validation runs first to keep the order matching the
-            # dashboard.
-            if transport_type == TransportType.stdio and stdio_config is not None:
-                try:
-                    caps = await runtime.client_manager.get_active_capabilities()
-                    services = runtime.client_manager._sandbox_services  # type: ignore[reportPrivateUsage]
-                    services[caps.provider].validate_resources(
-                        SandboxResources(
-                            cpu_vcpus=stdio_config.cpu_vcpus,
-                            memory_mb=stdio_config.memory_mb,
-                            disk_gb=stdio_config.disk_gb,
-                            pids_limit=stdio_config.pids_limit,
-                        ),
-                    )
-                except ResourcesUnsupported as exc:
-                    return f"Error: {exc}"
-                assert_sandbox_combo_allowed(
-                    plan,
-                    stdio_config.cpu_vcpus,
-                    stdio_config.memory_mb,
-                    source="admin_mcp.add_upstream",
-                    org_id=org_id,
-                    actor_email=actor_email,
-                )
-        except PlanLimitExceeded as e:
-            return f"Error: {e.message}"
-
-        mode = AuthMode(auth_mode)
-        auth = UpstreamAuthConfig(
-            mode=mode,
-            token=auth_token if auth_token else None,
-            scopes=(
-                [s.strip() for s in scopes.split(",") if s.strip()]
-                if scopes else []
-            ),
+            transport_type = TransportType(transport)
+        except ValueError:
+            return "Error: transport must be 'stdio' or 'streamable_http'."
+        stdio = transport_type == TransportType.stdio
+        if stdio and not command:
+            return "Error: 'command' required for stdio."
+        if not stdio and not url:
+            return "Error: 'url' required for streamable_http."
+        request = NewUpstreamRequest(
+            id=mcp_id,
+            display_name=display_name,
+            command=command if stdio else None,
+            args=_split_list(args) if stdio else [],
+            url=None if stdio else url,
+            auth_mode=auth_mode,
+            auth_token=auth_token or None,
+            scopes=_split_list(scopes),
         )
         try:
-            upstream = UpstreamDefinition(
-                id=mcp_id,
-                display_name=display_name,
-                transport=transport_type,
-                stdio=stdio_config,
-                http=http_config,
-                auth=auth,
+            await upstream_admin.add_upstream(
+                current_org_id.get(), request,
+                actor=current_caller_id(), source="admin_mcp.add_upstream",
             )
-        except ValidationError as e:
-            return f"Error: {e}"
-        try:
-            await runtime.config_service.add_upstream(org_id, upstream)
-            new_config = await policy_store.create_mcp_access(org_id, mcp_id)
-            runtime.policy_engine.reload(new_config)
-            return (
-                f"Upstream MCP '{mcp_id}' added (disconnected). "
-                "Use connect_upstream or reconnect from the "
-                "dashboard to connect."
-            )
-        except ValueError as e:
-            return f"Error: {e}"
+        except (AdminActionRefused, PlanLimitExceeded) as exc:
+            return refusal_text(exc)
+        # OAuth modes take no static token; say so rather than drop it.
+        token_note = (
+            " Note: auth_token was not saved: it only applies to "
+            "auth_mode 'service_account'."
+            if auth_token.strip() and auth_mode != AuthMode.service_account
+            else ""
+        )
+        return (
+            f"Upstream MCP '{mcp_id}' added, stopped. Run start_upstream "
+            "to start it (connect_upstream signs you in to an OAuth MCP)."
+            + token_note
+        )
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="remove_upstream",
@@ -437,35 +416,34 @@ def create_admin_mcp_server(
         annotations=DESTRUCTIVE_IDEMPOTENT,
     )
     async def remove_upstream(mcp_id: str) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
         try:
-            await runtime.config_service.remove_upstream(org_id, mcp_id)
-            return f"Upstream MCP '{mcp_id}' removed."
-        except ValueError as e:
-            return f"Error: {e}"
+            await upstream_admin.remove_upstream(
+                current_org_id.get(), mcp_id, actor=current_caller_id(),
+            )
+        except AdminActionRefused as exc:
+            return refusal_text(exc)
+        return f"Upstream MCP '{mcp_id}' removed."
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="disconnect_upstream",
         description=(
-            "Disconnect an upstream MCP without removing it. "
-            "The MCP configuration is preserved but the connection "
-            "is closed."
+            "Stop an upstream MCP without removing it, like the "
+            "dashboard's Stop button. The MCP configuration is "
+            "preserved and every connection to it closes, the shared "
+            "one and each user's own; tool calls are refused until "
+            "start_upstream. Saved sign-ins are kept, so start_upstream "
+            "brings it back with nobody signing in again. It stays "
+            "stopped, even across restarts."
         ),
         annotations=DESTRUCTIVE_IDEMPOTENT,
     )
     async def disconnect_upstream(mcp_id: str) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        upstream = await runtime.config_service.get_upstream(org_id, mcp_id)
-        if upstream is None:
-            return f"Upstream MCP '{mcp_id}' not found."
-        await runtime.client_manager.disconnect_upstream(mcp_id)
-        if connection_store is not None:
-            await connection_store.clear_connection_error(org_id, mcp_id)
-            # Admin Stop must survive restart — write explicit False.
-            await connection_store.set_disabled(org_id, mcp_id)
-        _notify_policy_change()
+        try:
+            await upstream_admin.stop_upstream(
+                current_org_id.get(), mcp_id, actor=current_caller_id(),
+            )
+        except AdminActionRefused as exc:
+            return refusal_text(exc)
         return f"Upstream MCP '{mcp_id}' disconnected."
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
@@ -587,12 +565,15 @@ def create_admin_mcp_server(
         tool: str = "",
         limit: int = 20,
     ) -> str:
+        org_id = current_org_id.get()
         results = await audit_repo.search(
-            current_org_id.get(),
+            org_id,
             user_id=user_id or None,
             mcp_id=mcp_id or None,
             tool=tool or None,
             limit=limit,
+            # Same plan retention cap as the dashboard Audit page.
+            since_iso=await audit_retention_since(org_repo, org_id),
         )
         if not results:
             return "No matching audit log entries found."
@@ -605,51 +586,16 @@ def create_admin_mcp_server(
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="refresh_upstream_tools",
         description=(
-            "Re-discover tools from one or all upstream MCPs."
+            "Re-discover tools from one or all upstream MCPs. A single "
+            "MCP must be running (for an OAuth MCP: an admin is signed "
+            "in to it); this never signs anyone in."
         ),
         annotations=ADDITIVE_IDEMPOTENT,
     )
     async def refresh_upstream_tools(mcp_id: str = "") -> str:
         org_id = current_org_id.get()
         runtime = await runtime_manager.get(org_id)
-        if mcp_id:
-            upstream = await runtime.config_service.get_upstream(org_id, mcp_id)
-            if upstream is None:
-                return f"Upstream MCP '{mcp_id}' not found."
-            # Establish an OAuth session under the caller (no-op for
-            # service_account or when one already exists), then refresh
-            # WITH transport-stall recovery so an E2B post-reattach stall
-            # heals + retries instead of persisting a partial catalogue
-            # (R6). This BLOCKS the admin's MCP client (worst case
-            # ~2×(establish+timeout)); unlike the dashboard's non-blocking
-            # refresh (c54c0b3) that is intended — this tool's contract is
-            # to return the discovered tool COUNT synchronously, which a
-            # backgrounded refresh can't do.
-            await _ensure_oauth_session(mcp_id)
-            try:
-                tools = await acquire_and_refresh_with_recovery(
-                    org_id=org_id,
-                    upstream=upstream,
-                    effective_user=recovery_effective_user(
-                        runtime.client_manager, upstream,
-                    ),
-                    connection_store=connection_store,
-                    client_manager=runtime.client_manager,
-                    tool_registry=runtime.tool_registry,
-                    server_url=server_url,
-                )
-                return (
-                    f"Refreshed {len(tools)} tools "
-                    f"from upstream MCP '{mcp_id}'."
-                )
-            except SessionUnavailable as e:
-                return (
-                    f"Error refreshing '{mcp_id}': could not reattach "
-                    f"session ({e.reason})."
-                )
-            except Exception as e:
-                return f"Error refreshing '{mcp_id}': {e}"
-        else:
+        if not mcp_id:
             await refresh_all_with_recovery(
                 org_id=org_id,
                 connection_store=connection_store,
@@ -661,11 +607,42 @@ def create_admin_mcp_server(
             return (
                 f"Refreshed all upstream MCPs. Total: {total} tools."
             )
+        # The dashboard's Refresh tools, with the same readiness check
+        # and audit row. It runs in the background; wait for its
+        # discovery to report the tool count.
+        try:
+            discovered = await upstream_admin.refresh_tools(
+                org_id, mcp_id, actor=current_caller_id(),
+            )
+        except Conflict:
+            return (
+                f"Error: MCP '{mcp_id}' is not running. Start it with "
+                "start_upstream (connect_upstream signs you in to an "
+                "OAuth MCP), then refresh."
+            )
+        except AdminActionRefused as exc:
+            return refusal_text(exc)
+        done, _ = await asyncio.wait(
+            {discovered}, timeout=_TOOL_DISCOVERY_WAIT_SECONDS,
+        )
+        if not done or discovered.cancelled():
+            return (
+                f"Tool discovery of '{mcp_id}' is still running. Run "
+                "list_upstream_tools in a moment."
+            )
+        error = discovered.result()
+        if error is not None:
+            return f"Error refreshing '{mcp_id}': {error}"
+        return (
+            f"Refreshed {await _tool_count(mcp_id)} tools "
+            f"from upstream MCP '{mcp_id}'."
+        )
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="upstream_status",
         description=(
-            "Show which upstream MCPs are connected or disconnected."
+            "Show each upstream MCP's state: connected, starting, "
+            "stopped, failed (with the error), or disconnected."
         ),
         annotations=READONLY,
     )
@@ -677,7 +654,7 @@ def create_admin_mcp_server(
             return "No upstream MCPs configured in MCP Hero."
         return json.dumps(
             {
-                uid: "connected" if ok else "disconnected"
+                uid: await _status_label(org_id, runtime, uid, ok)
                 for uid, ok in status.items()
             },
             indent=2,
@@ -714,75 +691,98 @@ def create_admin_mcp_server(
             "Returns an authorization URL that you must open in "
             "a browser to complete the OAuth flow. "
             "After authenticating, the MCP's tools will be "
-            "discovered and available to users."
+            "discovered and available to users. On a stopped MCP "
+            "whose admin sign-in was kept, it reconnects from that "
+            "sign-in instead, with no browser. Refused while another "
+            "admin is signed in to the MCP (only the dashboard's "
+            "Remove sign-in hands it over)."
         ),
         annotations=ADDITIVE_IDEMPOTENT,
     )
     async def connect_upstream(mcp_id: str) -> str:
+        discovery = _ToolDiscovery()
+        try:
+            result = await upstream_admin.connect_upstream(
+                current_org_id.get(), mcp_id,
+                actor=current_caller_id(),
+                on_tools_discovered=discovery.finished,
+            )
+        except NoSignInNeeded:
+            return (
+                f"MCP '{mcp_id}' uses service_account auth — no OAuth "
+                "connection needed. Run start_upstream to start it."
+            )
+        except AdminActionRefused as exc:
+            return refusal_text(exc)
+        return await _sign_in_text(mcp_id, result, discovery)
+
+    @server.tool(  # pyright: ignore[reportUnusedFunction]
+        name="start_upstream",
+        description=(
+            "Start an upstream MCP, like the dashboard's Start button. "
+            "A stopped MCP serves no tools until it is started. A "
+            "service_account MCP that is already running or starting is "
+            "left alone; to restart it, run disconnect_upstream, then "
+            "start_upstream. For a service_account MCP this waits for the "
+            "start to finish; a hosted stdio MCP's first start can take a "
+            "minute. For an OAuth MCP stopped with its admin sign-in kept, "
+            "it reconnects from that sign-in with no browser; otherwise it "
+            "signs you in, and may return an authorization URL to open in "
+            "a browser."
+        ),
+        annotations=ADDITIVE_IDEMPOTENT,
+    )
+    async def start_upstream(mcp_id: str) -> str:
         org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        if connection_store is None or auth_coordinator is None:
-            return "Error: OAuth is not configured."
-        upstream = await runtime.config_service.get_upstream(org_id, mcp_id)
-        if upstream is None:
-            return f"Upstream MCP '{mcp_id}' not found."
-        if upstream.auth.mode == AuthMode.service_account:
-            return (
-                f"MCP '{mcp_id}' uses service_account auth — "
-                "no OAuth connection needed."
+        discovery = _ToolDiscovery()
+        try:
+            outcome = await upstream_admin.start_upstream(
+                org_id, mcp_id,
+                actor=current_caller_id(),
+                restart=False,
+                on_tools_discovered=discovery.finished,
             )
-
-        caller_email = current_user_id.get()
-        # Single-slot admin_oauth: another admin already owning the slot
-        # must be explicitly disconnected before this admin can take
-        # over. Surface the conflict so the caller can decide whether
-        # to invoke disconnect first.
-        if upstream.auth.mode == AuthMode.admin_oauth:
-            for email in runtime.policy_engine.get_admin_emails():
-                if email == caller_email:
-                    continue
-                token = await connection_store.get_user_token(
-                    org_id, email, mcp_id,
-                )
-                if token is not None:
-                    return (
-                        f"'{email}' is already connected to '{mcp_id}'. "
-                        "Disconnect first to take over."
-                    )
-        result = await initiate_oauth_connection(
-            org_id=org_id,
-            upstream=upstream,
-            effective_user=caller_email,
-            connection_store=connection_store,
-            auth_coordinator=auth_coordinator,
-            client_manager=runtime.client_manager,
-            server_url=server_url,
+        except AdminActionRefused as exc:
+            return refusal_text(exc)
+        if outcome.already == "starting":
+            return (
+                f"MCP '{mcp_id}' is already starting. Run upstream_status "
+                "in a moment to check."
+            )
+        if outcome.already == "running":
+            return (
+                f"MCP '{mcp_id}' is already running. "
+                f"{await _tool_count(mcp_id)} tools available."
+            )
+        if outcome.sign_in is not None:
+            return await _sign_in_text(mcp_id, outcome.sign_in, discovery)
+        started = outcome.started
+        assert started is not None
+        # ``asyncio.wait`` never cancels what it waits on, so a client
+        # that gives up early leaves the Start running.
+        done, _ = await asyncio.wait({started}, timeout=_START_WAIT_SECONDS)
+        if not done:
+            return (
+                f"MCP '{mcp_id}' is still starting. Run upstream_status "
+                "in a moment to check."
+            )
+        result = None if started.cancelled() else started.result()
+        if result is not None and result.error is not None:
+            return f"Error starting '{mcp_id}': {result.error}"
+        if result is None or not result.started:
+            return (
+                f"The start of '{mcp_id}' was interrupted by a stop or a "
+                "newer start."
+            )
+        if result.discovery_error is not None:
+            return (
+                f"MCP '{mcp_id}' started, but tool discovery failed: "
+                f"{result.discovery_error}"
+            )
+        return (
+            f"MCP '{mcp_id}' started. "
+            f"{await _tool_count(mcp_id)} tools available."
         )
-
-        if result.connected:
-            try:
-                tools = await runtime.tool_registry.refresh_upstream(mcp_id)
-                return (
-                    f"MCP '{mcp_id}' is already connected. "
-                    f"Discovered {len(tools)} tools."
-                )
-            except Exception as e:
-                return (
-                    f"MCP '{mcp_id}' is connected but "
-                    f"tool discovery failed: {e}"
-                )
-
-        if result.authorization_url:
-            return (
-                f"Please open this URL in your browser to "
-                f"authorize '{mcp_id}':\n\n"
-                f"{result.authorization_url}\n\n"
-                "After authorizing, run "
-                f"refresh_upstream_tools(mcp_id=\"{mcp_id}\") "
-                "to discover tools."
-            )
-
-        return f"Error: {result.error or 'connection failed'}"
 
     # =====================================================================
     # User Management
@@ -791,112 +791,54 @@ def create_admin_mcp_server(
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="list_users",
         description=(
-            "List all users in MCP Hero with their roles and admin status."
+            "List all users in MCP Hero with their roles, admin status, "
+            "and status: 'active' once they accepted their invitation, "
+            "'pending' while only invited."
         ),
         annotations=READONLY,
     )
     async def list_users() -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        config = runtime.policy_engine.config
-        results: list[dict[str, Any]] = []
-        for email, user_def in config.users.items():
-            resolved = resolve_settings(config, email)
-            results.append({
-                "email": email,
-                "role": user_def.role,
-                "is_admin": resolved.is_admin,
-            })
-        return json.dumps(results, indent=2)
+        views = await user_admin.list_users(current_org_id.get())
+        return json.dumps([view.model_dump() for view in views], indent=2)
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="add_user",
         description=(
-            "Add a user to MCP Hero by email. "
-            "Optionally specify a role (defaults to the default role)."
+            "Invite a user to MCP Hero by email. "
+            "Optionally specify a role (defaults to the default role). "
+            "The user stays 'pending', with no access, until they sign "
+            "in and accept the invitation."
         ),
         annotations=ADDITIVE,
     )
     async def add_user(email: str, role: str = "") -> str:
-        org_id = current_org_id.get()
-        actor_email = current_user_id.get()
-        runtime = await runtime_manager.get(org_id)
-        config = runtime.policy_engine.config
-        if email in config.users:
-            return f"Error: user '{email}' already exists."
         try:
-            plan = await resolve_plan(org_repo, org_id)
-            assert_seat_capacity(
-                plan, len(config.users),
-                source="admin_mcp.add_user",
-                org_id=org_id,
-                actor_email=actor_email,
+            view = await user_admin.add_user(
+                current_org_id.get(), email, role or None,
+                actor=current_caller_id(), source="admin_mcp.add_user",
             )
-        except PlanLimitExceeded as e:
-            return f"Error: {e.message}"
-        if not role:
-            default_role = runtime.policy_engine.get_default_role()
-            if default_role is None:
-                return "Error: no default role configured."
-            role = default_role
-        if role not in config.roles:
-            return f"Error: role '{role}' not found."
-        user_def = UserDefinition(role=role)
-        new_config = await policy_store.set_user(org_id, email, user_def)
-        runtime.policy_engine.reload(new_config)
-        resolved = resolve_settings(new_config, email)
-        return json.dumps({
-            "email": email,
-            "role": role,
-            "is_admin": resolved.is_admin,
-        }, indent=2)
-
-    async def _active_member_emails(
-        org_id: str, config: SettingsConfig,
-    ) -> set[str]:
-        """Mirror of the dashboard's active-vs-pending split, so both
-        doors apply the last-admin rule to the same population. An
-        invited address with no membership row has never signed in and
-        cannot administer anything."""
-        if org_repo is None:
-            return set(config.users.keys())
-        memberships = await org_repo.list_memberships(org_id)
-        return {m.email for m in memberships}
+        except (AdminActionRefused, PlanLimitExceeded) as exc:
+            return refusal_text(exc)
+        return json.dumps(view.model_dump(), indent=2)
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="remove_user",
         description=(
             "Remove a user from MCP Hero. "
-            "This also revokes their gateway tokens and disconnects "
-            "their upstream sessions."
+            "For a member, this also removes them from the organization, "
+            "closes their gateway connections to it and disconnects "
+            "their upstream sessions. For a pending invitation, it only "
+            "deletes the invitation."
         ),
         annotations=DESTRUCTIVE_IDEMPOTENT,
     )
     async def remove_user(email: str) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        config = runtime.policy_engine.config
-        if would_remove_last_admin(
-            config, email,
-            eligible=await _active_member_emails(org_id, config),
-        ):
-            return f"Error: {LAST_ADMIN_REMOVE_ERROR}"
         try:
-            new_config = await policy_store.remove_user(org_id, email)
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(user=email)
-        if terminate_gateway_sessions is not None:
-            terminate_gateway_sessions(org_id, email)
-        if revoke_gateway_user is not None:
-            revoke_gateway_user(email)
-        await runtime.client_manager.disconnect_all_user_sessions(email)
-        if connection_store is not None:
-            # Purge the whole per-user key family (tokens + client_info +
-            # oauth_metadata + counters), so a re-invite re-registers
-            # cleanly instead of reusing a dead DCR client_info.
-            await connection_store.delete_all_for_user(org_id, email)
+            await user_admin.remove_user(
+                current_org_id.get(), email, actor=current_caller_id(),
+            )
+        except AdminActionRefused as exc:
+            return refusal_text(exc)
         return f"User '{email}' removed."
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
@@ -907,26 +849,13 @@ def create_admin_mcp_server(
         annotations=ADDITIVE_IDEMPOTENT,
     )
     async def set_user_role(email: str, role: str) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        config = runtime.policy_engine.config
-        if role in config.roles and would_remove_last_admin(
-            config, email, new_role=role,
-            eligible=await _active_member_emails(org_id, config),
-        ):
-            return f"Error: {LAST_ADMIN_DEMOTE_ERROR}"
         try:
-            new_config = await policy_store.set_user_role(org_id, email, role)
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(user=email)
-        resolved = resolve_settings(new_config, email)
-        return json.dumps({
-            "email": email,
-            "role": role,
-            "is_admin": resolved.is_admin,
-        }, indent=2)
+            view = await user_admin.set_user_role(
+                current_org_id.get(), email, role, actor=current_caller_id(),
+            )
+        except AdminActionRefused as exc:
+            return refusal_text(exc)
+        return json.dumps(view.model_dump(), indent=2)
 
     # =====================================================================
     # Role Management
@@ -941,26 +870,10 @@ def create_admin_mcp_server(
         annotations=READONLY,
     )
     async def list_roles() -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        config = runtime.policy_engine.config
-        user_counts: dict[str, int] = {}
-        for user_def in config.users.values():
-            user_counts[user_def.role] = user_counts.get(user_def.role, 0) + 1
-        token_counts: dict[str, int] = {}
-        if service_token_service is not None:
-            token_counts = await service_token_service.count_by_role(org_id)
-        results = [
-            {
-                "name": name,
-                "is_admin": role_def.is_admin,
-                "is_default": role_def.is_default,
-                "user_count": user_counts.get(name, 0),
-                "service_token_count": token_counts.get(name, 0),
-            }
-            for name, role_def in config.roles.items()
-        ]
-        return json.dumps(results, indent=2)
+        summaries = await role_admin.list_roles(current_org_id.get())
+        return json.dumps(
+            [summary.model_dump() for summary in summaries], indent=2,
+        )
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="create_role",
@@ -971,31 +884,16 @@ def create_admin_mcp_server(
         annotations=ADDITIVE,
     )
     async def create_role(name: str, copy_from: str = "") -> str:
-        org_id = current_org_id.get()
-        actor_email = current_user_id.get()
-        runtime = await runtime_manager.get(org_id)
         try:
-            plan = await resolve_plan(org_repo, org_id)
-            current_custom = sum(
-                1 for r in runtime.policy_engine.config.roles.values()
-                if not r.is_admin and not r.is_default
-            )
-            assert_custom_role_capacity(
-                plan, current_custom,
+            new_config = await role_admin.create_role(
+                current_org_id.get(), name,
+                copy_from=copy_from or None,
+                actor=current_caller_id(),
                 source="admin_mcp.create_role",
-                org_id=org_id,
-                actor_email=actor_email,
             )
-        except PlanLimitExceeded as e:
-            return f"Error: {e.message}"
-        try:
-            new_config = await policy_store.create_role(
-                org_id, name, copy_from=copy_from or None,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        return _role_access_json(runtime.policy_engine, name)
+        except (AdminActionRefused, PlanLimitExceeded) as exc:
+            return refusal_text(exc)
+        return _role_access_json(new_config, name)
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="delete_role",
@@ -1006,24 +904,12 @@ def create_admin_mcp_server(
         annotations=DESTRUCTIVE_IDEMPOTENT,
     )
     async def delete_role(role_name: str) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        # Service-token guard — mirrors the dashboard route: the
-        # policy store only knows config.users.
-        if service_token_service is not None:
-            token_counts = await service_token_service.count_by_role(org_id)
-            in_use = token_counts.get(role_name, 0)
-            if in_use:
-                return (
-                    f"Error: Cannot delete role '{role_name}': {in_use} "
-                    f"service token(s) assigned"
-                )
         try:
-            new_config = await policy_store.delete_role(org_id, role_name)
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
+            await role_admin.delete_role(
+                current_org_id.get(), role_name, actor=current_caller_id(),
+            )
+        except AdminActionRefused as exc:
+            return refusal_text(exc)
         return f"Role '{role_name}' deleted."
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
@@ -1034,19 +920,28 @@ def create_admin_mcp_server(
         annotations=ADDITIVE_IDEMPOTENT,
     )
     async def rename_role(role_name: str, new_name: str) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
         try:
-            new_config = await policy_store.rename_role(org_id, role_name, new_name)
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
-        return _role_access_json(runtime.policy_engine, new_name)
+            new_config = await role_admin.rename_role(
+                current_org_id.get(), role_name, new_name,
+                actor=current_caller_id(),
+            )
+        except AdminActionRefused as exc:
+            return refusal_text(exc)
+        return _role_access_json(new_config, new_name)
 
     # =====================================================================
     # Access Policies
     # =====================================================================
+
+    async def _role_edit(
+        role_name: str, edit: Awaitable[SettingsConfig],
+    ) -> str:
+        """Answer a role edit with the role's new settings."""
+        try:
+            new_config = await edit
+        except (AdminActionRefused, PlanLimitExceeded) as exc:
+            return refusal_text(exc)
+        return _role_access_json(new_config, role_name)
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="set_role_mcp_access",
@@ -1059,17 +954,10 @@ def create_admin_mcp_server(
     async def set_role_mcp_access(
         role_name: str, mcp_id: str, enabled: bool,
     ) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        try:
-            new_config = await policy_store.set_role_mcp_access_entry(
-                org_id, role_name, mcp_id, enabled,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
-        return _role_access_json(runtime.policy_engine, role_name)
+        return await _role_edit(role_name, role_admin.set_mcp_access_entry(
+            current_org_id.get(), role_name, mcp_id, enabled,
+            actor=current_caller_id(),
+        ))
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="set_role_auto_enable_new",
@@ -1083,17 +971,9 @@ def create_admin_mcp_server(
     async def set_role_auto_enable_new(
         role_name: str, auto_enable_new: bool,
     ) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        try:
-            new_config = await policy_store.set_role_auto_enable_new(
-                org_id, role_name, auto_enable_new,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
-        return _role_access_json(runtime.policy_engine, role_name)
+        return await _role_edit(role_name, role_admin.set_auto_enable_new(
+            current_org_id.get(), role_name, auto_enable_new,
+        ))
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="set_role_tool_access",
@@ -1106,17 +986,10 @@ def create_admin_mcp_server(
     async def set_role_tool_access(
         role_name: str, upstream_id: str, tool_name: str, enabled: bool,
     ) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        try:
-            new_config = await policy_store.set_role_tool_access_entry(
-                org_id, role_name, upstream_id, tool_name, enabled,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
-        return _role_access_json(runtime.policy_engine, role_name)
+        return await _role_edit(role_name, role_admin.set_tool_access_entry(
+            current_org_id.get(), role_name, upstream_id, tool_name, enabled,
+            actor=current_caller_id(),
+        ))
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="remove_role_tool_access",
@@ -1129,17 +1002,9 @@ def create_admin_mcp_server(
     async def remove_role_tool_access(
         role_name: str, upstream_id: str, tool_name: str,
     ) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        try:
-            new_config = await policy_store.remove_role_tool_access_entry(
-                org_id, role_name, upstream_id, tool_name,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
-        return _role_access_json(runtime.policy_engine, role_name)
+        return await _role_edit(role_name, role_admin.remove_tool_access_entry(
+            current_org_id.get(), role_name, upstream_id, tool_name,
+        ))
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="set_role_tool_fallback_enabled",
@@ -1154,8 +1019,6 @@ def create_admin_mcp_server(
     async def set_role_tool_fallback_enabled(
         role_name: str, upstream_id: str, fallback_enabled: str,
     ) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
         parsed: bool | None
         if fallback_enabled.lower() == "null":
             parsed = None
@@ -1165,15 +1028,9 @@ def create_admin_mcp_server(
             parsed = False
         else:
             return "Error: fallback_enabled must be 'true', 'false', or 'null'."
-        try:
-            new_config = await policy_store.set_role_tool_fallback_enabled(
-                org_id, role_name, upstream_id, parsed,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
-        return _role_access_json(runtime.policy_engine, role_name)
+        return await _role_edit(role_name, role_admin.set_tool_fallback_enabled(
+            current_org_id.get(), role_name, upstream_id, parsed,
+        ))
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="set_role_category_default",
@@ -1189,17 +1046,9 @@ def create_admin_mcp_server(
     async def set_role_category_default(
         role_name: str, upstream_id: str, annotation: str, enabled: bool,
     ) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        try:
-            new_config = await policy_store.set_role_tool_category_default(
-                org_id, role_name, upstream_id, annotation, enabled,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
-        return _role_access_json(runtime.policy_engine, role_name)
+        return await _role_edit(role_name, role_admin.set_category_default(
+            current_org_id.get(), role_name, upstream_id, annotation, enabled,
+        ))
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="remove_role_category_default",
@@ -1212,17 +1061,9 @@ def create_admin_mcp_server(
     async def remove_role_category_default(
         role_name: str, upstream_id: str, annotation: str,
     ) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        try:
-            new_config = await policy_store.remove_role_tool_category_default(
-                org_id, role_name, upstream_id, annotation,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
-        return _role_access_json(runtime.policy_engine, role_name)
+        return await _role_edit(role_name, role_admin.remove_category_default(
+            current_org_id.get(), role_name, upstream_id, annotation,
+        ))
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="set_role_argument_constraint",
@@ -1237,35 +1078,13 @@ def create_admin_mcp_server(
         role_name: str, upstream_id: str, tool_name: str,
         arg_name: str, pattern: str, mode: str = "allow",
     ) -> str:
-        org_id = current_org_id.get()
-        actor_email = current_user_id.get()
-        runtime = await runtime_manager.get(org_id)
-        try:
-            plan = await resolve_plan(org_repo, org_id)
-            assert_argument_constraints_allowed(
-                plan,
-                source="admin_mcp.set_role_argument_constraint",
-                org_id=org_id,
-                actor_email=actor_email,
-            )
-        except PlanLimitExceeded as e:
-            return f"Error: {e.message}"
-        try:
-            re.compile(pattern)
-        except re.error as e:
-            return f"Error: invalid regex pattern — {e}"
-        if mode not in ("allow", "forbid"):
-            return f"Error: invalid mode '{mode}', must be 'allow' or 'forbid'"
-        constraint = ArgumentConstraint(pattern=pattern, mode=mode)
-        try:
-            new_config = await policy_store.set_role_argument_constraint(
-                org_id, role_name, upstream_id, tool_name, arg_name, constraint,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
-        return _role_access_json(runtime.policy_engine, role_name)
+        return await _role_edit(role_name, role_admin.set_argument_constraint(
+            current_org_id.get(), role_name, upstream_id, tool_name, arg_name,
+            pattern=pattern,
+            mode=mode,
+            actor=current_caller_id(),
+            source="admin_mcp.set_role_argument_constraint",
+        ))
 
     @server.tool(  # pyright: ignore[reportUnusedFunction]
         name="remove_role_argument_constraint",
@@ -1277,16 +1096,43 @@ def create_admin_mcp_server(
     async def remove_role_argument_constraint(
         role_name: str, upstream_id: str, tool_name: str, arg_name: str,
     ) -> str:
-        org_id = current_org_id.get()
-        runtime = await runtime_manager.get(org_id)
-        try:
-            new_config = await policy_store.remove_role_argument_constraint(
-                org_id, role_name, upstream_id, tool_name, arg_name,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-        runtime.policy_engine.reload(new_config)
-        _notify_policy_change(role=role_name)
-        return _role_access_json(runtime.policy_engine, role_name)
+        return await _role_edit(
+            role_name,
+            role_admin.remove_argument_constraint(
+                current_org_id.get(), role_name, upstream_id, tool_name,
+                arg_name,
+            ),
+        )
+
+    install_call_tool_wrapper(server, rate_limits)
 
     return server
+
+
+def _upstream_view(upstream: UpstreamDefinition) -> dict[str, Any]:
+    """An upstream's configuration as ``get_upstream`` shows it.
+
+    An AI client reads it, so no credential may be in it: it says
+    whether a service-account token or an OAuth client secret is set,
+    never its value. Every header and env value is hidden unless it is
+    made only of Variable references (``${NAME}``); in the URL, the
+    command and its arguments, what may be a credential is hidden (user
+    info, a password-like parameter or flag, an env var set on the
+    command line, a header argument, anything shaped like a key). Names
+    and references stay, so the client can still tell how it's wired.
+    """
+    data = upstream.model_dump(mode="json", exclude_none=True)
+    auth: dict[str, Any] = data["auth"]
+    auth.pop("client_secret", None)
+    auth["has_token"] = has_service_account_token(upstream)
+    auth["has_client_secret"] = upstream.auth.client_secret is not None
+    if upstream.http is not None:
+        http: dict[str, Any] = data["http"]
+        http["url"] = hide_secrets_in_text(upstream.http.url)
+        http["headers"] = hide_secret_values(upstream.http.headers)
+    if upstream.stdio is not None:
+        stdio: dict[str, Any] = data["stdio"]
+        stdio["command"] = hide_secrets_in_text(upstream.stdio.command)
+        stdio["args"] = hide_secret_args(upstream.stdio.args)
+        stdio["env"] = hide_secret_values(upstream.stdio.env)
+    return data

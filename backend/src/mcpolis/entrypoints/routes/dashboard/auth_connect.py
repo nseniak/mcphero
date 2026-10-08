@@ -14,9 +14,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from mcpolis.adapters.observability.analytics_client import get_analytics
 from mcpolis.domain.model.events import Event
 from mcpolis.domain.model.policy import AuthMode
+from mcpolis.domain.services.admin_actions import SignInNeedsMembership
 from mcpolis.domain.services.upstream_connection_service import (
     OAuthFailureReason,
     connect_and_refresh_tools,
+    sign_out_of_upstream,
 )
 from mcpolis.entrypoints.controllers.gateway_controller import current_org_id
 from mcpolis.entrypoints.routes.dashboard._deps import (
@@ -24,6 +26,15 @@ from mcpolis.entrypoints.routes.dashboard._deps import (
     notify_policy_change,
 )
 from mcpolis.entrypoints.routes.dashboard._models import ConnectResponse
+
+
+def oauth_provider_domain(url: str) -> str:
+    """The analytics value naming an OAuth MCP's server: its host name.
+
+    Never ``netloc``: an MCP URL may carry ``user:password@`` before the
+    host, and analytics must not receive it.
+    """
+    return urlparse(url).hostname or ""
 
 
 def create_auth_connect_router(deps: DashboardDeps) -> APIRouter:
@@ -52,6 +63,10 @@ def create_auth_connect_router(deps: DashboardDeps) -> APIRouter:
                 400,
                 f"Upstream '{upstream_id}' does not use OAuth authentication",
             )
+        if not runtime.policy_engine.is_member(email):
+            # An MCP Hero operator browsing the org: the upstream's
+            # callback would refuse the sign-in at the end.
+            raise SignInNeedsMembership()
 
         def _notify_tokens_acquired() -> None:
             if deps.event_bus is not None:
@@ -69,7 +84,7 @@ def create_auth_connect_router(deps: DashboardDeps) -> APIRouter:
             else:
                 notify_policy_change(deps)
             provider_domain = (
-                urlparse(upstream.http.url).netloc if upstream.http else ""
+                oauth_provider_domain(upstream.http.url) if upstream.http else ""
             )
             get_analytics().track_async(
                 email,
@@ -174,11 +189,12 @@ def create_auth_connect_router(deps: DashboardDeps) -> APIRouter:
         if upstream is None:
             raise HTTPException(404, f"Upstream '{upstream_id}' not found")
 
-        await deps.connection_store.delete_user_token(
-            org_id, email, upstream_id,
-        )
-        await runtime.client_manager.disconnect_user_session(
-            upstream_id, email,
+        await sign_out_of_upstream(
+            org_id=org_id,
+            upstream_id=upstream_id,
+            user_id=email,
+            connection_store=deps.connection_store,
+            client_manager=runtime.client_manager,
         )
         # Caller's MCP clients still list this upstream's tools until
         # the next /tools/list. Push a user-scoped change so they

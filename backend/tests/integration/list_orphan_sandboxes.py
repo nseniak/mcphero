@@ -25,15 +25,16 @@ Categories:
 Run with::
 
     bash backend/tests/integration/run-list-orphan-sandboxes.sh
-    bash backend/tests/integration/run-list-orphan-sandboxes.sh --delete-orphans
+    MCPOLIS_PERSISTED_SANDBOX_IDS=sbx-a,sbx-b \
+        bash backend/tests/integration/run-list-orphan-sandboxes.sh --delete-orphans
     bash backend/tests/integration/run-list-orphan-sandboxes.sh --json
 
-Reads ``MCPOLIS_E2B_API_KEY`` from env (or the gitignored prod
-secrets file via the wrapper script). For the persistence
-cross-reference, also reads Mongo settings the same way the
-backend does — set ``MCPOLIS_MONGO_URI`` etc. for cloud-mode
-inspection, or omit them to skip the Mongo cross-ref entirely
-(every sandbox then categorises by tag/age only).
+Reads ``MCPOLIS_E2B_API_KEY`` from env (the wrapper script falls
+back to the gitignored ``backend/.env``). For the persistence
+cross-reference it does NOT connect to Mongo: pass the live ref ids
+as a comma-separated ``MCPOLIS_PERSISTED_SANDBOX_IDS`` (see
+``_load_persisted_sandbox_ids``), or omit it to skip the cross-ref
+entirely (every sandbox then categorises by tag/age only).
 """
 from __future__ import annotations
 
@@ -52,7 +53,10 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from mcpolis.adapters.sandbox_e2b import RealE2BClient  # noqa: E402
-from mcpolis.adapters.sandbox_e2b.client import E2BSDKError  # noqa: E402
+from mcpolis.adapters.sandbox_e2b.client import (  # noqa: E402
+    E2BNotFoundError,
+    E2BSDKError,
+)
 
 API_KEY = os.environ.get("MCPOLIS_E2B_API_KEY") or os.environ.get("E2B_API_KEY")
 
@@ -83,6 +87,8 @@ def _load_persisted_sandbox_ids() -> set[str]:
       tagged sandbox falls into ``mine_orphan`` /
       ``foreign_instance`` based on tag, never ``recognized``.
       Operator inspects the table, decides nothing needs killing.
+      ``--delete-orphans`` refuses to run in this mode (see
+      :func:`_delete_refusal`).
     - **Pre-cleanup**: ``MCPOLIS_PERSISTED_SANDBOX_IDS=$(mongo ...
       'JSON.stringify(...)') bash run-list-orphan-sandboxes.sh
       --delete-orphans``. Pulls the live ref ids out of Mongo with
@@ -187,6 +193,24 @@ def _print_json(rows: list[_Categorised]) -> None:
     ], indent=2))
 
 
+def _delete_refusal(persisted_ids: set[str]) -> str | None:
+    """Return why ``--delete-orphans`` must not run, or ``None``.
+
+    Without the persisted-id list nothing is ``recognized``, so every
+    sandbox in the E2B account older than the age gate would be
+    killed: live and paused mcpolis sandboxes included, and anything
+    else the account runs.
+    """
+    if persisted_ids:
+        return None
+    return (
+        "--delete-orphans needs MCPOLIS_PERSISTED_SANDBOX_IDS (the "
+        "comma-separated sandbox_id values from Mongo's sandbox_refs). "
+        "Without it every sandbox in the E2B account, live ones "
+        "included, would be killed. Refusing."
+    )
+
+
 async def _delete_orphans(
     client: RealE2BClient,
     rows: list[_Categorised],
@@ -208,6 +232,9 @@ async def _delete_orphans(
             await client.kill_sandbox(r.sandbox_id)
             print(f"[kill] {r.sandbox_id} ({r.category})")
             killed += 1
+        except E2BNotFoundError:
+            # Gone between the listing and the kill.
+            print(f"[gone] {r.sandbox_id} ({r.category})")
         except E2BSDKError as exc:
             print(
                 f"[fail] {r.sandbox_id} ({r.category}): {exc}",
@@ -216,7 +243,7 @@ async def _delete_orphans(
     return killed
 
 
-async def main() -> int:
+async def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "List + optionally clean up orphan E2B sandboxes "
@@ -228,8 +255,10 @@ async def main() -> int:
         default=os.environ.get("MCPOLIS_INSTANCE_ID"),
         help=(
             "mcpolis instance id to treat as 'mine'. Defaults to "
-            "$MCPOLIS_INSTANCE_ID. When unset, every tagged "
-            "sandbox falls into ``foreign_instance``."
+            "$MCPOLIS_INSTANCE_ID. The id is stable per database: "
+            "the ``value`` of the one doc in Mongo's "
+            "``sandbox_instance`` collection. When unset, every "
+            "tagged sandbox falls into ``foreign_instance``."
         ),
     )
     parser.add_argument(
@@ -242,10 +271,20 @@ async def main() -> int:
     )
     parser.add_argument(
         "--delete-orphans", action="store_true",
-        help="Kill all non-recognized sandboxes older than the threshold.",
+        help=(
+            "Kill all non-recognized sandboxes older than the threshold. "
+            "Requires MCPOLIS_PERSISTED_SANDBOX_IDS; refuses without it."
+        ),
     )
     parser.add_argument("--json", action="store_true", help="JSON output.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    persisted_ids = _load_persisted_sandbox_ids()
+
+    if args.delete_orphans:
+        refusal = _delete_refusal(persisted_ids)
+        if refusal is not None:
+            print(f"ERROR: {refusal}", file=sys.stderr)
+            return 2
 
     if not API_KEY:
         print(
@@ -255,7 +294,6 @@ async def main() -> int:
         return 2
 
     client = RealE2BClient(api_key=API_KEY)
-    persisted_ids = _load_persisted_sandbox_ids()
 
     try:
         sandboxes = await client.list_sandboxes()

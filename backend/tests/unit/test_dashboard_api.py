@@ -5,20 +5,29 @@ import json
 import time
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from mcpolis.adapters.repositories.file_config_store import FileConfigStore
 from mcpolis.adapters.upstream_clients.client_manager import (
     UpstreamClientManager,
 )
 from mcpolis.adapters.upstream_clients.session_single_flight import (
     ConnectAborted,
 )
+from mcpolis.domain.model.events import Event
+from mcpolis.domain.model.settings import SettingsConfig
+from mcpolis.domain.ports.config_repository import (
+    CONFIG_WRITE_CONFLICT_MESSAGE,
+    ConfigWriteConflictError,
+)
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
-from tests.unit._dev_stub_login import login_as
+from mcpolis.entrypoints.routes.dashboard_auth import build_session_cookie
+from tests.unit._dev_stub_login import accept_invitation, login_as
+from tests.unit.factories import make_accepted_members
 
 
 def make_import_confirm_body(
@@ -49,6 +58,11 @@ MCP_JSON = json.dumps({
     }
 })
 
+CONFIG_USERS = {
+    "admin@example.com": "admin",
+    "dev@example.com": "developer",
+}
+
 CONFIG_JSON = json.dumps({
     "upstreams": {
         "github": {"display_name": "GitHub", "auth_mode": "service_account"},
@@ -67,10 +81,7 @@ CONFIG_JSON = json.dumps({
             },
         },
     },
-    "users": {
-        "admin@example.com": {"role": "admin"},
-        "dev@example.com": {"role": "developer"},
-    },
+    "users": {email: {"role": role} for email, role in CONFIG_USERS.items()},
 })
 
 
@@ -79,6 +90,8 @@ def make_test_client(
     *,
     login: str | None = "admin@example.com",
     plan: str = "team",
+    superadmin_emails: str = "",
+    mcp_servers: str = MCP_JSON,
 ) -> TestClient:
     """Build a TestClient backed by the dev-stub provider and (by
     default) log in as the admin user.
@@ -92,9 +105,13 @@ def make_test_client(
     to ``team`` so existing tests aren't gated by the Free-tier
     limits introduced alongside the plan-mechanics rollout. Tests that
     want to assert Free-plan behaviour pass ``plan="free"``.
+
+    ``mcp_servers`` is the ``mcp.json`` (``github`` and ``mixpanel``
+    are configured in ``CONFIG_JSON``): pass one to point them at a
+    server the test runs.
     """
     mcp_json = tmp_path / "mcp.json"
-    mcp_json.write_text(MCP_JSON)
+    mcp_json.write_text(mcp_servers)
     config = tmp_path / "config.json"
     config.write_text(CONFIG_JSON)
     data_dir = tmp_path / "data"
@@ -102,6 +119,10 @@ def make_test_client(
     (data_dir / "subscription.json").write_text(
         json.dumps({"plan": plan}),
     )
+    # The users in ``CONFIG_JSON`` are members: they accepted their
+    # invitation. A test that needs a pending invitation adds one through
+    # ``POST /api/admin/users``.
+    make_accepted_members(data_dir, CONFIG_USERS)
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         mcp_json_path=mcp_json,
@@ -112,7 +133,8 @@ def make_test_client(
         google_client_id="",
         google_client_secret="",
         session_secret="test-session-secret",
-        server_url="http://localhost:8000")
+        server_url="http://localhost:8000",
+        superadmin_emails=superadmin_emails)
     with patch(
         "mcpolis.adapters.upstream_clients.client_manager.UpstreamClientManager.start_all"
     ), patch(
@@ -265,6 +287,61 @@ def test_admin_add_and_remove_user(tmp_path: Path) -> None:
     resp = client.get("/api/admin/users")
     emails = {u["email"] for u in resp.json()}
     assert "new@example.com" not in emails
+
+
+def test_admin_remove_user_writes_an_audit_row(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+
+    resp = client.delete("/api/admin/users/dev@example.com")
+    assert resp.status_code == 200
+
+    rows = client.get("/api/admin/audit?action=member_removed").json()["entries"]
+    assert len(rows) == 1
+    assert rows[0]["user_id"] == "admin@example.com"
+    assert rows[0]["target_user_id"] == "dev@example.com"
+    assert rows[0]["outcome"] == "success"
+
+
+def test_operator_removing_a_teammate_is_tagged_as_operator(
+    tmp_path: Path,
+) -> None:
+    """An MCP Hero operator is not an admin of the org; the dashboard
+    lets them act only because they are on the operator list. Their
+    row must carry the operator tag."""
+    client = make_test_client(
+        tmp_path, login=None, superadmin_emails="op@mcphero.io",
+    )
+    # Operators sign in with Google in cloud mode; here the signed
+    # session cookie stands in for that sign-in.
+    client.cookies.set("mcpolis_session", build_session_cookie(
+        Settings(_env_file=None, session_secret="test-session-secret"),  # type: ignore[call-arg]
+        email="op@mcphero.io", org_slug="default",
+    ))
+
+    resp = client.delete("/api/admin/users/dev@example.com")
+    assert resp.status_code == 200
+
+    rows = client.get("/api/admin/audit?action=member_removed").json()["entries"]
+    assert len(rows) == 1
+    assert rows[0]["user_id"] == "op@mcphero.io"
+    assert rows[0]["actor_role"] == "operator"
+
+
+def test_operator_who_is_also_an_org_admin_is_not_tagged(
+    tmp_path: Path,
+) -> None:
+    """On the operator list AND an admin of this org: they acted as the
+    org's own admin, so no operator tag."""
+    client = make_test_client(
+        tmp_path, superadmin_emails="admin@example.com",
+    )
+
+    resp = client.delete("/api/admin/users/dev@example.com")
+    assert resp.status_code == 200
+
+    rows = client.get("/api/admin/audit?action=member_removed").json()["entries"]
+    assert len(rows) == 1
+    assert rows[0]["actor_role"] is None
 
 
 def _read_connections(tmp_path: Path) -> dict[str, object]:
@@ -551,8 +628,10 @@ _DISCONNECT = (
     "mcpolis.adapters.upstream_clients.client_manager"
     ".UpstreamClientManager.disconnect_upstream"
 )
+# Refresh tools is the action both admin doors share
+# (``UpstreamAdminService.refresh_tools``), so these name its module.
 _READINESS = (
-    "mcpolis.entrypoints.routes.dashboard.upstream_admin"
+    "mcpolis.domain.services.upstream_admin_service"
     ".resolve_upstream_readiness"
 )
 # The refresh endpoint is non-blocking: it kicks off the acquire+refresh
@@ -562,7 +641,7 @@ _READINESS = (
 # to exercise the outcome glue deterministically (no bg-task timing); the
 # refresh logic itself is covered in test_refresh_tools_in_background.py.
 _REFRESH_BG = (
-    "mcpolis.entrypoints.routes.dashboard.upstream_admin"
+    "mcpolis.domain.services.upstream_admin_service"
     ".refresh_tools_in_background"
 )
 
@@ -1122,6 +1201,28 @@ def test_user_mcps_shows_connection_status(tmp_path: Path) -> None:
     assert mixpanel["user_connection_status"] == "not_connected"
 
 
+def test_user_mcps_never_show_the_credentials_of_a_url(tmp_path: Path) -> None:
+    """Every member reads My Tools, which only needs the site's icon: a
+    password before the ``@``, or a secret path a hosted MCP hands out
+    (anyone holding it can call that MCP), is not sent."""
+    secret = "ZjQ5YTk3ZDItNjM4ZC00MzA0LWI2NjQtYjY5ZmJmNmI4ZTc1"
+    client = make_test_client(
+        tmp_path,
+        login="dev@example.com",
+        mcp_servers=json.dumps({"mcpServers": {
+            "github": {"url": f"https://bob:pa55word@mcp.zapier.com/api/mcp/s/{secret}/mcp"},
+            "mixpanel": {"url": "http://localhost:9001/mcp"},
+        }}),
+    )
+
+    resp = client.get("/api/user/mcps")
+
+    assert resp.status_code == 200
+    assert "pa55word" not in resp.text and secret not in resp.text
+    github = next(m for m in resp.json() if m["id"] == "github")
+    assert github["url"] == "https://[hidden]@mcp.zapier.com/api/mcp/s/[hidden]/mcp"
+
+
 # --- Auth me endpoint ---
 
 
@@ -1210,8 +1311,12 @@ def test_set_argument_constraint_nonexistent_role(tmp_path: Path) -> None:
 # --- Test-mode MCP-token minting ---
 
 
-def make_oauth_test_client(tmp_path: Path) -> TestClient:
-    """Test client with OAuth enabled so the gateway provider is wired."""
+def make_oauth_test_client(
+    tmp_path: Path, *, trusted_proxy_hops: int = 0,
+) -> TestClient:
+    """Test client with OAuth enabled so the gateway provider is wired.
+    ``trusted_proxy_hops``: requests come through that many proxies (their
+    ``X-Forwarded-For`` names the caller)."""
     mcp_json = tmp_path / "mcp.json"
     mcp_json.write_text(MCP_JSON)
     config = tmp_path / "config.json"
@@ -1226,7 +1331,8 @@ def make_oauth_test_client(tmp_path: Path) -> TestClient:
         google_client_id="test-google-client",
         google_client_secret="test-google-secret",
         session_secret="test-session-secret",
-        server_url="http://localhost:8000")
+        server_url="http://localhost:8000",
+        trusted_proxy_hops=trusted_proxy_hops)
     with patch(
         "mcpolis.adapters.upstream_clients.client_manager.UpstreamClientManager.start_all"
     ), patch(
@@ -1260,6 +1366,24 @@ def test_test_mcp_token_returns_bearer_token(
     assert body["token_type"] == "Bearer"
     assert body["expires_in"] > 0
     assert isinstance(body["access_token"], str) and len(body["access_token"]) > 10
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["https://evil.example", "http://attacker.example:8080", "null"],
+)
+def test_test_mcp_token_refuses_web_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str) -> None:
+    """A browser stamps Origin on the request; CORS would let any site
+    read the minted bearer, so the route refuses before minting."""
+    monkeypatch.setenv("MCPOLIS_TEST_MODE", "1")
+    client = make_oauth_test_client(tmp_path)
+    resp = client.post(
+        "/api/auth/test-mcp-token",
+        headers={"Origin": origin},
+        json={"email": "admin@example.com", "org_slug": "default"})
+    assert resp.status_code == 403
+    assert "access_token" not in resp.text
 
 
 @pytest.mark.asyncio
@@ -1456,65 +1580,143 @@ def test_admin_disconnect_gateway_user_404_when_no_tokens(
     only for emails with active tokens, so a 404 here means the
     listing is stale; the frontend re-fetches on the error.)"""
     client = make_test_client(tmp_path)
-    resp = client.delete("/api/admin/gateway/users/nobody@example.com")
+    resp = client.delete("/api/admin/gateway/users/dev%40example.com")
     assert resp.status_code == 404
 
 
-def test_admin_disconnect_gateway_user_revokes_live_tokens(
-    tmp_path: Path,
-) -> None:
-    """Happy path: an admin revokes a connected user → underlying
-    ``revoke_user_tokens`` returns the count, route returns 200 with
-    a "Revoked N tokens" detail.
-
-    The route closure captures ``gateway_provider.revoke_user_tokens``
-    by reference at startup, so we can't class-level-patch it. Instead
-    we seed the provider's in-memory token dict so the real revoker
-    finds rows to delete.
-    """
+def seed_gateway_tokens(client: TestClient, email: str) -> None:
+    """Give ``email`` two live gateway access tokens and one refresh
+    token. The route closure captures ``revoke_user_tokens`` by
+    reference at startup, so the provider's in-memory dicts are seeded
+    directly for the real revoker to find."""
     from mcpolis.domain.ports.oauth_state_repository import (
         StoredAccessToken,
         StoredRefreshToken,
     )
 
-    client = make_test_client(tmp_path)
     provider = client.app.state.mcp_gateway_oauth_provider  # type: ignore[attr-defined,union-attr]
-    expires_at = int(__import__("time").time()) + 3600
-    provider._access_tokens["t-access-1"] = StoredAccessToken(
-        token="t-access-1",
+    expires_at = int(time.time()) + 3600
+    for token in (f"{email}-access-1", f"{email}-access-2"):
+        provider._access_tokens[token] = StoredAccessToken(
+            token=token,
+            client_id="c1",
+            user_email=email,
+            scopes=[],
+            expires_at=expires_at,
+        )
+    provider._refresh_tokens[f"{email}-refresh-1"] = StoredRefreshToken(
+        token=f"{email}-refresh-1",
         client_id="c1",
-        user_email="alice@example.com",
-        scopes=[],
-        expires_at=expires_at,
-    )
-    provider._access_tokens["t-access-2"] = StoredAccessToken(
-        token="t-access-2",
-        client_id="c1",
-        user_email="alice@example.com",
-        scopes=[],
-        expires_at=expires_at,
-    )
-    provider._refresh_tokens["t-refresh-1"] = StoredRefreshToken(
-        token="t-refresh-1",
-        client_id="c1",
-        user_email="alice@example.com",
+        user_email=email,
         scopes=[],
         created_at=0.0,
     )
 
-    resp = client.delete("/api/admin/gateway/users/alice%40example.com")
+
+def add_open_gateway_session(
+    client: TestClient, email: str, session_id: str,
+) -> AsyncMock:
+    """Give ``email`` an open gateway session in the default org, as the
+    gateway would; returns that session's ``terminate`` mock."""
+    notifier = client.app.state.policy_notifier  # type: ignore[attr-defined,union-attr]
+    transport = MagicMock()
+    transport.terminate = AsyncMock()
+    notifier._session_manager._server_instances[session_id] = transport  # pyright: ignore[reportPrivateUsage]
+    notifier._registry.register(session_id, "default", email)  # pyright: ignore[reportPrivateUsage]
+    return cast(AsyncMock, transport.terminate)
+
+
+def test_revoking_a_member_closes_their_open_gateway_session(
+    tmp_path: Path,
+) -> None:
+    """The revoked bearer is refused on the next request anyway, but an
+    open event stream stays open until the client hangs up unless the
+    session is closed."""
+    client = make_test_client(tmp_path)
+    seed_gateway_tokens(client, "dev@example.com")
+    terminate = add_open_gateway_session(client, "dev@example.com", "s-dev")
+
+    resp = client.delete("/api/admin/gateway/users/dev%40example.com")
+
+    assert resp.status_code == 200, resp.text
+    terminate.assert_awaited_once()
+    notifier = client.app.state.policy_notifier  # type: ignore[attr-defined,union-attr]
+    assert "s-dev" not in notifier._session_manager._server_instances  # pyright: ignore[reportPrivateUsage]
+
+
+def test_revoking_a_member_with_no_tokens_left_still_closes_their_session(
+    tmp_path: Path,
+) -> None:
+    """Their tokens may already be gone (revoked from another org) while
+    a stream is still open here: it is closed, and the answer is still
+    "no tokens"."""
+    client = make_test_client(tmp_path)
+    terminate = add_open_gateway_session(client, "dev@example.com", "s-dev")
+
+    resp = client.delete("/api/admin/gateway/users/dev%40example.com")
+
+    assert resp.status_code == 404
+    terminate.assert_awaited_once()
+
+
+def test_revoking_a_non_member_closes_nothing(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+    seed_gateway_tokens(client, "stranger@elsewhere.example")
+    terminate = add_open_gateway_session(
+        client, "stranger@elsewhere.example", "s-stranger",
+    )
+
+    resp = client.delete(
+        "/api/admin/gateway/users/stranger%40elsewhere.example",
+    )
+
+    assert resp.status_code == 404
+    terminate.assert_not_awaited()
+
+
+def test_admin_cannot_revoke_gateway_sign_in_of_a_non_member(
+    tmp_path: Path,
+) -> None:
+    """A gateway sign-in covers every org its owner belongs to, so an
+    admin may only revoke one held by a member of their own org. A
+    stranger's tokens must survive, and the answer must not reveal
+    whether the stranger has any (same 404 as "no tokens")."""
+    client = make_test_client(tmp_path)
+    seed_gateway_tokens(client, "stranger@elsewhere.example")
+    provider = client.app.state.mcp_gateway_oauth_provider  # type: ignore[attr-defined,union-attr]
+
+    resp = client.delete(
+        "/api/admin/gateway/users/stranger%40elsewhere.example",
+    )
+
+    assert resp.status_code == 404, resp.text
+    assert "stranger@elsewhere.example-access-1" in provider._access_tokens
+    assert "stranger@elsewhere.example-refresh-1" in provider._refresh_tokens
+
+
+def test_admin_disconnect_gateway_user_revokes_live_tokens(
+    tmp_path: Path,
+) -> None:
+    """Happy path: an admin revokes a connected member → underlying
+    ``revoke_user_tokens`` returns the count, route returns 200 with
+    a "Revoked N tokens" detail."""
+    client = make_test_client(tmp_path)
+    seed_gateway_tokens(client, "dev@example.com")
+    provider = client.app.state.mcp_gateway_oauth_provider  # type: ignore[attr-defined,union-attr]
+
+    resp = client.delete("/api/admin/gateway/users/dev%40example.com")
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
         "status": "ok",
-        "detail": "Revoked 3 tokens for alice@example.com",
+        "detail": "Revoked 3 tokens for dev@example.com",
     }
-    # And the underlying dict is now empty for alice.
+    # And the underlying dicts are now empty for the member.
     assert all(
-        t.user_email != "alice@example.com"
+        t.user_email != "dev@example.com"
         for t in provider._access_tokens.values()
     )
     assert all(
-        t.user_email != "alice@example.com"
+        t.user_email != "dev@example.com"
         for t in provider._refresh_tokens.values()
     )
 
@@ -1545,13 +1747,15 @@ def test_admin_connect_409_when_other_admin_owns_slot(
     )
 
     # Add alice as an admin so she's in the admin emails list (the
-    # owner scan only iterates admin emails).
+    # owner scan only iterates admin emails): invited, then accepted.
     client = make_test_client(tmp_path)
     add_user = client.post(
         "/api/admin/users",
         json={"email": "alice@example.com", "role": "admin"},
     )
     assert add_user.status_code == 201, add_user.text
+    accept_invitation(client, "alice@example.com")
+    login_as(client, "admin@example.com")
 
     # Seed a stored OAuth token for mixpanel under alice. We have to
     # poke the file-store directly — the dashboard never writes a
@@ -1571,13 +1775,13 @@ def test_admin_connect_409_when_other_admin_owns_slot(
         )
     asyncio.run(_seed())
 
-    # admin@example.com tries to take over mixpanel without first
-    # disconnecting alice → 409.
+    # admin@example.com tries to take over the running mixpanel while
+    # alice is signed in to it → 409.
     resp = client.post("/api/admin/upstreams/mixpanel/connect")
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
     assert "alice@example.com" in detail
-    assert "Disconnect first" in detail
+    assert "already signed in" in detail
 
 
 # --- Per-user OAuth connect / disconnect (auth_router) ---
@@ -1756,27 +1960,6 @@ def test_admin_set_user_role_400_on_unknown_role(tmp_path: Path) -> None:
 # --- Upstream-admin per-route coverage ---
 
 
-def test_admin_refresh_upstream_status_returns_summaries(
-    tmp_path: Path,
-) -> None:
-    """``POST /upstreams/refresh-status`` must return the same shape as
-    GET /upstreams (the dashboard re-uses the listing renderer for the
-    response). Patches ``reconnect_all_oauth_upstreams`` to avoid a
-    real network attempt; the route's interesting behavior is the
-    summary build that follows."""
-    client = make_test_client(tmp_path)
-    with patch(
-        "mcpolis.entrypoints.routes.dashboard.upstream_admin"
-        ".reconnect_all_oauth_upstreams",
-        return_value={},
-    ):
-        resp = client.post("/api/admin/upstreams/refresh-status")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert isinstance(data, list)
-    assert {u["id"] for u in data} == {"github", "mixpanel"}
-
-
 def test_admin_get_upstream_tools_returns_empty_for_unrefreshed(
     tmp_path: Path,
 ) -> None:
@@ -1944,6 +2127,7 @@ def test_admin_update_upstream_400_on_stdio_disabled(
     mcp_json.write_text(MCP_JSON)
     config = tmp_path / "config.json"
     config.write_text(CONFIG_JSON)
+    make_accepted_members(tmp_path / "data", CONFIG_USERS)
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         mcp_json_path=mcp_json,
@@ -2105,7 +2289,7 @@ def test_admin_connect_upstream_admin_oauth_returns_authorization_url(
         authorization_url="https://example.com/oauth/authorize?state=abc",
     )
     with patch(
-        "mcpolis.entrypoints.routes.dashboard.upstream_admin"
+        "mcpolis.domain.services.upstream_admin_service"
         ".connect_and_refresh_tools",
         return_value=fake,
     ):
@@ -2366,6 +2550,28 @@ def test_admin_rename_role_updates_name(tmp_path: Path) -> None:
     assert "to-rename" not in names
 
 
+def test_admin_rename_role_notifies_under_the_new_name(
+    tmp_path: Path,
+) -> None:
+    """The rename's ``policy_changed`` event names the NEW role. The
+    listener looks members up by role name, and after the rename they
+    all carry the new one, so a notice under the old name reached no
+    connected session."""
+    client = make_test_client(tmp_path)
+    client.post("/api/admin/roles", json={"name": "to-rename"})
+    published: list[Event] = []
+    bus = client.app.state.event_bus  # type: ignore[attr-defined]
+    bus.publish = lambda _org_id, event: published.append(event)  # type: ignore[method-assign]
+    resp = client.put(
+        "/api/admin/roles/to-rename/rename",
+        json={"new_name": "renamed"},
+    )
+    assert resp.status_code == 200
+    assert [
+        e.payload for e in published if e.type == "policy_changed"
+    ] == [{"role": "renamed"}]
+
+
 def test_admin_rename_role_400_on_unknown(tmp_path: Path) -> None:
     client = make_test_client(tmp_path)
     resp = client.put(
@@ -2486,3 +2692,197 @@ def test_the_mistyped_invite_can_still_be_cleaned_up(tmp_path: Path) -> None:
 
     resp = client.delete("/api/admin/users/tpyo@example.com")
     assert resp.status_code == 200
+
+
+def test_admin_add_user_reports_pending_until_first_sign_in(
+    tmp_path: Path,
+) -> None:
+    """A teammate added from the dashboard has not signed in yet, so
+    the add answer must say "pending", matching the Team list."""
+    client = make_test_client(tmp_path)
+
+    resp = client.post(
+        "/api/admin/users",
+        json={"email": "new@example.com", "role": "developer"},
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["status"] == "pending"
+    listing = client.get("/api/admin/users").json()
+    row = next(u for u in listing if u["email"] == "new@example.com")
+    assert row["status"] == "pending"
+
+
+def test_admin_import_confirm_blocked_by_sandbox_size_plan_gate(
+    tmp_path: Path,
+) -> None:
+    """Import copies a server's CPU / RAM, so it must apply the same
+    sandbox-size plan check as a single add. Free allows only the
+    1 vCPU / 1024 MB size."""
+    client = make_test_client(tmp_path, plan="free")
+
+    resp = client.post(
+        "/api/admin/upstreams/import/confirm",
+        json=make_import_confirm_body({
+            "big": {"command": "echo", "cpu_vcpus": 4, "memory_mb": 8192},
+        }))
+
+    assert resp.status_code == 402, resp.text
+    ids = {u["id"] for u in client.get("/api/admin/upstreams").json()}
+    assert "big" not in ids
+
+
+def test_admin_set_user_role_keeps_pending_status(tmp_path: Path) -> None:
+    """Changing the role of a teammate who has not signed in yet must
+    answer "pending", like the Team list."""
+    client = make_test_client(tmp_path)
+    client.post(
+        "/api/admin/users",
+        json={"email": "new@example.com", "role": "developer"},
+    )
+
+    resp = client.put(
+        "/api/admin/users/new@example.com/role", json={"role": "admin"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "pending"
+
+
+def test_admin_import_confirm_rejects_a_size_the_sandbox_cannot_run(
+    tmp_path: Path,
+) -> None:
+    """Import must refuse a CPU / RAM size the sandbox provider does
+    not offer, as a row error, like a single add does."""
+    client = make_test_client(tmp_path)
+
+    resp = client.post(
+        "/api/admin/upstreams/import/confirm",
+        json=make_import_confirm_body({
+            "odd": {"command": "echo", "cpu_vcpus": 3},
+        }))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["added"] == []
+    assert [e["id"] for e in body["errors"]] == ["odd"]
+    assert "cpu_vcpus" in body["errors"][0]["error"]
+
+
+def test_admin_add_upstream_with_a_bad_variable_name_saves_nothing(
+    tmp_path: Path,
+) -> None:
+    """Variable names are checked before the upstream is saved, so a bad
+    name leaves no half-made upstream behind."""
+    client = make_test_client(tmp_path)
+
+    resp = client.post("/api/admin/upstreams", json={
+        "id": "vars",
+        "display_name": "Vars",
+        "url": "http://localhost:9010/mcp",
+        "template_vars": {"bad-name": {"value": "x"}},
+    })
+
+    assert resp.status_code == 400, resp.text
+    ids = {u["id"] for u in client.get("/api/admin/upstreams").json()}
+    assert "vars" not in ids
+
+
+def test_admin_import_confirm_counts_only_rows_it_can_add(
+    tmp_path: Path,
+) -> None:
+    """A row refused for its own reason (an unsafe URL) does not count
+    toward the plan's caps: Free allows 5 remote HTTP MCPs, 2 exist, and
+    3 good rows still fit."""
+    client = make_test_client(tmp_path, plan="free")
+
+    resp = client.post(
+        "/api/admin/upstreams/import/confirm",
+        json=make_import_confirm_body({
+            "imp-a": {"url": "http://localhost:9001/mcp"},
+            "imp-b": {"url": "http://localhost:9002/mcp"},
+            "imp-c": {"url": "http://localhost:9003/mcp"},
+            "imp-unsafe": {"url": "http://169.254.169.254/mcp"},
+        }))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert sorted(body["added"]) == ["imp-a", "imp-b", "imp-c"]
+    assert [e["id"] for e in body["errors"]] == ["imp-unsafe"]
+def make_client_with_stale_team_view(tmp_path: Path) -> TestClient:
+    """admin@ and dev@ are signed-in admins, inv@ an invited admin who
+    never signed in. Then dev@ is removed behind the running app's back
+    (as a parallel request would), so the app's in-memory view still
+    lists dev@ as a signed-in admin."""
+    client = make_test_client(tmp_path)
+    login_as(client, "dev@example.com")
+    login_as(client, "admin@example.com")
+    resp = client.put(
+        "/api/admin/users/dev@example.com/role", json={"role": "admin"})
+    assert resp.status_code == 200
+    resp = client.post(
+        "/api/admin/users", json={"email": "inv@example.com", "role": "admin"})
+    assert resp.status_code == 201
+    path = tmp_path / "config.json"
+    raw: dict[str, Any] = json.loads(path.read_text())
+    del raw["users"]["dev@example.com"]
+    path.write_text(json.dumps(raw))
+    return client
+
+
+def users_on_disk(tmp_path: Path) -> set[str]:
+    raw: dict[str, Any] = json.loads((tmp_path / "config.json").read_text())
+    return set(raw["users"])
+
+
+def test_store_refuses_the_removal_a_stale_pre_check_let_through(
+    tmp_path: Path,
+) -> None:
+    """The route's pre-check sees two signed-in admins and passes. The
+    store must count the same signed-in people, so it sees admin@ is the
+    last one and refuses; counting inv@ would leave only an invitation."""
+    client = make_client_with_stale_team_view(tmp_path)
+
+    resp = client.delete("/api/admin/users/admin@example.com")
+
+    assert resp.status_code == 409, resp.text
+    assert "admin@example.com" in users_on_disk(tmp_path)
+
+
+def test_adding_an_address_added_meanwhile_is_a_409(tmp_path: Path) -> None:
+    """Two parallel adds of one address: the second must be refused, not
+    silently overwrite the first one's role."""
+    client = make_test_client(tmp_path)
+    path = tmp_path / "config.json"
+    raw: dict[str, Any] = json.loads(path.read_text())
+    raw["users"]["new@example.com"] = {"role": "admin"}
+    path.write_text(json.dumps(raw))
+
+    resp = client.post(
+        "/api/admin/users", json={"email": "new@example.com", "role": "developer"})
+
+    assert resp.status_code == 409, resp.text
+    raw = json.loads(path.read_text())
+    assert raw["users"]["new@example.com"]["role"] == "admin"
+
+
+def test_settings_write_conflict_is_a_retryable_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settings write that keeps losing races must answer "try again",
+    not a server error. The file store can't lose a race, so its write
+    is replaced by one that reports the conflict."""
+    async def always_conflicts(
+        self: FileConfigStore, org_id: str, email: str, role: str,
+        *, eligible: set[str] | None = None,
+    ) -> SettingsConfig:
+        raise ConfigWriteConflictError(CONFIG_WRITE_CONFLICT_MESSAGE)
+
+    monkeypatch.setattr(FileConfigStore, "set_user_role", always_conflicts)
+    client = make_test_client(tmp_path)
+
+    resp = client.put(
+        "/api/admin/users/dev@example.com/role", json={"role": "admin"})
+
+    assert resp.status_code == 409, resp.text
+    assert "try again" in resp.json()["detail"].lower()

@@ -125,6 +125,13 @@ source = '''
 # 502 from Caddy that never reached uvicorn is the exact failure
 # mode the athena-decision investigation couldn't see; this is what
 # closes that gap.
+#
+# The raw Caddy `request` object (with `uri` and the request headers)
+# and `resp_headers` stay on the record. Their credential headers
+# (Cookie, Authorization, ...) are removed and the secrets in their URLs
+# (the consent token, OAuth codes) masked in `redact_secrets`, not here,
+# because Caddy's error records carry the same `request` object and
+# never pass through this reshape.
 
 [transforms.reshape_caddy_access]
 type = "remap"
@@ -151,12 +158,6 @@ source = '''
           if length(ua) > 0 { .user_agent = ua[0] }
         }
       }
-      # F-02 Layer 2: drop request headers that frequently carry
-      # session credentials. The structlog processor never sees Caddy
-      # records, so this is the only line of defense for them.
-      del(.request.headers.Cookie)
-      del(.request.headers.Authorization)
-      del(.request.headers."Set-Cookie")
     }
     # Move the original Caddy `msg` to `message` so it doesn't shadow
     # `event` after the rewrite.
@@ -215,9 +216,12 @@ key_field = "{{ event }}"
 # directly to stdout, or anything emitted before
 # `configure_structlog` runs. This transform is the catch-all.
 #
-# Limitation: VRL's `for_each` is top-level only. Deep nesting must
-# be handled by Layer 1; this catches the flat shapes that matter
-# in practice (uvicorn / Caddy reshape outputs, third-party JSON).
+# Limitation: the key walker is top-level only (VRL's `for_each`).
+# Deep nesting must be handled by Layer 1; this catches the flat
+# shapes that matter in practice (uvicorn / Caddy reshape outputs,
+# third-party JSON). The header and URL pass at the end is the
+# exception: it walks into Caddy's nested `request`, `resp_headers`
+# and `headers` objects.
 
 [transforms.redact_secrets]
 type = "remap"
@@ -229,6 +233,63 @@ source = '''
       . = set!(., [k], "[REDACTED]")
     }
   }
+  # The key walker above misses two kinds of secret, because they sit in
+  # nested objects or inside a value. One walk handles both, over every
+  # value under these four fields:
+  #   - `http_path`: the uvicorn and Caddy reshape output;
+  #   - `request`: Caddy's raw `uri` and request headers;
+  #   - `resp_headers`: Caddy's response headers (access records);
+  #   - `headers`: the backend's response headers, in the reverse proxy's
+  #     debug "upstream roundtrip" record.
+  # This runs on every record, not only on access records: Caddy's
+  # `http.log.error` records (a 502 while the backend is down) carry the
+  # same `request` object and skip the Caddy reshape.
+  #
+  # 1. Credential headers are removed. Caddy logs headers as a map of
+  #    name -> array of values, and writes "REDACTED" for the values of
+  #    Cookie, Set-Cookie, Authorization and Proxy-Authorization itself,
+  #    but only while its `log_credentials` option is off. So every object
+  #    under these fields loses those four keys here, in any letter case,
+  #    whatever Caddy's settings.
+  #
+  # 2. Secrets in URLs are masked: the query string of a request target
+  #    (the gateway consent token at `/mcp/oauth/consent?consent=…`, OAuth
+  #    authorization codes at the Google and upstream callbacks), and the
+  #    URL headers of a Caddy record (`Referer` on the request, `Location`
+  #    on a 302, which carries the gateway code to the client's
+  #    redirect_uri). Every string under these fields gets the values of
+  #    its sensitive query params masked.
+  #
+  # One literal-keyed replace per param, writing the key back verbatim:
+  # a regex capture-group backreference can't be used because Vector's
+  # config loader would interpolate it as an environment variable. The
+  # match is unanchored on purpose: it also catches id_token / *_token
+  # params, and over-masking a log value is the safe direction here.
+  # Nothing below may fail on record data (no `string!` and the like):
+  # when this program fails, Vector sends the ORIGINAL record, unmasked,
+  # to the sink.
+  credential_headers = ["cookie", "set-cookie", "authorization", "proxy-authorization"]
+  http_fields = {"http_path": .http_path, "request": .request, "resp_headers": .resp_headers, "headers": .headers}
+  http_fields = map_values(http_fields, recursive: true) -> |value| {
+    if is_object(value) {
+      filter(object(value) ?? {}) -> |name, _values| {
+        !includes(credential_headers, downcase(name))
+      }
+    } else if is_string(value) {
+      masked = string(value) ?? ""
+      masked = replace(masked, r'(?i)consent=[^&]*', "consent=[REDACTED]")
+      masked = replace(masked, r'(?i)code=[^&]*', "code=[REDACTED]")
+      masked = replace(masked, r'(?i)access_token=[^&]*', "access_token=[REDACTED]")
+      masked = replace(masked, r'(?i)token=[^&]*', "token=[REDACTED]")
+      masked
+    } else {
+      value
+    }
+  }
+  if exists(.http_path) { .http_path = http_fields.http_path }
+  if exists(.request) { .request = http_fields.request }
+  if exists(.resp_headers) { .resp_headers = http_fields.resp_headers }
+  if exists(.headers) { .headers = http_fields.headers }
 '''
 
 # ---- Sink: Elastic Cloud Serverless data stream ----

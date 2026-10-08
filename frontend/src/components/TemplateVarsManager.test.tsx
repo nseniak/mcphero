@@ -97,7 +97,8 @@ describe("TemplateVarsManager (buffered mode)", () => {
       GH_TOKEN: { value: "ghp_value_more_than_16_chars", is_secret: true },
     });
     expect(screen.getByText("GH_TOKEN")).toBeInTheDocument();
-    expect(screen.getByText("••••hars")).toBeInTheDocument();
+    expect(screen.getByText("•••• set")).toBeInTheDocument();
+    expect(screen.queryByText(/ghp_value_more_than_16_chars/)).toBeNull();
     // The "password" pill is rendered for masked rows.
     expect(screen.getAllByText(/password/i).length).toBeGreaterThan(0);
   });
@@ -131,17 +132,17 @@ describe("TemplateVarsManager (buffered mode)", () => {
     expect(screen.queryByText(/••••/)).toBeNull();
   });
 
-  it("short secret values produce a masked display with no last-4 preview", () => {
+  it("password rows show only set or empty, never any part of the value", () => {
     render(
       <TemplateVarsManager
         upstreamId=""
         references={noRefs()}
-        initialBuffered={{ SHORT: secret("hi") }}
+        initialBuffered={{ SHORT: secret("hi"), BLANK: secret("") }}
       />,
     );
-    expect(screen.getByText("SHORT")).toBeInTheDocument();
-    expect(screen.getByText("••••")).toBeInTheDocument();
-    expect(screen.queryByText(/••••hi/)).toBeNull();
+    expect(screen.getByText("•••• set")).toBeInTheDocument();
+    expect(screen.getByText("empty")).toBeInTheDocument();
+    expect(screen.queryByText(/hi$/)).toBeNull();
   });
 
   it('badges referenced env vars and flags unreferenced ones', () => {
@@ -288,8 +289,7 @@ describe("TemplateVarsManager (buffered mode)", () => {
     expect(within(dialog).queryByLabelText(/Treat as password/)).toBeNull();
   });
 
-  it("password row obfuscates by default; eye toggle reveals", async () => {
-    const user = userEvent.setup();
+  it("password row has no reveal or copy control", () => {
     render(
       <TemplateVarsManager
         upstreamId=""
@@ -299,42 +299,34 @@ describe("TemplateVarsManager (buffered mode)", () => {
         }}
       />,
     );
-    // Default render — masked display with last-4 preview, no
-    // plaintext on screen.
-    expect(screen.getByText("••••1234")).toBeInTheDocument();
+    expect(screen.getByText("•••• set")).toBeInTheDocument();
     expect(screen.queryByText(/ghp_supersecretvalue1234/)).toBeNull();
-    // Click the eye to reveal.
-    await user.click(screen.getByLabelText(/Reveal value/i));
-    expect(screen.getByText("ghp_supersecretvalue1234")).toBeInTheDocument();
-    // Click again to hide.
-    await user.click(screen.getByLabelText(/Hide value/i));
-    expect(screen.queryByText(/ghp_supersecretvalue1234/)).toBeNull();
-    expect(screen.getByText("••••1234")).toBeInTheDocument();
+    expect(screen.queryByText(/1234/)).toBeNull();
+    expect(screen.queryByLabelText(/Reveal value/i)).toBeNull();
+    expect(screen.queryByLabelText(/Copy value/i)).toBeNull();
   });
 
-  it("password row copy button copies plaintext without revealing it", async () => {
+  it("password Edit starts blank and blank keeps the buffered value", async () => {
     const user = userEvent.setup();
-    const writeText = vi.fn(() => Promise.resolve());
-    Object.defineProperty(navigator, "clipboard", {
-      value: { writeText },
-      configurable: true,
-      writable: true,
-    });
+    const onChange = vi.fn();
     render(
       <TemplateVarsManager
         upstreamId=""
         references={noRefs()}
-        initialBuffered={{
-          GH_TOKEN: secret("ghp_anothertokenvalue9876"),
-        }}
+        initialBuffered={{ TOKEN: secret("buffered-value-1234567890") }}
+        onBufferedChange={onChange}
       />,
     );
-    // Copy without revealing — paste-into-form ergonomics without
-    // putting the secret on screen.
-    await user.click(screen.getByLabelText(/Copy value/i));
-    expect(writeText).toHaveBeenCalledWith("ghp_anothertokenvalue9876");
-    // Plaintext still not on screen.
-    expect(screen.queryByText("ghp_anothertokenvalue9876")).toBeNull();
+    await user.click(screen.getByTitle(/Replace value/));
+    const dialog = screen.getByRole("dialog");
+    const value = within(dialog).getByPlaceholderText(
+      /Leave blank to keep the saved value/,
+    ) as HTMLInputElement;
+    expect(value.value).toBe("");
+    await user.click(within(dialog).getByRole("button", { name: /^Save$/ }));
+    expect(onChange).toHaveBeenCalledWith({
+      TOKEN: { value: "buffered-value-1234567890", is_secret: true },
+    });
   });
 
   it("Edit modal renames a buffered variable (delete-old + set-new)", async () => {
@@ -480,33 +472,239 @@ afterEach(() => {
   listSandboxFilesSpy.mockReset();
 });
 
+/** A server row as the API sends it: a password never carries its
+ *  value, a plain row does. */
 function summary(
   name: string,
-  opts: { is_secret?: boolean; value?: string | null; last_four?: string | null } = {},
+  opts: { is_secret?: boolean; value?: string; has_value?: boolean } = {},
 ): TemplateVarSummary {
-  // Default to a non-null value when one isn't provided so the row
-  // renders the cell (obfuscated for secret rows, verbatim for plain
-  // rows). The "(no value)" fallback is back-compat only.
-  const explicit = "value" in opts;
-  const last_four = opts.last_four ?? null;
-  const inferredValue =
-    last_four !== null
-      ? `placeholder-${last_four}`
-      : "placeholder-value";
+  const isSecret = opts.is_secret ?? true;
+  const value = opts.value ?? "placeholder-value";
   return {
     name,
-    is_secret: opts.is_secret ?? true,
-    value: explicit ? (opts.value ?? null) : inferredValue,
-    last_four,
+    is_secret: isSecret,
+    value: isSecret ? null : value,
+    has_value: opts.has_value ?? true,
     created_at: new Date(0).toISOString(),
     updated_at: new Date(0).toISOString(),
   };
 }
 
+function renderDeferred(pending: PendingTemplateVarChanges, onPendingChange: (next: PendingTemplateVarChanges) => void) {
+  return render(
+    <TemplateVarsManager
+      upstreamId="srv-id"
+      references={noRefs()}
+      pendingChanges={pending}
+      onPendingChange={onPendingChange}
+    />,
+  );
+}
+
+describe("TemplateVarsManager (deferred mode, write-only passwords)", () => {
+  it("Edit of a server password with a blank value queues nothing", async () => {
+    listTemplateVarsSpy.mockResolvedValue([summary("TOKEN")]);
+    const user = userEvent.setup();
+    const onPendingChange = vi.fn();
+    renderDeferred(EMPTY_PENDING_CHANGES, onPendingChange);
+    await screen.findByText("TOKEN");
+    await user.click(screen.getByTitle(/Replace value/));
+    const dialog = screen.getByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: /^Save$/ }));
+    expect(onPendingChange).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("Edit of a server password with a typed value queues the new value", async () => {
+    listTemplateVarsSpy.mockResolvedValue([summary("TOKEN")]);
+    const user = userEvent.setup();
+    const onPendingChange = vi.fn();
+    renderDeferred(EMPTY_PENDING_CHANGES, onPendingChange);
+    await screen.findByText("TOKEN");
+    await user.click(screen.getByTitle(/Replace value/));
+    const dialog = screen.getByRole("dialog");
+    await user.type(
+      within(dialog).getByPlaceholderText(/Leave blank to keep the saved value/),
+      "new-password",
+    );
+    await user.click(within(dialog).getByRole("button", { name: /^Save$/ }));
+    expect(onPendingChange).toHaveBeenCalledWith({
+      sets: { TOKEN: { value: "new-password", is_secret: true } },
+      deletes: [],
+    });
+  });
+
+  it("Clear queues an empty value and the row then reads empty", async () => {
+    listTemplateVarsSpy.mockResolvedValue([summary("TOKEN")]);
+    const user = userEvent.setup();
+    let pending: PendingTemplateVarChanges = EMPTY_PENDING_CHANGES;
+    const onPendingChange = vi.fn((next: PendingTemplateVarChanges) => {
+      pending = next;
+    });
+    const { rerender } = renderDeferred(pending, onPendingChange);
+    await screen.findByText("TOKEN");
+    await user.click(screen.getByTitle(/Replace value/));
+    const dialog = screen.getByRole("dialog");
+    await user.click(within(dialog).getByLabelText(/Clear the saved value/));
+    await user.click(within(dialog).getByRole("button", { name: /^Save$/ }));
+    expect(onPendingChange).toHaveBeenCalledWith({
+      sets: { TOKEN: { value: "", is_secret: true } },
+      deletes: [],
+    });
+    rerender(
+      <TemplateVarsManager
+        upstreamId="srv-id"
+        references={noRefs()}
+        pendingChanges={pending}
+        onPendingChange={onPendingChange}
+      />,
+    );
+    expect(screen.getByText("empty")).toBeInTheDocument();
+  });
+
+  it("a kept-value rename shows the row under its new name as set", async () => {
+    listTemplateVarsSpy.mockResolvedValue([summary("OLD_NAME")]);
+    renderDeferred(
+      {
+        sets: { NEW_NAME: { value: null, is_secret: true, rename_from: "OLD_NAME" } },
+        deletes: ["OLD_NAME"],
+      },
+      vi.fn(),
+    );
+    expect(await screen.findByText("NEW_NAME")).toBeInTheDocument();
+    expect(screen.queryByText("OLD_NAME")).toBeNull();
+    expect(screen.getByText("•••• set")).toBeInTheDocument();
+  });
+
+  it("renaming twice keeps pointing at the original saved row", async () => {
+    listTemplateVarsSpy.mockResolvedValue([summary("FIRST")]);
+    const user = userEvent.setup();
+    const onPendingChange = vi.fn();
+    renderDeferred(
+      {
+        sets: { SECOND: { value: null, is_secret: true, rename_from: "FIRST" } },
+        deletes: ["FIRST"],
+      },
+      onPendingChange,
+    );
+    await screen.findByText("SECOND");
+    await user.click(screen.getByTitle(/Replace value/));
+    const dialog = screen.getByRole("dialog");
+    const name = within(dialog).getByLabelText(/Name/i) as HTMLInputElement;
+    await user.clear(name);
+    await user.type(name, "THIRD");
+    await user.click(within(dialog).getByRole("button", { name: /^Save$/ }));
+    expect(onPendingChange).toHaveBeenCalledWith({
+      sets: { THIRD: { value: null, is_secret: true, rename_from: "FIRST" } },
+      deletes: ["FIRST"],
+    });
+  });
+});
+
+function plainSummary(name: string, value: string): TemplateVarSummary {
+  return summary(name, { is_secret: false, value, has_value: value !== "" });
+}
+
+/** Render in deferred mode and keep the parent's pending state, the
+ *  way the detail page does. */
+function renderWithLivePending(initial: PendingTemplateVarChanges = EMPTY_PENDING_CHANGES) {
+  let pending = initial;
+  const onPendingChange = vi.fn((next: PendingTemplateVarChanges) => {
+    pending = next;
+  });
+  const view = render(
+    <TemplateVarsManager
+      upstreamId="srv-id"
+      references={noRefs()}
+      pendingChanges={pending}
+      onPendingChange={onPendingChange}
+    />,
+  );
+  const sync = () =>
+    view.rerender(
+      <TemplateVarsManager
+        upstreamId="srv-id"
+        references={noRefs()}
+        pendingChanges={pending}
+        onPendingChange={onPendingChange}
+      />,
+    );
+  return { getPending: () => pending, sync };
+}
+
+async function clickInRow(name: string, title: RegExp) {
+  const user = userEvent.setup();
+  const row = (await screen.findByText(name)).closest("li");
+  if (!row) throw new Error(`no row ${name}`);
+  await user.click(within(row as HTMLElement).getByTitle(title));
+  return user;
+}
+
+async function renameInModal(user: ReturnType<typeof userEvent.setup>, newName: string) {
+  const dialog = screen.getByRole("dialog");
+  const name = within(dialog).getByLabelText(/Name/i) as HTMLInputElement;
+  await user.clear(name);
+  await user.type(name, newName);
+  await user.click(within(dialog).getByRole("button", { name: /^Save$/ }));
+}
+
+describe("TemplateVarsManager (deferred mode, reused names)", () => {
+  it("delete X, then rename password P onto X: X stays in deletes", async () => {
+    listTemplateVarsSpy.mockResolvedValue([summary("P"), plainSummary("X", "visible")]);
+    const { getPending, sync } = renderWithLivePending();
+    await clickInRow("X", /Delete variable/);
+    sync();
+    const user = await clickInRow("P", /Replace value/);
+    await renameInModal(user, "X");
+    expect(getPending()).toEqual({
+      sets: { X: { value: null, is_secret: true, rename_from: "P" } },
+      deletes: ["X", "P"],
+    });
+  });
+
+  it("delete plain X, re-add X as a password: the typed value is never shown", async () => {
+    listTemplateVarsSpy.mockResolvedValue([plainSummary("X", "visible")]);
+    const { getPending, sync } = renderWithLivePending();
+    await clickInRow("X", /Delete variable/);
+    sync();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /Add variable/ }));
+    const dialog = screen.getByRole("dialog");
+    await user.type(within(dialog).getByLabelText(/Name/i), "X");
+    await user.type(within(dialog).getByPlaceholderText(/Paste value/), "typed-new-password-123");
+    await user.click(within(dialog).getByRole("button", { name: /^Save$/ }));
+    sync();
+    expect(getPending().deletes).toEqual(["X"]);
+    expect(await screen.findByText("X")).toBeInTheDocument();
+    expect(screen.getByText("•••• set")).toBeInTheDocument();
+    expect(screen.queryByText("typed-new-password-123")).toBeNull();
+  });
+
+  it("rename P to Q and back to P queues nothing", async () => {
+    listTemplateVarsSpy.mockResolvedValue([summary("P")]);
+    const { getPending, sync } = renderWithLivePending();
+    await renameInModal(await clickInRow("P", /Replace value/), "Q");
+    sync();
+    await renameInModal(await clickInRow("Q", /Replace value/), "P");
+    expect(getPending()).toEqual({ sets: {}, deletes: [] });
+  });
+
+  it("a kept rename whose source is gone still shows its row", async () => {
+    listTemplateVarsSpy.mockResolvedValue([summary("OTHER")]);
+    renderWithLivePending({
+      sets: { RENAMED: { value: null, is_secret: true, rename_from: "GONE" } },
+      deletes: ["GONE"],
+    });
+    await screen.findByText("OTHER");
+    expect(screen.getByText("RENAMED")).toBeInTheDocument();
+    expect(screen.getByText("empty")).toBeInTheDocument();
+  });
+});
+
 describe("TemplateVarsManager (deferred mode)", () => {
   it("renders the server list, then layers a buffered Add on top", async () => {
     listTemplateVarsSpy.mockResolvedValue([
-      summary("EXISTING_TOKEN", { is_secret: true, last_four: "abcd" }),
+      summary("EXISTING_TOKEN", { is_secret: true }),
     ]);
     const user = userEvent.setup();
     let pending: PendingTemplateVarChanges = EMPTY_PENDING_CHANGES;
@@ -523,7 +721,7 @@ describe("TemplateVarsManager (deferred mode)", () => {
     );
     // Server row appears once the fetch resolves.
     expect(await screen.findByText("EXISTING_TOKEN")).toBeInTheDocument();
-    expect(screen.getByText(/••••abcd/)).toBeInTheDocument();
+    expect(screen.getByText("•••• set")).toBeInTheDocument();
     // Add a new row via the modal — should land in pending, not the API.
     await user.click(screen.getByRole("button", { name: /Add variable/ }));
     const dialog = screen.getByRole("dialog");
@@ -553,11 +751,7 @@ describe("TemplateVarsManager (deferred mode)", () => {
 
   it("Rename of a server row queues delete-old + set-new in pending", async () => {
     listTemplateVarsSpy.mockResolvedValue([
-      summary("OLD_NAME", {
-        is_secret: true,
-        value: "server-value-1234567890",
-        last_four: "7890",
-      }),
+      summary("OLD_NAME", { is_secret: true }),
     ]);
     const user = userEvent.setup();
     let pending: PendingTemplateVarChanges = EMPTY_PENDING_CHANGES;
@@ -580,10 +774,11 @@ describe("TemplateVarsManager (deferred mode)", () => {
     await user.type(name, "NEW_NAME");
     await user.click(within(dialog).getByRole("button", { name: /^Save$/ }));
     // Server-row rename: queue OLD_NAME for delete (so the flush
-    // wipes the old row) AND set NEW_NAME with the same value.
+    // wipes the old row) AND set NEW_NAME, keeping the saved value
+    // the dashboard never saw (the backend copies it).
     expect(onPendingChange).toHaveBeenCalledWith({
       sets: {
-        NEW_NAME: { value: "server-value-1234567890", is_secret: true },
+        NEW_NAME: { value: null, is_secret: true, rename_from: "OLD_NAME" },
       },
       deletes: ["OLD_NAME"],
     });
@@ -617,9 +812,9 @@ describe("TemplateVarsManager (deferred mode)", () => {
     });
   });
 
-  it("Add on a name that's queued for delete moves it back into sets (un-delete)", async () => {
+  it("Add on a name that's queued for delete keeps the delete so the row is recreated", async () => {
     listTemplateVarsSpy.mockResolvedValue([
-      summary("FLIPFLOP", { is_secret: true, last_four: "1234" }),
+      summary("FLIPFLOP", { is_secret: true }),
     ]);
     const user = userEvent.setup();
     let pending: PendingTemplateVarChanges = { sets: {}, deletes: ["FLIPFLOP"] };
@@ -646,9 +841,12 @@ describe("TemplateVarsManager (deferred mode)", () => {
       "back-again-1234567890",
     );
     await user.click(within(dialog).getByRole("button", { name: /^Save$/ }));
+    // FLIPFLOP stays in deletes: the save deletes the old row and
+    // creates a new one, so the new row takes this flag (a replace
+    // in place would keep the old row's flag).
     expect(onPendingChange).toHaveBeenCalledWith({
       sets: { FLIPFLOP: { value: "back-again-1234567890", is_secret: true } },
-      deletes: [],
+      deletes: ["FLIPFLOP"],
     });
     rerender(
       <TemplateVarsManager
@@ -663,7 +861,7 @@ describe("TemplateVarsManager (deferred mode)", () => {
 
   it("blocks Add when the name already exists on the server", async () => {
     listTemplateVarsSpy.mockResolvedValue([
-      summary("SERVER_TOKEN", { is_secret: true, last_four: "abcd" }),
+      summary("SERVER_TOKEN", { is_secret: true }),
     ]);
     const user = userEvent.setup();
     const onPendingChange = vi.fn();
@@ -751,5 +949,29 @@ describe("TemplateVarsManager (deferred mode)", () => {
       sets: {},
       deletes: ["BREAK_ME"],
     });
+  });
+});
+
+describe("TemplateVarsManager (no edit buffer)", () => {
+  it("offers no edit buttons when an MCP id comes without a pending-changes buffer", async () => {
+    // With an ``upstreamId`` but neither ``pendingChanges`` nor
+    // ``readOnly``, Save used to close the modal and store nothing.
+    listTemplateVarsSpy.mockResolvedValue([
+      summary("EXISTING_TOKEN", { is_secret: true, has_value: true }),
+    ]);
+    render(
+      <TemplateVarsManager
+        upstreamId="srv-id"
+        references={[{
+          name: "MISSING",
+          location: { mcpId: "", field: "env", jsonKey: "X" },
+        }]}
+      />,
+    );
+    expect(await screen.findByText("EXISTING_TOKEN")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Add variable/ })).toBeNull();
+    expect(screen.queryByTitle(/Replace value/)).toBeNull();
+    expect(screen.queryByTitle(/Delete variable/)).toBeNull();
+    expect(screen.queryByText(/references undefined variables/)).toBeNull();
   });
 });

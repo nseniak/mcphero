@@ -68,6 +68,7 @@ from mcpolis.adapters.repositories.mongo_client import (
     COLL_AUDIT,
     COLL_CONFIG,
     COLL_CONNECTIONS,
+    COLL_GATEWAY_OAUTH,
     COLL_OAUTH_STATE,
     COLL_SANDBOX_FILES,
     COLL_SANDBOX_REFS,
@@ -175,6 +176,9 @@ class StorageBundle:
     # that haven't been ported to the protocol yet. None in cloud mode.
     file_config_store: FileConfigStore | None = None
     file_mcp_store: McpJsonStore | None = None
+    # Read synchronously by the standalone boot, which builds the default
+    # org's runtime (and its accepted members) before the event loop.
+    file_org_repo: FileOrganizationRepository | None = None
 
 
 def build_storage(
@@ -247,6 +251,7 @@ def build_file_storage(
         mongo=None,
         file_config_store=config_store,
         file_mcp_store=mcp_store,
+        file_org_repo=organization_repo,
     )
 
 
@@ -301,7 +306,7 @@ def build_cloud_storage(
         scoped(COLL_AUDIT), event_bus=event_stream,
     )
     oauth_state_repo = MongoOAuthStateRepository(
-        scoped(COLL_OAUTH_STATE), encryptor,
+        scoped(COLL_GATEWAY_OAUTH), scoped(COLL_OAUTH_STATE), encryptor,
     )
     tool_catalog_repo = MongoToolCatalogRepository(scoped(COLL_TOOL_CATALOG))
     # Cloud-mode sandbox refs go through Mongo so the in-memory
@@ -350,10 +355,11 @@ async def initialize_storage(
 ) -> None:
     """Async-side initialization that needs an event loop.
 
-    - Cloud mode: create Mongo indexes, then sync membership rows for
-      every org that already has users in its config doc (so
-      ``list_user_orgs`` works for users added via the Team page).
-      No default org is created — users create their own on signup.
+    - Cloud mode: create Mongo indexes. No default org is created —
+      users create their own on signup. Membership rows are NOT derived
+      from ``config.users`` here: an address there with no row is a
+      pending invitation, and only the invited person accepting it
+      makes it a membership.
     - Standalone mode: ensure the single ``default`` org exists (no-op
       — the file config store already seeded defaults synchronously
       during ``create_app``).
@@ -363,17 +369,6 @@ async def initialize_storage(
             bundle.mongo.database,
             audit_retention_days=audit_retention_days,
         )
-        # Sync memberships for all existing orgs. Users added via the
-        # Team page only write to ``config.users``; the membership row
-        # is created here (idempotent upsert) so ``list_user_orgs``
-        # and the Team page's "Joined/Pending" status work correctly.
-        all_orgs = await bundle.organization_repo.list_organizations()
-        for org in all_orgs:
-            config = await bundle.config_repo.load(org.id)
-            for email, user_def in config.users.items():
-                await bundle.organization_repo.add_membership(
-                    org.id, email, user_def.role,
-                )
     else:
         # Standalone mode: ensure the default org + default roles.
         await bundle.organization_repo.ensure_default_org()

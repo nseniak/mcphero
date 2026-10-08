@@ -36,6 +36,7 @@ from mcpolis.domain.model.upstream import (
     UpstreamDefinition,
 )
 from mcpolis.domain.ports import DEFAULT_ORG_ID
+from mcpolis.domain.services.sign_in_refresh_lock import SignInRefreshLock
 from mcpolis.domain.services.upstream_connection_service import (
     DisconnectReason,
     reconnect_with_stored_tokens,
@@ -200,7 +201,7 @@ async def test_refresh_token_releases_lock_on_decrypt_error() -> None:
         user_id=USER_ID,
         connection_store=store,
         server_url=SERVER_URL,
-        distributed_lock=lock,
+        refresh_lock=SignInRefreshLock(lock),
     )
 
     lock.acquire.assert_awaited_once()

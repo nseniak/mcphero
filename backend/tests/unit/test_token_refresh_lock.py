@@ -14,6 +14,7 @@ from mcpolis.domain.model.upstream import (
     TransportType,
     UpstreamDefinition,
 )
+from mcpolis.domain.services.sign_in_refresh_lock import SignInRefreshLock
 from mcpolis.domain.services.upstream_connection_service import (
     refresh_token_for_user,
 )
@@ -61,7 +62,7 @@ async def test_distributed_lock_prevents_duplicate_token_refresh() -> None:
         user_id="admin",
         connection_store=connection_store,
         server_url="http://localhost:8080",
-        distributed_lock=lock,
+        refresh_lock=SignInRefreshLock(lock),
     )
 
     lock.acquire.assert_awaited_once()
@@ -89,14 +90,18 @@ async def test_token_refresh_acquires_and_releases_lock() -> None:
         user_id="admin",
         connection_store=connection_store,
         server_url="http://localhost:8080",
-        distributed_lock=lock,
+        refresh_lock=SignInRefreshLock(lock),
     )
 
-    lock.acquire.assert_awaited_once()
+    # Taken for the sign-in, then renewed while the refresh retried for
+    # 10 s (every third of its lifetime).
+    key = SignInRefreshLock.key("org-1", "test-mcp", "admin")
+    assert lock.acquire.await_args_list
+    assert {call.args[0] for call in lock.acquire.await_args_list} == {key}
     # Token was checked (refresh proceeded)
     connection_store.get_user_token.assert_awaited()
     # Lock was released
-    lock.release.assert_awaited_once()
+    lock.release.assert_awaited_once_with(key)
 
 
 @pytest.mark.asyncio
@@ -142,7 +147,7 @@ async def test_noop_lock_always_allows_refresh() -> None:
         user_id="admin",
         connection_store=connection_store,
         server_url="http://localhost:8080",
-        distributed_lock=lock,
+        refresh_lock=SignInRefreshLock(lock),
     )
 
     # Token was checked (NoOp lock always acquires)

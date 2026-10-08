@@ -69,9 +69,28 @@ class OrganizationRepository(Protocol):
 
     async def add_membership(
         self, org_id: str, email: str, role: str
-    ) -> Membership: ...
+    ) -> Membership:
+        """Save ``email``'s membership of the org (an accepted
+        invitation), or update the role of the one that exists."""
+        ...
+
+    async def update_membership_role(
+        self, org_id: str, email: str, role: str
+    ) -> bool:
+        """Set the role of an EXISTING membership row; never creates one.
+        Returns whether a row was there to update. A role change must not
+        bring back a membership that a removal just deleted."""
+        ...
 
     async def remove_membership(self, org_id: str, email: str) -> None: ...
+
+    async def rename_role(
+        self, org_id: str, old_name: str, new_name: str
+    ) -> int:
+        """Point this org's memberships holding ``old_name`` at
+        ``new_name``. Returns the number of rows moved. The membership
+        row keeps its own copy of the policy role name."""
+        ...
 
     async def delete_organization(self, org_id: str) -> None:
         """Delete an organization and all its memberships."""

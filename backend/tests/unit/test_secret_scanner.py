@@ -7,7 +7,13 @@ scanner is a pure function, the logging is the caller's job.
 """
 from __future__ import annotations
 
-from mcpolis.domain.services.secret_scanner import scan_for_secrets
+from mcpolis.domain.services.secret_scanner import (
+    HIDDEN_VALUE,
+    hide_secret_args,
+    hide_secret_values,
+    hide_secrets_in_text,
+    scan_for_secrets,
+)
 
 
 def test_scanner_detects_github_token() -> None:
@@ -150,3 +156,151 @@ def test_scanner_match_preview_passes_through_short_value() -> None:
     # A 6-char value with secret-suggestive key + entropy: still
     # below the entropy length threshold (16).
     assert scan_for_secrets(env={"TOKEN": "ABCxyz"}) == []
+
+
+# --- Hiding credentials from a reader (the Admin MCP's get_upstream) ---
+# Errs on hiding: a reader like an AI client must never see one.
+
+
+def test_hide_secret_values_hides_every_value_but_references() -> None:
+    """Deny by default: a credential hides behind harmless-looking names
+    and shapes too (a password inside ``DATABASE_URL``, a ``Cookie``, a
+    GitLab token under the name ``PAT``), so a plain setting is hidden
+    as well."""
+    values = {
+        "Authorization": "Bearer abc123",
+        "X-Custom": "token abc123",
+        "DATABASE_URL": "postgres://admin:S3cretPassw0rd@db.example.com:5432/app",
+        "Cookie": "session=abcd1234efgh5678ijkl9012",
+        "PAT": "glpat-abcdefghij0123456789",
+        "AUTH_MODE": "oauth",
+        "LOG_LEVEL": "debug",
+    }
+
+    assert hide_secret_values(values) == dict.fromkeys(values, HIDDEN_VALUE)
+
+
+def test_hide_secret_values_shows_values_made_only_of_references() -> None:
+    values = {
+        "Authorization": "Bearer ${API_TOKEN}",
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}",
+        "CREDENTIALS": "${USER} ${PASSWORD}",
+        "EMPTY": "",
+    }
+
+    assert hide_secret_values(values) == values
+
+
+def test_hide_secrets_in_text_hides_url_credentials() -> None:
+    # Whatever is before the @: a user name and a password, or a token
+    # alone; a password holding a raw @ is hidden whole.
+    assert hide_secrets_in_text(
+        "https://bob:pa55word@mcp.example.com/mcp?api_key=abc123&page=2",
+    ) == f"https://{HIDDEN_VALUE}@mcp.example.com/mcp?api_key={HIDDEN_VALUE}&page=2"
+    assert hide_secrets_in_text(
+        "https://plaintoken@git.example.com/repo",
+    ) == f"https://{HIDDEN_VALUE}@git.example.com/repo"
+    assert hide_secrets_in_text(
+        "postgres://admin:p@ss@db.example.com:5432/app",
+    ) == f"postgres://{HIDDEN_VALUE}@db.example.com:5432/app"
+    # A key in the path (Zapier, Pipedream... hand out secret URLs) or in
+    # a query value under any name.
+    zapier = "ZjQ5YTk3ZDItNjM4ZC00MzA0LWI2NjQtYjY5ZmJmNmI4ZTc1"
+    assert hide_secrets_in_text(
+        f"https://mcp.zapier.com/api/mcp/s/{zapier}/mcp",
+    ) == f"https://mcp.zapier.com/api/mcp/s/{HIDDEN_VALUE}/mcp"
+    assert hide_secrets_in_text(
+        "https://mcp.example.com/c7c118f6-71fa-44c4-86e3-bc032facce88/sse"
+        "?customer=4f9a1c2e8b7d6a5f3e2d",
+    ) == f"https://mcp.example.com/{HIDDEN_VALUE}/sse?customer={HIDDEN_VALUE}"
+    # A known token shape.
+    assert hide_secrets_in_text(
+        "https://actions.example.com/mcp/sk-ak-abcdefghijklmnopqrstuvwx/sse",
+    ) == f"https://actions.example.com/mcp/{HIDDEN_VALUE}/sse"
+
+
+def test_hide_secrets_in_text_shows_references_and_plain_parts() -> None:
+    for text in (
+        "https://mcp.example.com/mcp?token=${TOKEN}&page=2",
+        "https://${USER}:${PASSWORD}@mcp.example.com/mcp",
+        "https://server.smithery.ai/@owner/server/mcp?profile=work",
+        "http://127.0.0.1:9001/mcp",
+        # A reference is shown whatever its name looks like.
+        "https://mcp.example.com/${KEY_A1B2C3D4E5F6G7H8}/mcp",
+    ):
+        assert hide_secrets_in_text(text) == text
+
+
+def test_hide_secrets_in_text_hides_env_vars_set_on_a_command_line() -> None:
+    """Like an env var's value: hidden unless only references."""
+    assert hide_secrets_in_text(
+        "API_KEY=abc123 LOG_LEVEL=debug node server.js",
+    ) == f"API_KEY={HIDDEN_VALUE} LOG_LEVEL={HIDDEN_VALUE} node server.js"
+    shown = "TOKEN=${TOKEN} node server.js"
+    assert hide_secrets_in_text(shown) == shown
+
+
+def test_hide_secrets_in_text_hides_what_follows_an_auth_scheme() -> None:
+    assert hide_secrets_in_text(
+        'curl -H "Authorization: Bearer abc123" https://mcp.example.com',
+    ) == f'curl -H "Authorization: Bearer {HIDDEN_VALUE}" https://mcp.example.com'
+    shown = 'curl -H "Authorization: Bearer ${TOKEN}" https://mcp.example.com'
+    assert hide_secrets_in_text(shown) == shown
+
+
+def test_hide_secret_args_hides_credential_arguments() -> None:
+    assert hide_secret_args([
+        "-y", "mcp-remote", "https://mcp.example.com/sse",
+        "--header", "Authorization: Bearer abc123",
+        "--header", "X-Tenant: acme",
+        "--api-key", "abc123",
+        "--pat", "plain-value",
+        "--token=xyz789",
+        "--workspace", "ab12cd34ef56gh78ij90",
+        "-e", "GITHUB_TOKEN=plain-value",
+        "--port", "8080",
+    ]) == [
+        "-y", "mcp-remote", "https://mcp.example.com/sse",
+        # After --header, a header's value is hidden like in the headers.
+        "--header", f"Authorization: {HIDDEN_VALUE}",
+        "--header", f"X-Tenant: {HIDDEN_VALUE}",
+        "--api-key", HIDDEN_VALUE,
+        "--pat", HIDDEN_VALUE,
+        f"--token={HIDDEN_VALUE}",
+        "--workspace", HIDDEN_VALUE,
+        "-e", f"GITHUB_TOKEN={HIDDEN_VALUE}",
+        "--port", "8080",
+    ]
+
+
+def test_hide_secret_args_hides_a_whole_assigned_value() -> None:
+    """An argument that sets a value hides all of it, spaces included,
+    and a header set with ``--header=`` is hidden like after ``--header``."""
+    assert hide_secret_args([
+        "--password=two words",
+        "API_KEY=a b",
+        "LOG_LEVEL=debug",
+        "apikey=abc",
+        "mode=readonly",
+        "--header=X-Api-Key: abc123",
+        "--config", '{"apiKey": "plain-pass", "region": "eu"}',
+    ]) == [
+        f"--password={HIDDEN_VALUE}",
+        f"API_KEY={HIDDEN_VALUE}",
+        f"LOG_LEVEL={HIDDEN_VALUE}",
+        f"apikey={HIDDEN_VALUE}",
+        "mode=readonly",
+        f"--header=X-Api-Key: {HIDDEN_VALUE}",
+        "--config", f'{{"apiKey": "{HIDDEN_VALUE}", "region": "eu"}}',
+    ]
+
+
+def test_hide_secret_args_shows_references_and_package_names() -> None:
+    args = [
+        "--header", "Authorization:${AUTH_HEADER}", "--token", "${TOKEN}",
+        "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "-e", "API_KEY=${API_KEY}",
+        "mcp-neo4j-cypher@0.2.1", "--from", "mcp-server-git==0.6.2",
+        "@modelcontextprotocol/server-filesystem", "localhost:8080",
+    ]
+
+    assert hide_secret_args(args) == args

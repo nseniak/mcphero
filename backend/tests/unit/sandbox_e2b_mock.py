@@ -123,13 +123,19 @@ class MockE2BProcessHandle:
     ``wait()`` blocks until the test calls ``simulate_exit``."""
 
     def __init__(
-        self, exit_code: int = 0, *, pid: int = 1234,
+        self,
+        exit_code: int = 0,
+        *,
+        pid: int = 1234,
+        client: "MockE2BClient | None" = None,
     ) -> None:
         self._stdin: list[bytes] = []
         self._exit_event = asyncio.Event()
         self._exit_code = exit_code
         self._killed = False
         self._pid = pid
+        # The client whose switches (``process_kill_hangs``) apply.
+        self._client = client
         # When set, ``send_stdin`` raises this exception instead of
         # buffering. Lets tests reproduce the case where the
         # underlying sandbox has died (E2B kill timer, network blip)
@@ -140,6 +146,9 @@ class MockE2BProcessHandle:
         # returns, so a fast server's answer can arrive mid-send; a
         # test reproduces that by answering from here.
         self.during_send: Callable[[bytes], Awaitable[None]] | None = None
+        # When set, ``wait()`` raises this instead of returning a code:
+        # the SDK's events stream failing, as opposed to a process exit.
+        self._wait_error: Exception | None = None
 
     @property
     def pid(self) -> int:
@@ -165,6 +174,12 @@ class MockE2BProcessHandle:
         self._exit_code = code
         self._exit_event.set()
 
+    def simulate_stream_error(self, exc: Exception) -> None:
+        """Make ``wait()`` raise ``exc``: the output stream broke
+        without reporting any exit code."""
+        self._wait_error = exc
+        self._exit_event.set()
+
     async def send_stdin(self, data: bytes) -> None:
         if self.stdin_send_error is not None:
             raise self.stdin_send_error
@@ -174,6 +189,8 @@ class MockE2BProcessHandle:
 
     async def wait(self) -> int:
         await self._exit_event.wait()
+        if self._wait_error is not None:
+            raise self._wait_error
         return self._exit_code
 
     async def release(self) -> None:
@@ -184,6 +201,11 @@ class MockE2BProcessHandle:
         self._exit_event.set()
 
     async def kill(self) -> None:
+        if self._client is not None and self._client.process_kill_hangs:
+            # A process kill goes through envd, which is what hangs in
+            # a wedged sandbox.
+            self._client.kill_started.set()
+            await asyncio.Event().wait()
         self._killed = True
         self._exit_event.set()
 
@@ -223,6 +245,11 @@ class MockE2BSandboxHandle:
         self._client.commands.append(
             _RecordedCommand(argv=list(argv), env=dict(env)),
         )
+        self._client.run_command_started.set()
+        if self._client.run_command_gate is not None:
+            await self._client.run_command_gate.wait()
+        if self._client.run_command_raises is not None:
+            raise self._client.run_command_raises
         # Save callbacks so tests can simulate stdout/stderr emission.
         self._client.last_on_stdout = on_stdout
         self._client.last_on_stderr = on_stderr
@@ -231,7 +258,9 @@ class MockE2BSandboxHandle:
         # wake path replaces the process: code that forgets to persist
         # the new pid, or that kills the wrong one, would still pass.
         self._client.next_pid += 1
-        process = MockE2BProcessHandle(pid=self._client.next_pid)
+        process = MockE2BProcessHandle(
+            pid=self._client.next_pid, client=self._client,
+        )
         self.last_process = process
         return process
 
@@ -296,8 +325,14 @@ class MockE2BSandboxHandle:
         return snapshot_id
 
     async def kill(self) -> None:
-        self.killed = True
+        await self._client.wait_for_kill_gate()
         self._client.kills.append(_RecordedKill(sandbox_id=self._sandbox_id))
+        if self._client.kill_raises is not None:
+            raise self._client.kill_raises
+        self.killed = True
+        # As E2B does, and as ``kill_sandbox`` here: once killed, the
+        # sandbox is gone from the listing, whichever way it was killed.
+        self._client.drop_listed(self._sandbox_id)
 
     async def write_file(
         self,
@@ -346,7 +381,6 @@ class MockE2BClient(E2BClient):
     file_writes: list[_RecordedFileWrite] = field(
         default_factory=list[_RecordedFileWrite],
     )
-    deleted_snapshots: list[str] = field(default_factory=list[str])
     volume_creates: list[_RecordedVolumeCreate] = field(
         default_factory=list[_RecordedVolumeCreate],
     )
@@ -376,6 +410,31 @@ class MockE2BClient(E2BClient):
     # Force-error switches for tests.
     create_raises: Exception | None = None
     connect_raises: Exception | None = None
+    # When set, a sandbox kill (``kill_sandbox`` or a handle's
+    # ``kill``) records the attempt, then raises.
+    kill_raises: Exception | None = None
+    # When set, ``run_command`` records the call, then waits for this
+    # gate before it returns: an MCP command whose start hangs.
+    run_command_gate: asyncio.Event | None = None
+    # When set, ``run_command`` records the call, then raises this: an
+    # MCP command that fails to start.
+    run_command_raises: Exception | None = None
+    run_command_started: asyncio.Event = field(default_factory=asyncio.Event)
+    # When set, a sandbox kill (by handle or by id) waits for this gate
+    # before it takes effect: a slow E2B API. A kill cancelled while it
+    # waits takes no effect, like an HTTP call cut short.
+    kill_gate: asyncio.Event | None = None
+    # Set when a sandbox kill starts, or a process kill that hangs.
+    kill_started: asyncio.Event = field(default_factory=asyncio.Event)
+    # When True, a process kill never returns: it goes through envd,
+    # which is what hangs when an MCP is wedged.
+    process_kill_hangs: bool = False
+
+    async def wait_for_kill_gate(self) -> None:
+        """Start a sandbox kill: signal it, then hold it at ``kill_gate``."""
+        self.kill_started.set()
+        if self.kill_gate is not None:
+            await self.kill_gate.wait()
 
     async def create_sandbox(
         self,
@@ -469,15 +528,18 @@ class MockE2BClient(E2BClient):
         return out
 
     async def kill_sandbox(self, sandbox_id: str) -> None:
+        await self.wait_for_kill_gate()
         self.kills.append(_RecordedKill(sandbox_id=sandbox_id))
+        if self.kill_raises is not None:
+            raise self.kill_raises
+        self.drop_listed(sandbox_id)
+
+    def drop_listed(self, sandbox_id: str) -> None:
+        """Take a killed sandbox off the provider's listing."""
         self.live_infos = [
             info for info in self.live_infos
             if info.sandbox_id != sandbox_id
         ]
-
-    async def delete_snapshot(self, snapshot_id: str) -> None:
-        self.deleted_snapshots.append(snapshot_id)
-        self._snapshot_metadata.pop(snapshot_id, None)
 
     async def create_volume(self, *, name: str) -> str:
         if self.volume_create_raises is not None:

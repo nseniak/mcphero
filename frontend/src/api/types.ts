@@ -38,6 +38,15 @@ export interface CurrentOrgInfo {
   plan: PlanName;
 }
 
+/** An organization's invitation the signed-in person has not accepted
+ *  yet. Until they accept it they are not a member: no access, and the
+ *  organization's admins can't act on them. */
+export interface InvitationInfo {
+  slug: string;
+  display_name: string;
+  role: string;
+}
+
 export interface UserInfo {
   email: string;
   roles: string[];
@@ -46,6 +55,7 @@ export interface UserInfo {
   is_superadmin: boolean;
   orgs: OrgMembership[];
   current_org: CurrentOrgInfo | null;
+  invitations: InvitationInfo[];
 }
 
 export interface UpstreamSummary {
@@ -57,10 +67,10 @@ export interface UpstreamSummary {
    *  ⇔ shared session live. For both OAuth modes ⇔ at least one
    *  admin has authenticated. */
   ready: boolean;
-  /** Email of the admin currently providing readiness for either
-   *  OAuth mode, or null for service_account / when no admin is
-   *  signed in. Drives the "Authenticated by alice@" + take-over
-   *  UX uniformly across both OAuth modes. */
+  /** Email of the admin whose saved sign-in serves either OAuth mode
+   *  (while stopped: the one Start reuses), or null for service_account
+   *  / when no admin is signed in. Drives "Ready, by alice@" and
+   *  Remove sign-in uniformly across both OAuth modes. */
   slot_owner: string | null;
   tool_count: number;
   /** True while the post-connect catalog refresh (list_tools /
@@ -74,6 +84,10 @@ export interface UpstreamSummary {
    *  ms, but the underlying connect can take 1–60s for a sandbox
    *  cold pull). */
   starting: boolean;
+  /** True while an admin's Stop holds, until an admin's Start. A
+   *  stopped OAuth upstream with a kept admin sign-in (``slot_owner``)
+   *  shows Connect, since Start reuses it; without one, Authenticate. */
+  stopped: boolean;
   url: string | null;
   disconnect_reason: string | null;
 }
@@ -102,6 +116,8 @@ export interface UpstreamDetail {
    *  signal, surfaced on the detail page so the button + status pill
    *  show "Starting…" across tab switches and reloads. */
   starting: boolean;
+  /** See UpstreamSummary.stopped. */
+  stopped: boolean;
   url: string | null;
   command: string | null;
   client_id: string | null;
@@ -319,17 +335,17 @@ export interface AddUpstreamTemplateVarSpec {
 
 /** Wire-shape of a per-MCP env-var summary.
  *
- * For secret rows, ``value`` is always ``null`` — the UI renders a
- * masked display from ``last_four``. For plain rows, ``value`` carries
- * the plaintext so the UI can render it verbatim.
+ * Passwords (``is_secret=true``) are write-only: ``value`` is always
+ * ``null`` and ``has_value`` says whether a non-empty value is saved.
+ * For plain rows, ``value`` carries the plaintext.
  */
 export interface TemplateVarSummary {
   name: string;
   is_secret: boolean;
   /** Plaintext value — present only when ``is_secret=false``. */
   value: string | null;
-  /** Last 4 chars when the saved value is longer than 16 chars; null otherwise. */
-  last_four: string | null;
+  /** ``true`` when a non-empty value is saved. */
+  has_value: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -373,11 +389,13 @@ export interface SystemVariable {
 
 /** Per-entry shape inside ``UpdateUpstreamRequest.template_var_changes.sets``.
  *
- * Mirrors :class:`AddUpstreamTemplateVarSpec` so the buffered create-wizard
- * payload and the deferred edit-page payload share a wire shape. */
+ * ``value: null`` keeps the saved value of ``rename_from`` (a rename)
+ * or of the same name. That is how a password, which the dashboard
+ * never holds, survives a Save or a rename. */
 export interface UpdateUpstreamTemplateVarSpec {
-  value: string;
+  value: string | null;
   is_secret: boolean;
+  rename_from?: string;
 }
 
 /** Buffered env-var mutations the deferred Edit/Save flow flushes
@@ -479,8 +497,6 @@ export interface SuperadminOverviewCounts {
 
 export interface SuperadminOverviewSystem {
   mode: "standalone" | "cloud";
-  sandbox_runner_configured: boolean;
-  sandbox_runner_url_count: number;
   mixpanel_enabled: boolean;
   sentry_enabled: boolean;
 }

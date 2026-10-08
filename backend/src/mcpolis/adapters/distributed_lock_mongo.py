@@ -1,7 +1,9 @@
 """Mongo-backed distributed lock for cloud (multi-backend) mode.
 
-Uses a ``locks`` collection with a TTL index on ``expires_at`` so
-expired locks are garbage-collected automatically by MongoDB.
+Uses the ``locks`` collection. Its TTL index on ``expires_at`` is
+created at startup with the other indexes, in
+``adapters/repositories/mongo_client.py`` (not here), so MongoDB
+garbage-collects expired locks.
 
 acquire() uses findOneAndUpdate with upsert + $setOnInsert:
 - If no doc exists → inserted with this holder → acquired.
@@ -18,8 +20,7 @@ from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorCollection, AsyncIOMotorDatabase
 
-
-COLL_LOCKS = "locks"
+from mcpolis.adapters.repositories.mongo_client import COLL_LOCKS
 
 
 class MongoDistributedLock:

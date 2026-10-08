@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { BACKEND_URL, createOrg, loginAs } from "./helpers";
+import { BACKEND_URL, acceptInvitation, createOrg, loginAs } from "./helpers";
 
 /**
  * Sibling of 29-org-switcher-non-admin-landing.spec.ts. Same bug,
@@ -29,10 +29,11 @@ test("Manage-page Switch must not land a non-admin user on /admin/upstream", asy
   });
   expect([200, 201]).toContain(resp.status());
 
-  // User signs in (membership materializes) and creates org2 (admin
-  // there). Their cookie is then pointed at org2.
+  // User signs in, accepts the invitation (now a member of org1) and
+  // creates org2 (admin there). Their cookie is then pointed at org2.
   await loginAs(page, USER);
   const pageReq = page.context().request;
+  await acceptInvitation(pageReq, ORG1);
   resp = await pageReq.post(`${BACKEND_URL}/api/orgs`, {
     data: { slug: ORG2, display_name: "Org Two", created_via: "manage_page" },
   });

@@ -3,8 +3,8 @@
  *
  * The bucket holds two flavours:
  * - ``is_secret=true`` (the default): plaintext is write-only —
- *   accepted on PUT but never returned. Listing carries ``last_four``
- *   for display only.
+ *   accepted on PUT but never returned. Listing carries only
+ *   ``has_value`` (set / empty).
  * - ``is_secret=false``: value is returned in clear by GET / list so
  *   the UI can render it verbatim.
  *

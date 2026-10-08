@@ -33,12 +33,10 @@ class TemplateVarRepository(Protocol):
         Sorted by name ascending so the UI's order is stable across
         calls. Returns an empty list when nothing is defined.
 
-        ``value`` is populated for both kinds — the dashboard SPA
-        obfuscates password rows by default and exposes an eye
-        toggle to reveal (1Password-style). ``last_four`` is still
-        provided for the masked preview placeholder. Encryption-at-
-        rest still applies uniformly in cloud mode regardless of
-        the ``is_secret`` flag.
+        Passwords (``is_secret=True``) are write-only: their summary
+        carries ``value=None`` and only ``has_value``. Plain rows carry
+        the value. Build summaries with
+        :func:`~mcpolis.domain.model.template_var.make_template_var_summary`.
         """
         ...
 
@@ -71,9 +69,8 @@ class TemplateVarRepository(Protocol):
         decision: to flip a value's secrecy after the fact, the caller
         must delete + re-create.
 
-        ``last_four`` is computed from ``value`` server-side and
-        stored alongside the encrypted blob (cloud mode) or plaintext
-        (standalone) so the listing path never has to decrypt.
+        The returned summary follows the same write-only rule as
+        :meth:`list_summaries`: a password's value is not in it.
         """
         ...
 

@@ -18,7 +18,7 @@
  */
 import { test, expect, type Page } from "@playwright/test";
 
-import { apiLoginAs, loginAs, OAUTH_TEST_MCP_URL as FAKE_OAUTH, BACKEND_URL as BACKEND } from "./helpers";
+import { apiLoginAs, loginAs, OAUTH_TEST_MCP_URL as FAKE_OAUTH, resetOAuthUpstream } from "./helpers";
 const ORG = "acme-corp";
 const USER = "admin@example.com";
 const UPSTREAM = "oauth-tools-pu";
@@ -44,18 +44,11 @@ async function clickAndCompleteOAuthPopup(page: Page, email: string) {
 
 test.beforeEach(async ({ request }) => {
   await request.post(`${FAKE_OAUTH}/test/reset`);
+  // Leftover sign-ins from other admins (e.g. admin2@example.com from
+  // specs 15b / 17b) would put the page in the "Ready, by <other-admin>"
+  // state. The admin Stop keeps sign-ins, so every holder signs out.
+  await resetOAuthUpstream(request, UPSTREAM);
   await apiLoginAs(request, USER);
-  // Per-user disconnect clears only this caller's row. After Phase B
-  // unified the admin-tab UX across both OAuth modes, a leftover
-  // row from another admin (e.g. admin2@example.com from specs 15b
-  // / 17b) would put the page in the "Connected, by <other-admin>"
-  // state — Disconnect button instead of Authenticate. So also
-  // call the admin-tab disconnect to release any slot-owning
-  // admin's row regardless of identity.
-  await request.post(`${BACKEND}/api/auth/disconnect/${UPSTREAM}`);
-  await request.post(
-    `${BACKEND}/api/admin/upstreams/${UPSTREAM}/disconnect`
-  );
 });
 
 test.describe("/my-tools sign-out (per_user_oauth)", () => {

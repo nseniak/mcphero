@@ -5,6 +5,7 @@ import { Sidebar } from "./Sidebar";
 import { OrgSwitcher } from "./OrgSwitcher";
 import { PlanBadge } from "./PlanBadge";
 import { StartupBanner } from "../StartupBanner";
+import { PendingInvitations } from "../PendingInvitations";
 import { useAuth } from "../../hooks/useAuth";
 import { useFeatures } from "../../hooks/useFeatures";
 import { useTranslation } from "../../i18n/index";
@@ -193,6 +194,11 @@ export function DashboardLayout() {
           </div>
         )}
         <div className="p-6">
+          {user.invitations.length > 0 && (
+            <div className="mb-6">
+              <PendingInvitations invitations={user.invitations} />
+            </div>
+          )}
           <Outlet />
         </div>
       </main>

@@ -40,6 +40,7 @@ from typing import Any
 
 import structlog
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
 from mcpolis.domain.model.sandbox_file import (
     SandboxFile,
     SandboxFileSummary,
@@ -74,10 +75,9 @@ class FileSandboxFileRepository(SandboxFileRepository):
         self,
         data: dict[str, dict[str, dict[str, dict[str, Any]]]],
     ) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-        tmp.replace(self._path)
+        write_text_atomic(
+            self._path, json.dumps(data, indent=2, sort_keys=True),
+        )
 
     @staticmethod
     def _display_name(name: str, record: dict[str, Any]) -> str:

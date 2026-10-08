@@ -7,10 +7,12 @@
 #   bash frontend/run-unit-tests.sh -t "blocks Add"                  # name filter
 #   bash frontend/run-unit-tests.sh --watch                          # watch mode
 #
-# Outputs (parallel to backend/run-unit-tests.sh's outputs):
-#   /tmp/mcpolis-vitest-junit.xml        (JUnit XML, machine-readable)
-#   /tmp/mcpolis-vitest-report.json      (vitest JSON reporter)
-#   /tmp/mcpolis-frontend-build.log      (npm run build log; no-arg invocations only)
+# Outputs (parallel to backend/run-unit-tests.sh's outputs), in this run's
+# own folder (tests/run_folder.py), printed at the start and the end;
+# /tmp/mcpolis-test-runs/latest-vitest points at the newest:
+#   vitest-junit.xml        (JUnit XML, machine-readable)
+#   vitest-report.json      (vitest JSON reporter)
+#   frontend-build.log      (npm run build log; no-arg invocations only)
 #
 # These files let CI / wrapper scripts grep for pass/fail without
 # scraping the human-readable terminal output, same model as the
@@ -24,12 +26,17 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This run's own results folder, so a concurrent run can't overwrite its
+# reports. Resolved before the cd, so a relative MCPOLIS_TEST_OUT_DIR means
+# the caller's directory.
+RUN_DIR="$(python3 "$SCRIPT_DIR/../tests/run_folder.py" vitest)" || exit 1
 cd "$SCRIPT_DIR"
 
-JUNIT_OUT="/tmp/mcpolis-vitest-junit.xml"
-JSON_OUT="/tmp/mcpolis-vitest-report.json"
-BUILD_LOG="/tmp/mcpolis-frontend-build.log"
+JUNIT_OUT="$RUN_DIR/vitest-junit.xml"
+JSON_OUT="$RUN_DIR/vitest-report.json"
+BUILD_LOG="$RUN_DIR/frontend-build.log"
 rm -f "$JUNIT_OUT" "$JSON_OUT" "$BUILD_LOG"
+echo "Results folder: $RUN_DIR"
 
 RUN_BUILD=0
 if [ "$#" -eq 0 ]; then
@@ -63,6 +70,7 @@ if [ -n "$BUILD_PID" ]; then
     fi
 fi
 
+echo "Results folder: $RUN_DIR"
 if [ "$VITEST_EXIT" -ne 0 ] || [ "$BUILD_EXIT" -ne 0 ]; then
     exit 1
 fi

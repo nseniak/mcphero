@@ -1,7 +1,7 @@
 """Org pinning for service-token gateway requests.
 
 A service token is bound to exactly one org at mint time; the pinned
-org rides in the auth scopes (see ``service_token_verifier``). This
+org rides on the ``ServiceAccessToken`` (see ``service_token_verifier``). This
 middleware enforces the pin on the ``/mcp`` sub-app:
 
 - bare ``/mcp`` (``MULTI_ORG_SENTINEL``) → resolve to the pinned org.
@@ -26,7 +26,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcpolis.domain.model.service_token import (
     is_service_token_auth,
-    pinned_org_from_auth_scopes,
+    pinned_org_from_access_token,
 )
 from mcpolis.domain.ports import MULTI_ORG_SENTINEL
 from mcpolis.entrypoints.controllers.gateway_controller import (
@@ -51,23 +51,23 @@ class ServiceTokenOrgPinMiddleware:
         if auth_user is None:
             await self._app(scope, receive, send)
             return
-        scopes = auth_user.access_token.scopes
-        if not is_service_token_auth(scopes):
-            # Human auth — untouched. Discriminate on SCOPE_SVC presence,
+        access_token = auth_user.access_token
+        if not is_service_token_auth(access_token):
+            # Human auth — untouched. Discriminate on the token type,
             # NOT on a resolvable pinned org: an org-less service identity
             # must fail closed below, not be mistaken for a human and
             # forwarded with the multi-org sentinel intact (AUTH-1).
             await self._app(scope, receive, send)
             return
-        pinned_org = pinned_org_from_auth_scopes(scopes)
+        pinned_org = pinned_org_from_access_token(access_token)
         if pinned_org is None:
             # Service identity with no resolvable org. The verifier always
-            # emits the org scope, so this can only come from a future
+            # sets the org, so this can only come from a future
             # minting path / scope refactor — fail closed rather than
             # bypass org isolation. Same anti-enumeration body as a slug
             # mismatch.
             logger.info(
-                "service_token.org_pin.no_org_scope",
+                "service_token.org_pin.no_org",
                 user_id=auth_user.display_name,
             )
             response = JSONResponse(

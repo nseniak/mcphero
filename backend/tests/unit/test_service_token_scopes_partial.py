@@ -1,22 +1,19 @@
-"""AUTH-1 — incomplete service-token scopes must resolve safely.
+"""AUTH-1 — an org-less service token must fail closed, and a human
+token can never be mistaken for a service token.
 
-A service token's (role, org) ride in ``AccessToken.scopes`` (see
-``service_token_verifier``). The org-pin middleware is the boundary
-that enforces "one token, one org". This module pins what happens
-when the scopes are *incomplete* — ``SCOPE_SVC`` present but no
-``SCOPE_ORG_PREFIX`` entry:
+A service token's (role, org) ride as typed fields of
+``ServiceAccessToken`` (see ``service_token_verifier``). The org-pin
+middleware is the boundary that enforces "one token, one org":
 
-- The verifier structurally cannot mint such a token (org_id is a
-  required field on ``ServiceTokenRecord`` and is always emitted) —
-  proven below so the no-org case can only arise from a future
-  refactor / a different minting path.
-- The org-pin middleware, however, discriminates "is this a service
-  token?" purely on ``pinned_org_from_auth_scopes(...) is not None``.
-  A ``[SCOPE_SVC]``-only or ``[SCOPE_SVC, role]``-only token therefore
-  takes the "human auth — untouched" branch and is passed through
-  *unpinned*. The intended contract is that a service identity with
-  no resolvable org must NOT bypass org isolation — it must be
-  rejected. That guardrail is the [BUG?] spec below.
+- The verifier structurally cannot mint an org-less token
+  (``ServiceTokenRecord.org_id`` is required) — proven below, so an
+  empty org can only arise from a future minting path.
+- The middleware rejects an org-less service token instead of
+  forwarding it unpinned with the multi-org sentinel.
+- A human ``AccessToken`` whose scopes spell out the old service
+  encoding (``mcpolis:svc``, ``mcpolis:org:<id>``) — scopes a client
+  can request over OAuth — is passed through as human auth, never
+  pinned to the org it names.
 """
 from __future__ import annotations
 
@@ -34,11 +31,9 @@ from mcpolis.adapters.repositories.file_service_token_repository import (
     FileServiceTokenRepository,
 )
 from mcpolis.domain.model.service_token import (
-    SCOPE_ORG_PREFIX,
-    SCOPE_ROLE_PREFIX,
-    SCOPE_SVC,
+    ServiceAccessToken,
     is_service_token_auth,
-    pinned_org_from_auth_scopes,
+    pinned_org_from_access_token,
 )
 from mcpolis.domain.ports import MULTI_ORG_SENTINEL
 from mcpolis.domain.services.service_token_service import ServiceTokenService
@@ -52,17 +47,30 @@ def make_service(tmp_path: Path) -> ServiceTokenService:
     return ServiceTokenService(repo=FileServiceTokenRepository(tmp_path))
 
 
-def make_partial_svc_user(scopes: list[str]) -> AuthenticatedUser:
-    """A service-identity AccessToken with caller-chosen scopes.
-
-    Used to forge the malformed tokens the verifier can't actually
-    mint, so the middleware's defense-in-depth can be exercised.
-    """
+def make_orgless_svc_user() -> AuthenticatedUser:
+    """A service token with an empty org — a token the verifier can't
+    actually mint, so the middleware's defense-in-depth can be
+    exercised."""
     return AuthenticatedUser(
-        AccessToken(
+        ServiceAccessToken(
             token="svct_forged",
             client_id="svc:ci-bot",
-            scopes=scopes,
+            scopes=[],
+            role_name="reader",
+            org_id="",
+            expires_at=None,
+        ),
+    )
+
+
+def make_human_user_with_forged_scopes() -> AuthenticatedUser:
+    """A human OAuth token whose client requested the old service-token
+    scope encoding."""
+    return AuthenticatedUser(
+        AccessToken(
+            token="oauth-token",
+            client_id="member@example.com",
+            scopes=["mcpolis:svc", "mcpolis:role:admin", "mcpolis:org:org-b"],
             expires_at=None,
         ),
     )
@@ -121,18 +129,13 @@ async def run_middleware(
     return status, body, inner
 
 
-# --- Invariant proof: the verifier always emits all three scopes ---
+# --- Invariant proof: the verifier always sets the org ---
 
 
 @pytest.mark.asyncio
-async def test_verifier_always_emits_org_scope_for_minted_token(
+async def test_verifier_always_sets_org_for_minted_token(
     tmp_path: Path,
 ) -> None:
-    """No-bug leg: a real verifier can't produce an org-less service
-    token. ``ServiceTokenRecord.org_id`` is required and the verifier
-    unconditionally appends ``SCOPE_ORG_PREFIX + record.org_id``, so
-    the malformed-scope inputs the middleware tests below forge can
-    only come from a future minting path, never from this one."""
     service = make_service(tmp_path)
     minted = await service.mint(
         org_id="org-a", label="ci-bot", role_name="reader",
@@ -142,65 +145,34 @@ async def test_verifier_always_emits_org_scope_for_minted_token(
         minted.raw_token,
     )
     assert access is not None
-    assert is_service_token_auth(access.scopes)
-    assert pinned_org_from_auth_scopes(access.scopes) == "org-a"
-    # Every service-token scope list carries exactly the org scope.
-    org_scopes = [
-        s for s in access.scopes if s.startswith(SCOPE_ORG_PREFIX)
-    ]
-    assert org_scopes == [SCOPE_ORG_PREFIX + "org-a"]
+    assert is_service_token_auth(access)
+    assert pinned_org_from_access_token(access) == "org-a"
 
 
 # --- Defense-in-depth: middleware on a forged org-less service token ---
 
 
 @pytest.mark.asyncio
-async def test_svc_token_without_org_scope_is_rejected_not_passed_through(
-) -> None:
-    """[BUG?] Intended contract: a service identity (``SCOPE_SVC``)
-    with no resolvable pinned org must NOT reach the inner app
-    unpinned — that would bypass org isolation. A bare ``/mcp``
-    request (``MULTI_ORG_SENTINEL``) from such a token must be
-    rejected (or otherwise never forwarded with the sentinel intact),
-    never silently treated as human fan-out."""
-    status, _, inner = await run_middleware(
-        auth_user=make_partial_svc_user([SCOPE_SVC]),
-        org_id=MULTI_ORG_SENTINEL,
-    )
-    # Must not have reached the inner app with the unresolved sentinel
-    # org — that is the org-isolation bypass.
-    assert inner.calls != [MULTI_ORG_SENTINEL]
-    assert status == 401
-
-
-@pytest.mark.asyncio
-async def test_svc_token_with_role_but_no_org_scope_is_rejected(
-) -> None:
-    """[BUG?] Same hazard with a role present but org missing —
-    ``[SCOPE_SVC, role:reader]``. ``pinned_org_from_auth_scopes``
-    still returns None, so the middleware can't tell this apart from
-    human auth and forwards it unpinned."""
-    status, _, inner = await run_middleware(
-        auth_user=make_partial_svc_user(
-            [SCOPE_SVC, SCOPE_ROLE_PREFIX + "reader"],
-        ),
-        org_id=MULTI_ORG_SENTINEL,
-    )
-    assert inner.calls != [MULTI_ORG_SENTINEL]
-    assert status == 401
-
-
-@pytest.mark.asyncio
 async def test_org_less_svc_token_is_rejected_before_reaching_inner_app(
 ) -> None:
-    """Post-fix (AUTH-1): an org-less service token is rejected at the
-    org-pin boundary and never reaches the inner app at all. Previously
-    this pinned the defective pass-through (status 200, sentinel org
-    forwarded); it was flipped in lockstep with the fix to assert the
-    fail-closed behavior."""
     status, _, inner = await run_middleware(
-        auth_user=make_partial_svc_user([SCOPE_SVC]),
+        auth_user=make_orgless_svc_user(),
         org_id=MULTI_ORG_SENTINEL,
     )
     assert status == 401
     assert inner.calls == []
+
+
+# --- Human token with forged service scopes is never pinned ---
+
+
+@pytest.mark.asyncio
+async def test_human_token_with_forged_org_scope_is_not_pinned() -> None:
+    """Bare ``/mcp`` keeps the multi-org sentinel (email-based fan-out
+    over the human's real memberships), never the org the scope names."""
+    status, _, inner = await run_middleware(
+        auth_user=make_human_user_with_forged_scopes(),
+        org_id=MULTI_ORG_SENTINEL,
+    )
+    assert status == 200
+    assert inner.calls == [MULTI_ORG_SENTINEL]

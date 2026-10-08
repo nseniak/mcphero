@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+import weakref
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
@@ -19,11 +21,15 @@ from mcpolis.adapters.auth.hmac_token import sign_token
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
-# How long to wait for the user to complete auth in the browser
-AUTH_TIMEOUT = 300  # 5 minutes
-
 # Signed state tokens are valid for 10 minutes
 STATE_TOKEN_MAX_AGE = 600
+
+# How long a flow waits for the person to finish signing in in the
+# browser: as long as the sign-in link is accepted. A shorter wait (it
+# was 5 minutes) left flows whose callback still arrived in time with
+# nobody waiting: the callback answered "Authorization successful" and
+# the sign-in was lost.
+AUTH_TIMEOUT = STATE_TOKEN_MAX_AGE
 
 
 class UpstreamUnreachableError(RuntimeError):
@@ -49,7 +55,20 @@ class UpstreamUnreachableError(RuntimeError):
         self.reason = reason
 
 
-@dataclass
+class SignInAborted(RuntimeError):
+    """The sign-in was called off before its code was exchanged: the
+    person was removed from the org meanwhile."""
+
+
+class SignInRefused(RuntimeError):
+    """The sign-in may not land any more (its ``sign_in_check`` refused
+    it at the callback): another admin took the upstream's admin sign-in
+    slot meanwhile. The message says so, for the person."""
+
+
+# ``eq=False``: a flow is one object, compared and hashed by identity, so
+# the coordinator can track the live ones in a ``WeakSet``.
+@dataclass(eq=False)
 class PendingAuth:
     """State for a single in-flight OAuth flow."""
 
@@ -63,6 +82,20 @@ class PendingAuth:
     tokens_refreshed: bool = False
     failure_message: str | None = None
     failure_reason: str | None = None
+    # Set by ``abort``: the flow must not save a sign-in any more.
+    aborted: bool = False
+    # Set by ``refuse``: why the sign-in may not land, for the person.
+    refusal: str | None = None
+    # Asked at the callback and right before the sign-in is saved: why it
+    # may not land any more, or None (an admin's sign-in to an admin_oauth
+    # upstream, while another admin holds its admin sign-in slot).
+    sign_in_check: Callable[[], Awaitable[str | None]] | None = None
+    # Set once the wait for the callback is over without one: a late
+    # callback finds nobody waiting.
+    stopped_waiting: bool = False
+    # How long ``callback_handler`` waits for the callback.
+    auth_timeout: float = AUTH_TIMEOUT
+    created_at: float = field(default_factory=time.monotonic)
     _event: asyncio.Event = field(default_factory=asyncio.Event)
     _redirect_event: asyncio.Event = field(
         default_factory=asyncio.Event
@@ -116,17 +149,52 @@ class PendingAuth:
     async def callback_handler(self) -> tuple[str, str | None]:
         """Called by the MCP SDK to wait for the auth code.
 
-        Blocks until ``complete()`` is called (from the callback endpoint).
+        Blocks until ``complete()`` is called (from the callback endpoint),
+        ``auth_timeout`` at most. Raises ``SignInAborted`` once the flow is
+        aborted, and ``SignInRefused`` once it is refused, before or after
+        the code arrived: the SDK then never exchanges it.
         """
-        await asyncio.wait_for(self._event.wait(), timeout=AUTH_TIMEOUT)
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=self.auth_timeout)
+        except TimeoutError:
+            self.stopped_waiting = True
+            raise
+        if self.aborted:
+            raise SignInAborted("The sign-in was cancelled")
+        if self.refusal is not None:
+            raise SignInRefused(self.refusal)
         if self.auth_code is None:
             raise ValueError("OAuth callback completed without auth code")
         return (self.auth_code, self.auth_state)
+
+    async def check_sign_in(self) -> str | None:
+        """Why the sign-in may not land any more, or None: called off,
+        refused, or refused by its ``sign_in_check`` now."""
+        if self.aborted:
+            return "The sign-in was cancelled."
+        if self.refusal is not None:
+            return self.refusal
+        if self.sign_in_check is None:
+            return None
+        return await self.sign_in_check()
 
     def complete(self, code: str, state: str | None) -> None:
         """Signal that the callback has arrived with the auth code."""
         self.auth_code = code
         self.auth_state = state
+        self._event.set()
+
+    def abort(self) -> None:
+        """Call the flow off: a waiting ``callback_handler`` wakes up and
+        raises, and no sign-in may be saved from it any more (see
+        ``McpTokenStorage``'s fresh sign-in guard)."""
+        self.aborted = True
+        self._event.set()
+
+    def refuse(self, message: str) -> None:
+        """Refuse the sign-in, saying why (``message``): like ``abort``,
+        but for someone who stays a member."""
+        self.refusal = message
         self._event.set()
 
     def mark_tokens_refreshed(self) -> None:
@@ -194,18 +262,48 @@ class PendingAuthCoordinator:
     in two orgs in parallel from overwriting one flow with the other.
     """
 
-    def __init__(self, signing_key: bytes) -> None:
+    def __init__(
+        self,
+        signing_key: bytes,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        auth_timeout: float = AUTH_TIMEOUT,
+    ) -> None:
         self._signing_key = signing_key
+        self._monotonic = monotonic
+        self._auth_timeout = auth_timeout
         self._pending: dict[tuple[str, str, str], PendingAuth] = {}
+        # Every flow still running, including one whose code already
+        # arrived and is being exchanged (no longer in ``_pending``), so
+        # ``abort_for_user`` reaches it. Weak: a flow that ended goes away.
+        self._flows: weakref.WeakSet[PendingAuth] = weakref.WeakSet()
 
     @property
     def signing_key(self) -> bytes:
         return self._signing_key
 
+    def _drop_expired(self) -> None:
+        """Forget flows nobody can complete any more: the signed state in
+        the sign-in link is refused after ``STATE_TOKEN_MAX_AGE`` (a flow
+        whose person never came back used to stay here forever), and a
+        flow that stopped waiting for its callback would take the code
+        and lose it."""
+        cutoff = self._monotonic() - STATE_TOKEN_MAX_AGE
+        for key, pending in list(self._pending.items()):
+            if pending.created_at < cutoff or pending.stopped_waiting:
+                del self._pending[key]
+
     def create_pending(
-        self, org_id: str, upstream_id: str, user_id: str
+        self,
+        org_id: str,
+        upstream_id: str,
+        user_id: str,
+        *,
+        sign_in_check: Callable[[], Awaitable[str | None]] | None = None,
     ) -> PendingAuth:
-        """Create a new pending auth flow."""
+        """Create a new pending auth flow. ``sign_in_check``: see
+        ``PendingAuth.sign_in_check``."""
+        self._drop_expired()
         key = (org_id, upstream_id, user_id)
         # Clean up any existing pending auth for this key
         self._pending.pop(key, None)
@@ -215,8 +313,30 @@ class PendingAuthCoordinator:
             upstream_id=upstream_id,
             user_id=user_id,
             signing_key=self._signing_key,
+            sign_in_check=sign_in_check,
+            auth_timeout=self._auth_timeout,
+            created_at=self._monotonic(),
         )
         self._pending[key] = pending
+        self._flows.add(pending)
+        return pending
+
+    def waiting_flow(
+        self,
+        org_id: str,
+        upstream_id: str,
+        user_id: str,
+        original_state: str | None,
+    ) -> PendingAuth | None:
+        """The flow a callback carrying ``original_state`` is for, while it
+        still waits for it. ``None`` when no flow of this person to this
+        upstream waits (none in memory, e.g. after a restart), or when the
+        one waiting is a newer flow (another Connect click since), whose
+        sign-in link carries another state."""
+        self._drop_expired()
+        pending = self._pending.get((org_id, upstream_id, user_id))
+        if pending is None or pending.auth_state != original_state:
+            return None
         return pending
 
     def complete_by_key(
@@ -227,16 +347,19 @@ class PendingAuthCoordinator:
         code: str,
         original_state: str | None,
     ) -> PendingAuth | None:
-        """Complete a pending auth by (org_id, upstream_id, user_id).
+        """Complete the flow ``original_state`` is for (``waiting_flow``)
+        with ``code``, and return it.
 
-        Called by the callback route after verifying the signed state token.
-        Returns the PendingAuth if found in memory, None otherwise
-        (e.g. after a server restart).
+        Called by the callback route after verifying the signed state
+        token. ``None`` when that flow is not waiting in memory (e.g.
+        after a server restart): a newer flow of the same person is left
+        alone, rather than handed an older flow's code that its sign-in
+        library refuses (the state differs).
         """
-        key = (org_id, upstream_id, user_id)
-        pending = self._pending.pop(key, None)
+        pending = self.waiting_flow(org_id, upstream_id, user_id, original_state)
         if pending is None:
             return None
+        del self._pending[(org_id, upstream_id, user_id)]
         pending.complete(code, original_state)
         return pending
 
@@ -244,9 +367,51 @@ class PendingAuthCoordinator:
         self, org_id: str, upstream_id: str, user_id: str
     ) -> PendingAuth | None:
         """Get an existing pending auth flow."""
+        self._drop_expired()
         return self._pending.get((org_id, upstream_id, user_id))
 
     def cleanup(self, org_id: str, upstream_id: str, user_id: str) -> None:
         """Remove a pending auth flow."""
         key = (org_id, upstream_id, user_id)
         self._pending.pop(key, None)
+
+    def refuse(self, pending: PendingAuth, message: str) -> None:
+        """Refuse ``pending``'s sign-in, saying why (``PendingAuth.refuse``),
+        and forget it, unless a newer flow replaced it meanwhile."""
+        pending.refuse(message)
+        key = (pending.org_id, pending.upstream_id, pending.user_id)
+        if self._pending.get(key) is pending:
+            del self._pending[key]
+
+    def abort(self, org_id: str, upstream_id: str, user_id: str) -> None:
+        """Call off ``user_id``'s sign-in to one upstream (see
+        ``abort_for_user``)."""
+        for pending in list(self._flows):
+            if (
+                pending.org_id == org_id
+                and pending.upstream_id == upstream_id
+                and pending.user_id == user_id
+            ):
+                pending.abort()
+        self.cleanup(org_id, upstream_id, user_id)
+
+    def abort_for_user(self, org_id: str, user_id: str) -> int:
+        """Call off every sign-in ``user_id`` has in progress in the org:
+        they were removed from it. A flow still waiting for its callback
+        can no longer be completed, and one whose code already arrived
+        saves no sign-in. Returns how many flows were aborted."""
+        aborted = 0
+        for pending in list(self._flows):
+            if pending.org_id == org_id and pending.user_id == user_id:
+                pending.abort()
+                aborted += 1
+        for key in [k for k in self._pending if k[0] == org_id and k[2] == user_id]:
+            del self._pending[key]
+        if aborted:
+            logger.info(
+                "upstream.oauth.sign_in_aborted",
+                org_id=org_id,
+                user=user_id,
+                flows=aborted,
+            )
+        return aborted

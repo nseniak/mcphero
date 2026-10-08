@@ -1,13 +1,13 @@
 """E2B template grid — Python source of truth for the published
 ``runner/e2b-templates/`` matrix.
 
-The operator-side generator at ``runner/e2b-templates/generate_templates.py``
-emits one ``e2b.toml`` per entry here; this module re-encodes the
+The operator-side driver at ``runner/e2b-templates/build_grid.py``
+builds one E2B template per entry here; this module re-encodes the
 same matrix so :class:`E2BSandboxService.capabilities` and
 ``validate_resources`` stay in lockstep without forcing a runtime
 import of the generator script.
 
-A test in ``tests/test_e2b_template_grid_consistency.py`` enforces
+A test in ``tests/unit/test_e2b_template_grid.py`` enforces
 the two sources never drift.
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Literal
 E2BLanguage = Literal["node", "python", "docker"]
 
 # (cpu_vcpus, ram_mb) pairings, mirrored from
-# ``runner/e2b-templates/generate_templates.py``.
+# ``runner/e2b-templates/build_grid.py``.
 CPU_RAM_PAIRS: tuple[tuple[int, int], ...] = (
     (1, 1024),
     (1, 2048),
@@ -124,8 +124,9 @@ def language_for_command(command: str) -> E2BLanguage | None:
         return "python"
     if cmd == "docker":
         # Docker-distributed MCPs run as ``docker run -i --rm <image>``
-        # inside a dind-capable sandbox whose ``dockerd`` is started at
-        # boot via the template's ``set_start_cmd``. ``docker compose``
+        # inside a dind-capable sandbox whose ``dockerd`` the service
+        # adopts (or starts) after boot in ``_start_docker_daemon``.
+        # ``docker compose``
         # is a subcommand of the same binary, so it's covered too.
         return "docker"
     return None

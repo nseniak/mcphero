@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
 from tests.unit._dev_stub_login import login_as
+from tests.unit.factories import make_config_users_accepted
 
 SUPERADMIN_EMAIL = "admin@example.com"
 DEFAULT_SLUG = "default"
@@ -46,6 +47,7 @@ def make_settings_with_upstreams(
     mcp_path.write_text(json.dumps({"mcpServers": mcp_servers}))
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
+    make_config_users_accepted(tmp_path / "data", json.dumps(config))
     return Settings(
         _env_file=None,  # type: ignore[call-arg]
         mcp_json_path=mcp_path,

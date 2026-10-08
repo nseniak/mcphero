@@ -6,6 +6,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 
+from mcpolis.domain.model.email_address import email_key
+from mcpolis.domain.services.user_admin_service import active_member_emails
 from mcpolis.entrypoints.controllers.gateway_controller import current_org_id
 from mcpolis.entrypoints.routes.dashboard._deps import (
     DashboardDeps,
@@ -24,21 +26,22 @@ def create_config_router(deps: DashboardDeps) -> APIRouter:
         runtime = await deps.runtime_manager.get(org_id)
         # Gateway tokens are user-scoped (global), so the raw connected
         # list spans every org. The dashboard shows per-org "connected
-        # users" — intersect with this org's known members. In standalone
-        # mode the policy users are the single source of truth, so the
-        # intersection collapses to "members who have ever connected".
+        # users": intersect with this org's MEMBERS. A pending invitation
+        # is not one, so inviting an address can't reveal whether that
+        # person uses MCP Hero through another org.
         global_connected = (
             deps.get_gateway_connected_users()
             if deps.get_gateway_connected_users
             else []
         )
-        org_user_emails = set(runtime.policy_engine.config.users.keys())
-        connected = (
-            sorted(set(global_connected) & org_user_emails)
-            if org_user_emails
-            else []
+        members = await active_member_emails(
+            deps.org_repo, org_id, runtime.policy_engine.config,
         )
-        all_emails = sorted(org_user_emails | set(connected))
+        # A member invited as ``Bob@Acme.com`` signs in as
+        # ``bob@acme.com``: letter case is ignored.
+        connected_keys = {email_key(email) for email in global_connected}
+        connected = sorted(e for e in members if email_key(e) in connected_keys)
+        all_emails = sorted(members)
         org_slug = ""
         if deps.is_cloud_mode and deps.org_repo is not None:
             org = await deps.org_repo.get_organization(org_id)

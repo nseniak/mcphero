@@ -20,6 +20,10 @@ When in doubt, ask: "if marketing renamed the product tomorrow, would
 this need to change?" If yes, it's user-facing; use `MCP Hero`. If no,
 it's technical; use `mcpolis`.
 
+## Glossary
+
+- **MCP API key**: the key an admin gives an MCP whose Authentication is "None" (for example a GitHub access token); the app sends it on every call.
+
 ## General rules
 
 This is a young project with no backward-compatibility guarantees on
@@ -67,10 +71,16 @@ without an explicit mode):
   (inline / fullscreen / pip / counter / solar) so MCP-Apps widget
   plumbing can be smoke-tested through the gateway.
 
-stdio MCPs run via the SandboxService boundary. Set
-`MCPOLIS_E2B_API_KEY` in `backend/.env.cloud` to route them through
-E2B. Without an API key the backend falls back to the unsafe
-local-subprocess path with a clear warning at startup.
+stdio MCPs run via the SandboxService boundary. Cloud mode never
+falls back to the unsafe local-subprocess path on its own: it must be
+named (`MCPOLIS_SANDBOX_PROVIDER=local-subprocess`, the
+`.env.cloud.example` default), or the backend refuses to start. To
+route stdio MCPs through E2B, set `MCPOLIS_E2B_API_KEY` in
+`backend/.env.cloud` AND change its `MCPOLIS_SANDBOX_PROVIDER` line to
+`e2b`: an explicit provider wins over the key, and `start.sh` keeps
+the first line for a key, so edit the line rather than appending one.
+Standalone mode still falls back to local-subprocess with a startup
+warning.
 
 `bash stop.sh` tears down backend + frontend; pass `--all` to also
 stop the cloud-mode mongo + redis containers.
@@ -99,11 +109,13 @@ Both modes serve the same ports:
   `mcpolis` conda env — never into the base env or globally.
 - Unit tests: `bash backend/run-unit-tests.sh [-j N] [pytest args...]`
   Parallel via pytest-xdist (`-j auto` by default; `-j 1` for serial
-  when debugging). Outputs `/tmp/mcpolis-unit-junit.xml` +
-  `/tmp/mcpolis-unit-report.json` for grep-able pass/fail.
+  when debugging). Outputs `unit-junit.xml` + `unit-report.json`
+  for grep-able pass/fail, in the run's own results folder (see
+  [Where test results land](#where-test-results-land)).
 - Integration tests (real-SDK, gated by `E2B_API_KEY`):
   `bash backend/run-integration-tests.sh [-j N] [args]` — `-j 4` by
-  default. Same JUnit/JSON outputs under `/tmp/mcpolis-integration-*`.
+  default. Same JUnit/JSON outputs (`integration-junit.xml`,
+  `integration-report.json`) in its results folder.
 - Standalone integration scripts: `bash backend/tests/integration/run-e2b-real-e2e.sh` (~$0.05, ~5 min) and `bash backend/tests/integration/run-list-orphan-sandboxes.sh`
 - E2E tests (Playwright, full-stack):
   `bash tests/run-e2e-tests.sh [--shards N] [spec...]`. The script
@@ -114,7 +126,13 @@ Both modes serve the same ports:
   `19998+i*10`, each probed upward for the first free port so a lone
   run lands on exactly these numbers but a run sharing the host (a
   leftover orphan, or a concurrent run) spills to the next free port
-  instead of silently binding atop a squatter. Backed by an isolated
+  instead of silently binding atop a squatter. Concurrent runs take
+  turns at this: a run holds a host-wide lock
+  (`/tmp/mcpolis-e2e-ports.lock`) from probing until its servers
+  listen, because a probe can't see a port another run picked but
+  hasn't bound yet (two runs started together failed their e2e legs in
+  12 s, 2026-10-07). Seeding runs after the release. A waiting run
+  prints the holder's pid and gives up after 10 minutes. Backed by an isolated
   test mongo on `27018` and test redis on `6380` (compose `test`
   profile, started on demand, `--clean` to tear down on exit). Each
   run's Mongo databases carry a per-run token (`mcpolis_e2e_<token>_sN`)
@@ -125,11 +143,12 @@ Both modes serve the same ports:
   never the dev stack or a live concurrent run). Specs are partitioned
   across
   shards by a longest-processing-time-first bin-packer that reads
-  `/tmp/mcpolis-e2e-spec-times.json` (refreshed after every run);
-  cold-cache fallback is round-robin. Per-shard logs at
-  `/tmp/mcpolis-e2e-shard-N.log`; per-shard Playwright JSON at
-  `/tmp/mcpolis-e2e-shard-N.json`; aggregate at
-  `/tmp/mcpolis-e2e-aggregate.{json,txt}`. Convention for splitting
+  `/tmp/mcpolis-e2e-spec-times.json` (refreshed after every run, and
+  shared by every run on the host); cold-cache fallback is
+  round-robin. Per-shard logs (`e2e-shard-N.log`), per-shard
+  Playwright JSON (`e2e-shard-N.json`) and the aggregate
+  (`e2e-aggregate.{json,txt}`) land in the run's results folder.
+  Convention for splitting
   a spec: extract shared fixtures into `tests/e2e/_<feature>_helpers.ts`,
   break the file into `<NN><letter>-<slug>.spec.ts` siblings.
 
@@ -153,10 +172,11 @@ Both modes serve the same ports:
   e2e servers, fakes and URLs on 127.0.0.1, and keep their
   connections pooled.
 - Frontend unit tests (vitest, jsdom): `bash frontend/run-unit-tests.sh [vitest args...]`.
-  Outputs `/tmp/mcpolis-vitest-junit.xml` + `/tmp/mcpolis-vitest-report.json`
-  for grep-able pass/fail. Mirror of the pytest wrapper. Plain
+  Outputs `vitest-junit.xml` + `vitest-report.json` (plus
+  `frontend-build.log` on a no-arg run) for grep-able pass/fail, in
+  its results folder. Mirror of the pytest wrapper. Plain
   `npm test` works too — the script just adds the JUnit/JSON
-  reporters and the `/tmp/` cleanup.
+  reporters and the results folder.
 
 All four runners above are safe to execute while `bash start.sh`
 is up — the dev session, dev Mongo (`mcpolis_dev` on `:27017`),
@@ -188,14 +208,58 @@ than serializing: each e2e shard counts ~2 CPUs, integration is
 network-bound (~0), and unit's `-j` takes the rest with ~2 cores of
 headroom. On a 14-core box that's `unit -j4`, `e2e --shards 4`,
 `integration -j4`. Per-suite JSON reports are aggregated into
-`/tmp/mcpolis-all-aggregate.txt`; per-suite logs land at
-`/tmp/mcpolis-all-{unit,e2e,integration}.log`.
+`all-aggregate.txt` and per-suite logs land at
+`all-{unit,e2e,integration}.log`, all in test-all's results folder.
+test-all hands that folder to each leg, so the legs' own files
+(shard logs, JUnit XML) sit beside the summary.
 
 Knobs (env vars): `NO_INTEGRATION=1` skips the paid E2B leg for
 cheap local runs; `UNIT_JOBS` / `E2E_SHARDS` / `INTEGRATION_JOBS`
 override the budget; `E2E_RETRIES` / `E2E_TIMEOUT_MS` (defaulted
-to `2` / `45000` under `test-all`) are forwarded to Playwright,
+to `3` / `45000` under `test-all`) are forwarded to Playwright,
 which reads them in [tests/e2e/playwright.config.ts](tests/e2e/playwright.config.ts).
+
+### Where test results land
+
+Every runner above (and `run-e2b-broad-matrix.sh`) writes its logs
+and reports into a results folder of its own, and prints it at the
+start and as the last line:
+`/tmp/mcpolis-test-runs/<date>-<time>-<suite>-<checkout>-<random>/`
+(printed as its real path, `/private/tmp/...` on macOS).
+`<suite>` is `all`, `unit`, `integration`, `e2e`, `vitest` or
+`e2b-broad-matrix`; `<checkout>` is the worktree's folder name
+(`mcpolis` for the main clone). Two runs at once, from one checkout
+or several, never overwrite each other's results. Before, every run
+shared fixed `/tmp/mcpolis-*` paths: on 2026-10-07 two worktrees ran
+`make test-all` together, one run's e2e leg failed, and
+`/tmp/mcpolis-all-e2e.log` already held the other run's green
+output. The rule lives in [tests/run_folder.py](tests/run_folder.py).
+
+- **Read the folder the run printed.**
+  `/tmp/mcpolis-test-runs/latest-<suite>` points at the newest run of
+  that suite, set when the run starts, so it is only right when no
+  other run of that suite started since.
+- `make test-all` passes its folder to every leg as
+  `MCPOLIS_TEST_OUT_DIR`, so `latest-unit` / `latest-e2e` /
+  `latest-integration` point there too. A leg that leaves no
+  readable report fails test-all, even with exit code 0.
+- Set `MCPOLIS_TEST_OUT_DIR` yourself to make a runner write into a
+  folder you choose. It is yours: two runs given the same folder share
+  it. A folder outside `/tmp/mcpolis-test-runs/` leaves the shared
+  `latest-*` links alone.
+- File names are the old fixed paths minus `/tmp/mcpolis-`
+  (`unit-report.json`, `e2e-shard-0.log`, `all-aggregate.txt`, ...).
+  Playwright's failure files (error context, traces) go to
+  `e2e-shard-N-artifacts/` in the same folder, instead of the
+  `tests/e2e/test-results/` that every run in a checkout shared. The
+  runners no longer write the old paths, so any copies still in `/tmp`
+  come from earlier runs or from checkouts on older code.
+- A folder is deleted once it is older than a day AND 30 newer
+  folders exist AND nothing in it changed for a day. A folder a
+  `latest-*` link points at is kept.
+- Shared on purpose: the e2e spec-times cache (written in one atomic
+  step, so two runs finishing together can't tear it) and the e2e port
+  lock above.
 
 ## Service tokens (gateway auth for headless agents)
 
@@ -214,10 +278,18 @@ Key invariants:
   raw OAuth provider, so service tokens are structurally rejected there.
 - Identity is `svc:<label>` — **never** an entry in `config.users`, never
   on the Team page, never a plan seat. The role is resolved at the auth
-  boundary: the verifier puts `mcpolis:role:<role>` / `mcpolis:org:<org>`
-  scopes on the AccessToken, and the gateway controller passes
-  `boundary_role` into the PolicyEngine calls. A deleted role fails
-  closed (zero tools).
+  boundary: the verifier mints a `ServiceAccessToken` with typed
+  `role_name` / `org_id` (it is the only minter; a guard test checks),
+  and the gateway controller passes `boundary_role` into the
+  PolicyEngine calls. Never carry a role or org in scopes: OAuth scopes
+  are client input (open client registration accepts any string). The
+  gateway OAuth provider also refuses and strips the reserved
+  `mcpolis:` scope namespace. A deleted role fails
+  closed (zero tools). The controller reads the role from the bearer
+  of the request being handled (`_request_auth_user`), not the
+  session's: the MCP SDK keeps the auth of a session's `initialize`
+  for the session's whole life, so a role rename left open token
+  sessions on a role name that no longer exists.
 - Tokens are pinned to one org. `ServiceTokenOrgPinMiddleware` resolves
   bare `/mcp` to the pinned org and 401s slug mismatches with the
   anti-enumeration body.
@@ -225,6 +297,129 @@ Key invariants:
   write per minute per token.
 
 User-facing doc: [docs/service-tokens.md](docs/service-tokens.md).
+
+## Admin actions run to completion
+
+An admin action writes several stores in a row (saved config, running
+policy, token registry, membership rows, audit log); cut half-way it
+leaves them disagreeing. So every admin action that changes something
+runs to its end once started, whatever cancels the request:
+`finish_despite_cancels` / `@runs_to_completion` in
+[backend/src/mcpolis/domain/services/cancel_shield.py](backend/src/mcpolis/domain/services/cancel_shield.py),
+on the shared actions (`UserAdminService`, `UpstreamAdminService`,
+`RoleAdminService`) that both doors call. It runs the action in a task
+of its own, so neither an anyio scope cancel (the MCP SDK on a client's
+`notifications/cancelled`, `BaseHTTPMiddleware`) nor a native
+`Task.cancel()` (uvicorn at the end of its graceful shutdown) cuts it,
+then passes the cancel on.
+
+- The one `tools/call` wrapper of the Admin MCP and the operator MCP
+  (`install_call_tool_wrapper` in `admin_tool_calls.py`) runs every tool
+  not annotated read-only that way. Don't add a
+  per-tool `anyio.CancelScope(shield=True)`: a handler that returns
+  normally after the client cancelled makes the SDK answer twice
+  ("Request already responded to"), which kills the whole session.
+- Dashboard and operator writes (every `/api/` request but GET, HEAD and
+  OPTIONS) run to completion too, through `RunToCompletionMiddleware`
+  (the outermost middleware). The shutdown drains every held job set
+  (`drain_every_set`): it waits, within a bound, for the jobs each
+  `BackgroundTaskSet` holds, then closes the stores while every set
+  refuses new ones (`refusing_new_jobs`).
+- The same helper carries every other piece of work a cancel must not
+  cut: the gateway's audit write, the E2B sandbox kill, a connect
+  letting go of its transport, a token refresh. Where they differ, it
+  is an option (`held_by`, `time_limit`, `on_failure`, `pass_cancel_on`,
+  `wait_after_cancel`). Add an option there rather than hand-roll
+  another shielded wait, so a fix lands once.
+- Test a cancel over the real protocol (`cancel_mcp_call_while_gated` in
+  `tests/unit/factories.py`) and against a native cancel
+  (`cancel_natively_while_gated`). `cancel_while_gated` alone skips the
+  SDK's answer step.
+
+## Request rate limits
+
+Sliding one-minute windows, decided by `RateLimitService`
+([backend/src/mcpolis/domain/services/rate_limit_service.py](backend/src/mcpolis/domain/services/rate_limit_service.py))
+over the `RateLimiter` port: in-memory in standalone, one Redis Lua
+script in cloud.
+
+| Surface | Charged to | Enforced in | Caller sees |
+|---|---|---|---|
+| Gateway `tools/call`, allowed | the caller in the org, and the whole org | gateway controller (`_admit_call`) | `isError` tool result naming the wait |
+| Gateway `tools/call`, `resources/read`, `prompts/get`, refused | the caller only (`tool_call:denied:<caller>`, a service token as `svc:<label>@<org>`) | `_admit_call`, `_refused`, `_refused_text`, `_refuse_disabled_mcp` | same, or the read's / prompt's text |
+| Admin MCP tool calls | the admin | low-level `tools/call` wrapper (`install_call_tool_wrapper`) | `isError` tool result |
+| Dashboard `/api/*` | the signed-in user, else the client IP | `RateLimitMiddleware` | HTTP 429 + `Retry-After` |
+| Sign-in endpoints | the client IP, one bucket per `SignInGroup` | `RateLimitMiddleware` | HTTP 429 + `Retry-After` |
+
+The numbers live in two places only: per-plan tool-call limits in
+`PlanLimits` ([plan_policy.py](backend/src/mcpolis/domain/services/plan_policy.py)),
+the rest in `Settings` (`MCPOLIS_RATE_LIMIT_*`). They are runaway
+ceilings, not the Terms §3 fair-use line, and the user docs
+deliberately don't publish them.
+
+Rules to keep when touching this area:
+
+- A check charges all of its buckets or none. A refusal by the
+  caller's own bucket must not spend the org bucket, or one runaway
+  agent drains its teammates' quota.
+- Only calls the org's policy allows reach the org bucket. Every
+  refusal path of `tools/call`, `resources/read` and `prompts/get`
+  (denied by policy, naming an org the caller isn't in, an unknown
+  tool, prompt or resource) goes through `_admit_call`, `_refused`,
+  `_refused_text` or `_refuse_disabled_mcp`: charged to the caller's
+  refused-call bucket, one bucket for all three, held to the Free
+  per-caller limit with no plan lookup. Any signed-in account can
+  reach `/mcp/{slug}` (membership there is enforced by policy), so no
+  refusal may spend, or reveal the plan of, someone else's org. A
+  caller over that limit gets the refusal before any `denied` audit
+  row is written (`_charge_and_audit_denial`, shared by the three).
+  Reads and prompts check access before existence: an MCP the org
+  doesn't have gets the same "disabled for you" answer, so the answer
+  can't list an org's MCPs. A service token's refused-call bucket is
+  per org (labels are unique per org only); a person's is one bucket
+  across every org.
+- The Admin MCP limit is charged to `current_caller_id()`, the bearer
+  identity. `current_user_id` alone is the dashboard cookie and stays
+  "anonymous" for AI clients; an earlier version keyed on it and put
+  every admin of every org in one bucket. The guard is the two-admin
+  real-transport test in `test_rate_limit_gateway.py`.
+- Tool calls are refused with a tool error, never an HTTP 429: AI
+  clients read the error and wait; many treat a 429 on the MCP
+  transport as a broken connection.
+- On the MCP OAuth endpoints a 429 carries `{"error":
+  "too_many_requests"}`: the MCP SDK knows that code and keeps its saved
+  sign-in. An unknown code makes it drop a refused token refresh and
+  restart the interactive sign-in, refused by the same bucket.
+- Sign-in endpoints are bucketed per `SignInGroup` so the dashboard's
+  automatic error reports can't close MCP token refresh behind the
+  same IP. The two EventSource endpoints (`/api/events`, upstream log
+  stream) are never limited: a browser never retries an EventSource
+  that got a non-200 answer.
+- The client IP is the `X-Forwarded-For` entry
+  `MCPOLIS_TRUSTED_PROXY_HOPS` places from the right; never the
+  leftmost one, which the client writes. Compose sets 1 behind the
+  bundled nginx and 2 with `docker-compose.proxied.yml`. A private
+  (non-loopback) result logs `rate_limit.client_ip.private` once per
+  process: behind proxies it means the hop count is too low and every
+  client shares one bucket. IPv6 is keyed per /64; `::ffff:a.b.c.d` as
+  its IPv4 address.
+- A failure of the limiting machinery admits the request: rate limiting
+  must never be what takes the gateway down. Each Redis check is capped
+  at 0.5 s (a Redis that never answers costs a bounded delay, not a
+  hang); the outage logs one `rate_limit.check.failed_open` ERROR per
+  minute and `rate_limit.check.recovered` when it ends. A plan lookup
+  failure admits too; plans are cached 30 s.
+- Refusals log `rate_limit.exceeded` (and track `rate_limit_hit` when
+  the caller is known) once per bucket per window via `EmitThrottle`;
+  counts swallowed in between ride on the next line, or on a `closing`
+  line when the bucket goes quiet. A quiet bucket is forgotten either
+  way, so a caller rotating client IPs can't grow the reporter.
+- `MCPOLIS_RATE_LIMIT_ENABLED=false` switches every limit off with a
+  restart, no deploy.
+- E2E lifts the per-IP and per-user limits (all its traffic comes from
+  127.0.0.1, with shared seeded users, in one Redis); tool-call limits
+  keep their plan values and `47-rate-limits.spec.ts` asserts them on
+  the `/mcp/{slug}/` URL, per caller and per org.
 
 ## Sandbox provider selection
 
@@ -240,12 +435,18 @@ Cloud-mode rules enforced by `validate_startup_secrets` in
 [backend/src/mcpolis/entrypoints/config.py](backend/src/mcpolis/entrypoints/config.py):
 
 - `MCPOLIS_SANDBOX_PROVIDER=e2b` requires `MCPOLIS_E2B_API_KEY`.
-- `MCPOLIS_SANDBOX_PROVIDER=local-subprocess` is rejected outright
-  (no-isolation path; dev-only).
+- Empty value requires `MCPOLIS_E2B_API_KEY` and then means `e2b`.
+  With no key, cloud mode refuses to start: there is no silent
+  fallback to the unsandboxed `local-subprocess` runner (operator
+  decision, 2026-10-07). Standalone mode keeps that fallback, with a
+  startup warning.
+- `MCPOLIS_SANDBOX_PROVIDER=local-subprocess` (no isolation) is
+  accepted only when named explicitly AND `MCPOLIS_HOST` is a literal
+  loopback address: local dev (`.env.cloud.example` names it) and
+  the e2e runner. Any other bind is rejected; the production image
+  binds `0.0.0.0`.
 - `MCPOLIS_SANDBOX_PROVIDER=own-runner` is rejected outright
   (legacy backend, removed).
-- Empty value falls back to `e2b` when an API key is set, else
-  `local-subprocess` with a startup warning.
 
 ### Waking a paused sandbox never reuses its MCP process
 

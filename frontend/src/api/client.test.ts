@@ -139,3 +139,26 @@ describe("apiFetch X-Org-Slug header", () => {
     expect(headers["X-Org-Slug"]).toBeUndefined();
   });
 });
+
+describe("apiFetch rate-limit replies", () => {
+  it("shows the server's sentence, which names the wait", async () => {
+    stubFetch(429, {
+      error: "rate_limited",
+      retry_after: 7,
+      message: "Too many requests. Try again in 7 seconds.",
+    });
+    await expect(apiFetch("/api/admin/upstreams")).rejects.toMatchObject({
+      status: 429,
+      message: "Too many requests. Try again in 7 seconds.",
+    });
+    expect(onExpired).not.toHaveBeenCalled();
+  });
+
+  it("falls back to its own sentence when the server sends none", async () => {
+    stubFetch(429, { error: "rate_limited", retry_after: 7 });
+    await expect(apiFetch("/api/admin/upstreams")).rejects.toMatchObject({
+      status: 429,
+      message: "Too many requests. Please wait 7 seconds.",
+    });
+  });
+});

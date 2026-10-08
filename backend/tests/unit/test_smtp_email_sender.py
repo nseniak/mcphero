@@ -141,3 +141,16 @@ async def test_send_failure_propagates() -> None:
 
     with pytest.raises(RuntimeError, match="smtp refused"):
         await sender.send_email(to="a@b.com", subject="s", body_text="b")
+
+
+async def test_every_smtp_step_is_time_bounded() -> None:
+    """aiosmtplib waits 60 s per step by default; one silent mail server
+    then holds a send for a full minute. The sender passes its own,
+    shorter bound."""
+    calls, send_fn = make_recorder()
+    sender = make_sender(send_fn)
+
+    await sender.send_email(to="a@b.com", subject="s", body_text="b")
+
+    _message, kwargs = calls[0]
+    assert kwargs["timeout"] == 15.0

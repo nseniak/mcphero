@@ -494,3 +494,21 @@ async def test_file_audit_delete_for_org(tmp_path: Path) -> None:
     assert len(remaining) == 1
     assert remaining[0]["org_id"] == "org-b"
     assert await repo.delete_for_org("org-a") == 0
+
+
+@pytest.mark.asyncio
+async def test_file_audit_rows_logged_after_a_purge_are_kept(
+    tmp_path: Path,
+) -> None:
+    """The purge saves the live log as a new file. A row logged after it
+    must land in that file, not in the replaced one the log handler had
+    open, where nobody would ever read it again."""
+    repo: AuditRepository = FileAuditRepository(tmp_path / "audit.jsonl")
+    await repo.log("org-a", make_audit_entry(org_id="org-a", user_id="u1"))
+    await repo.log("org-b", make_audit_entry(org_id="org-b", user_id="u2"))
+
+    assert await repo.delete_for_org("org-b") == 1
+    await repo.log("org-a", make_audit_entry(org_id="org-a", user_id="u3"))
+
+    remaining = await repo.search_cross_org()
+    assert sorted(row["user_id"] for row in remaining) == ["u1", "u3"]

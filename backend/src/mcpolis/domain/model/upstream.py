@@ -102,6 +102,97 @@ class UpstreamDefinition(BaseModel):
         return self
 
 
+# The env var a stdio MCP reads its service-account token from. It is
+# also the name of the secret Variable an ``auth_token`` is saved as.
+STDIO_AUTH_TOKEN_ENV = "MCP_AUTH_TOKEN"
+AUTH_TOKEN_VARIABLE = STDIO_AUTH_TOKEN_ENV
+AUTH_TOKEN_REFERENCE = f"${{{AUTH_TOKEN_VARIABLE}}}"
+
+
+def with_service_account_token(
+    upstream: UpstreamDefinition, token: str | None,
+) -> tuple[UpstreamDefinition, str | None]:
+    """Point *upstream* at its service-account token, and return the
+    token to save as the secret Variable ``MCP_AUTH_TOKEN``.
+
+    The transport config gets a reference, never the token: the
+    ``Authorization: Bearer ${MCP_AUTH_TOKEN}`` header for HTTP, the
+    ``MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN}`` env var for stdio. Both stores
+    persist the transport config, so the reference survives a reload,
+    and the Variable keeps the token masked in the dashboard, hidden
+    from ``get_upstream`` and redacted from Server logs (what "Move to
+    Variables" does). A separate token field was dropped on save, and
+    its copy of a ``Bearer ${NAME}`` header overwrote the substituted one.
+
+    Returns ``(upstream, None)`` unchanged when there is nothing to save:
+    no token, an OAuth mode (no static token), or a header or env entry
+    the caller already set (after "Move to Variables" the dashboard sends
+    ``Bearer ${NAME}`` alongside the raw token).
+
+    Surrounding whitespace is trimmed (a token read from a file ends in
+    a newline). See ``_check_service_account_token`` for what is refused.
+    """
+    token = (token or "").strip()
+    if not token or upstream.auth.mode != AuthMode.service_account:
+        return upstream, None
+    if upstream.http is not None:
+        headers = upstream.http.headers
+        if any(name.lower() == "authorization" for name in headers):
+            return upstream, None
+        _check_service_account_token(token, ascii_only=True)
+        http = upstream.http.model_copy(update={
+            "headers": {
+                **headers, "Authorization": f"Bearer {AUTH_TOKEN_REFERENCE}",
+            },
+        })
+        return upstream.model_copy(update={"http": http}), token
+    if upstream.stdio is not None:
+        env = upstream.stdio.env
+        if STDIO_AUTH_TOKEN_ENV in env:
+            return upstream, None
+        _check_service_account_token(token, ascii_only=False)
+        stdio = upstream.stdio.model_copy(update={
+            "env": {**env, STDIO_AUTH_TOKEN_ENV: AUTH_TOKEN_REFERENCE},
+        })
+        return upstream.model_copy(update={"stdio": stdio}), token
+    return upstream, None
+
+
+def has_service_account_token(upstream: UpstreamDefinition) -> bool:
+    """Whether a service-account upstream sends a token: an
+    ``Authorization`` header (HTTP) or an ``MCP_AUTH_TOKEN`` env var
+    (stdio), the places ``with_service_account_token`` writes."""
+    if upstream.auth.mode != AuthMode.service_account:
+        return False
+    if upstream.http is not None:
+        return any(
+            name.lower() == "authorization" for name in upstream.http.headers
+        )
+    if upstream.stdio is not None:
+        return STDIO_AUTH_TOKEN_ENV in upstream.stdio.env
+    return False
+
+
+def _check_service_account_token(token: str, *, ascii_only: bool) -> None:
+    """Raise ``ValueError`` when *token* can never be sent.
+
+    A control character (a line break inside the token) and, in an HTTP
+    header, a non-ASCII character make the HTTP client refuse every
+    request, and its error message prints the whole header, token
+    included, into the logs. The message raised here never contains the
+    token. Callers translate it to a 400 / ``Error:`` reply.
+    """
+    if not token.isprintable():
+        raise ValueError(
+            "auth_token contains a line break, a tab or another "
+            "non-printable character"
+        )
+    if ascii_only and not token.isascii():
+        raise ValueError(
+            "auth_token for an HTTP MCP must use ASCII characters only"
+        )
+
+
 class ServerInfo(BaseModel):
     name: str
     version: str

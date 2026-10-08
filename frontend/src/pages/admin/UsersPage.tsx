@@ -17,6 +17,7 @@ import { useFeatures } from "../../hooks/useFeatures";
 import { ConfirmDialog, useConfirm } from "../../components/ConfirmDialog";
 import { Trash2, Plus, ChevronDown, X, Link2, Check, Copy } from "lucide-react";
 import { track } from "../../lib/analytics";
+import { sameEmail } from "../../lib/email-address";
 import { maybeHandlePlanLimit } from "../../lib/planLimits";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../../components/ui/tooltip";
 import { RoleBadge } from "../../components/RoleBadge";
@@ -48,9 +49,11 @@ function InviteLinkCard() {
           <div>
             <p className="text-sm font-medium text-zinc-900">Invite team members</p>
             <p className="mt-0.5 text-xs text-zinc-600">
-              After you add a team member below, send them this link so they can join{" "}
-              <span className="font-medium text-zinc-900">{user.current_org.display_name}</span>.
-              Only team members can sign in through it.
+              After you add a team member below, send them this link. They sign in and
+              click Join to join{" "}
+              <span className="font-medium text-zinc-900">{user.current_org.display_name}</span>;
+              until then they stay Pending, with no access. Only people you added can join
+              through it.
             </p>
           </div>
           <div className="flex items-stretch gap-2">
@@ -371,7 +374,7 @@ export function UsersPage() {
                     )}
                   </td>
                   <td className="px-2 py-2 text-right">
-                    {user.email !== currentUser?.email && (
+                    {!(currentUser && sameEmail(user.email, currentUser.email)) && (
                       <Tooltip>
                         <TooltipTrigger
                           onClick={() => handleRemove(user.email)}

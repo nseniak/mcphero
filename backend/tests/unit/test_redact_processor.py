@@ -16,7 +16,8 @@ Contract:
   dicts. List elements that are themselves not dicts are passed
   through unchanged — the Caddy/uvicorn-shaped ``headers: [{name,
   value}]`` array is *not* redacted here; that case goes through
-  Layer 2 (Vector's ``del(.request.headers.Cookie)``).
+  Layer 2 (Vector's ``redact_secrets``, which removes Caddy's
+  credential headers).
 - Non-container scalars (str, int, None) pass through untouched.
 
 Tests are toplevel functions, no fixtures (per CLAUDE.md).

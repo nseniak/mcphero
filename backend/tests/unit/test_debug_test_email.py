@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from mcpolis.adapters.email.stub_email_sender import StubEmailSender
 from mcpolis.adapters.observability.analytics_client import AnalyticsClient
+from mcpolis.domain.model.email_allowlist import EmailAllowlist
 from mcpolis.domain.ports.email_sender import EmailSender
 from mcpolis.entrypoints.routes.debug_routes import create_debug_router
 
@@ -37,7 +38,7 @@ def make_client(
             analytics,
             email_sender,
             get_current_user,
-            {SUPERADMIN},
+            EmailAllowlist([SUPERADMIN]),
         )
     )
     return TestClient(app, raise_server_exceptions=False)

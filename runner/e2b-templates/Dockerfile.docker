@@ -7,11 +7,12 @@
 # The image carries the full Docker engine (dockerd + CLI + containerd)
 # so an MCP distributed as a container can be launched with
 # `docker run -i --rm <image>`. Unlike the node / python templates,
-# this one needs a running daemon BEFORE the MCP command executes, so
-# `build_grid.py` attaches a `set_start_cmd` that launches `dockerd` at
-# sandbox boot and a `wait_for_port` ready probe — the sandbox isn't
-# reported ready until the daemon answers. Don't add an ENTRYPOINT/CMD
-# here; boot is driven entirely by the template's start command.
+# this one needs a running daemon BEFORE the MCP command executes. The
+# backend's `E2BSandboxService._start_docker_daemon` adopts the
+# systemd-managed `dockerd` this image boots with (or starts its own)
+# and waits until it answers. The template has no `set_start_cmd`: E2B
+# validates it during the build, where a daemon already runs, and the
+# build fails. Don't add an ENTRYPOINT/CMD here.
 #
 # Base + install follow E2B's published Docker template recipe
 # (https://e2b.dev/docs/template/examples/docker): Ubuntu 24.04 + the

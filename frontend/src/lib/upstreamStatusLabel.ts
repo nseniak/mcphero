@@ -19,6 +19,8 @@ type TFunction = (
  *  Otherwise we override the label to communicate the actual state:
  *    - ready=true with a slot owner who isn't the viewer ⇒
  *      "Ready, by alice@co.com"
+ *    - ready=false on an OAuth-mode upstream an admin stopped
+ *      (``stopped``), whether or not its sign-in was kept ⇒ "Stopped"
  *    - ready=false on an OAuth-mode upstream ⇒ "Authentication needed"
  *    - ready=false on a stdio service_account ⇒ "Not started"
  *    - ready=false on an HTTP service_account ⇒ default "Disconnected"
@@ -34,10 +36,14 @@ export function upstreamStatusLabel(
     }
     return undefined;
   }
+  const isOAuth = u.auth_mode === "admin_oauth" || u.auth_mode === "per_user_oauth";
+  if (isOAuth && u.stopped) {
+    return t("status.stopped");
+  }
   if (u.disconnect_reason) {
     return undefined;
   }
-  if (u.auth_mode === "admin_oauth" || u.auth_mode === "per_user_oauth") {
+  if (isOAuth) {
     return t("status.authenticationNeeded");
   }
   if (u.transport === "stdio") {

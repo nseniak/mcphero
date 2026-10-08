@@ -8,8 +8,8 @@ Design notes
   cannot tail another org's events, and it never calls ``psubscribe``.
 * Publish is a synchronous call from domain code (matching the
   in-process adapter's signature), so we schedule the underlying async
-  ``redis.publish`` on the running event loop via
-  ``asyncio.get_running_loop().create_task``. Fire-and-forget is
+  ``redis.publish`` as a task on the running event loop, held in a
+  ``BackgroundTaskSet`` until it ends. Fire-and-forget is
   acceptable — if a publish fails we log and drop the event, identical
   to how the in-process adapter drops on a full queue.
 * ``subscribe`` yields the same ``Event | None`` shape as the in-process
@@ -30,6 +30,7 @@ from coredis.commands.pubsub import PubSub
 from coredis.response.types import PubSubMessage
 
 from mcpolis.domain.model.events import Event
+from mcpolis.domain.services.background_tasks import BackgroundTaskSet
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
@@ -76,7 +77,7 @@ class RedisEventStream:
     def __init__(self, url: str) -> None:
         self._url = url
         self._client: coredis.Redis[str] = _client_from_url(url)
-        self._publish_tasks: set[asyncio.Task[None]] = set()
+        self._publish_tasks = BackgroundTaskSet()
 
     def publish(self, org_id: str, event: Event) -> None:
         """Fire-and-forget publish via the running event loop."""
@@ -90,7 +91,7 @@ class RedisEventStream:
             channel=channel,
         )
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             # No running loop (e.g. sync test helper) — skip. Real
             # publishers always run inside the FastAPI event loop.
@@ -100,10 +101,8 @@ class RedisEventStream:
                 channel=channel,
             )
             return
-        task = loop.create_task(self._publish(channel, payload))
-        # Keep a reference so the task isn't GC'd mid-flight.
-        self._publish_tasks.add(task)
-        task.add_done_callback(self._publish_tasks.discard)
+        # Held until it ends, so the task isn't GC'd mid-flight.
+        self._publish_tasks.spawn(self._publish(channel, payload))
 
     async def _publish(self, channel: str, payload: str) -> None:
         try:
@@ -174,9 +173,7 @@ class RedisEventStream:
 
     async def close(self) -> None:
         """Cancel in-flight publishes and close the Redis client."""
-        for task in list(self._publish_tasks):
-            task.cancel()
-        self._publish_tasks.clear()
+        self._publish_tasks.cancel_all()
         # coredis 5.x doesn't expose a public ``aclose``; draining the
         # connection pool is the documented way to tear down.
         try:

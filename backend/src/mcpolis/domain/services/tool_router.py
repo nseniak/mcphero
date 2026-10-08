@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar
 
+import anyio
 import mcp.types as mcp_types
 import structlog
 from mcp.shared.exceptions import McpError
@@ -27,13 +28,17 @@ from mcpolis.domain.model.audit import AuditEntry
 from mcpolis.domain.model.policy import AuthMode
 from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.adapters.repositories.audit_repository import AuditRepository
+from mcpolis.domain.services.audit_actions import write_audit_entry
+from mcpolis.domain.services.cancel_shield import finish_despite_cancels
 from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry, is_transport_stall
 from mcpolis.domain.services.upstream_connection_service import (
+    UPSTREAM_STOPPED,
     SessionUnavailable,
     acquire_upstream_session,
     heal_stalled_session,
     settle_oauth_state_after_stall,
+    slot_owner_of,
 )
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
@@ -62,6 +67,12 @@ _T = TypeVar("_T")
 # 16-20s ``resources/read`` (R7) and a slow prompt render are safe.
 _DISPATCH_PROBE_INTERVAL = 30.0
 _DISPATCH_PING_TIMEOUT = 10.0
+
+# How long a request's audit row may take to write. The write is shielded
+# from the request's cancellation (see ``_write_audit_row``), so this bound
+# is what keeps a hung audit store from holding a cancelled request open.
+# A healthy write is one database round trip.
+AUDIT_WRITE_TIMEOUT_SECONDS = 5.0
 
 
 # Canonical "<code> <reason>" strings for every 4xx, built once from
@@ -406,6 +417,7 @@ class ToolRouter:
         policy_engine: PolicyEngine,
         connection_store: ConnectionStore | None = None,
         server_url: str = "http://localhost:8000",
+        audit_write_timeout_seconds: float = AUDIT_WRITE_TIMEOUT_SECONDS,
     ) -> None:
         self._registry = tool_registry
         self._client_manager = client_manager
@@ -414,6 +426,7 @@ class ToolRouter:
         self._policy_engine = policy_engine
         self._connection_store = connection_store
         self._server_url = server_url
+        self._audit_write_timeout = audit_write_timeout_seconds
 
     def register_upstream(self, upstream: UpstreamDefinition) -> None:
         """Keep ``_upstreams`` in sync with runtime add-upstream flows.
@@ -428,41 +441,51 @@ class ToolRouter:
     def unregister_upstream(self, upstream_id: str) -> None:
         self._upstreams.pop(upstream_id, None)
 
+    def stored_default_arguments(
+        self, upstream_id: str, tool_name: str,
+    ) -> dict[str, Any]:
+        """The default arguments an admin stored for this tool."""
+        upstream = self._upstreams.get(upstream_id)
+        if upstream is None:
+            return {}
+        return dict(upstream.default_arguments.get(tool_name, {}))
+
+    def effective_arguments(
+        self, upstream_id: str, tool_name: str, arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """The arguments actually sent upstream: the caller's, with the
+        upstream's stored default arguments merged on top (a default
+        wins over the caller's value).
+
+        The gateway's argument check runs on this same result, so a
+        stored default is checked against the role's argument patterns
+        exactly like a value the caller typed.
+        """
+        return {
+            **arguments,
+            **self.stored_default_arguments(upstream_id, tool_name),
+        }
+
     async def _resolve_admin_oauth_owner(
         self, org_id: str, upstream_id: str,
     ) -> str | None:
-        """Return the admin who currently owns the admin_oauth slot.
+        """Return the admin whose sign-in an ``admin_oauth`` call uses,
+        or ``None`` when no admin holds one.
 
-        ``admin_oauth`` is single-slot by design: at most one admin's
-        token is stored for an upstream at a time. The connect handler
-        clears every other admin's token for the upstream before
-        writing the caller's, so this lookup typically finds at most
-        one match. If the data ever has more than one (e.g. legacy
-        rows from before the single-slot invariant was enforced), pick
-        the most recently refreshed; tie-break lexicographically for
-        deterministic test runs. Returns ``None`` when no admin holds
-        the slot.
+        Nothing guarantees a single admin row per upstream: Connect
+        refuses a second admin while the slot is held, but rows saved
+        before that rule, and an admin's own sign-in kept across a Stop,
+        can leave several. So this is ``slot_owner_of``, the one rule the
+        admin tab, Connect's refusal and Remove sign-in also use: calls
+        run on the sign-in the dashboard shows, and removing that one
+        moves them to the next.
         """
         if self._connection_store is None:
             return None
-        admin_emails = self._policy_engine.get_admin_emails()
-        candidates: list[tuple[datetime, str, str]] = []
-        for email in admin_emails:
-            token = await self._connection_store.get_user_token(
-                org_id, email, upstream_id,
-            )
-            if token is None:
-                continue
-            ts = (
-                token.refresh_token_created_at
-                or token.updated_at
-                or datetime.fromtimestamp(0, tz=UTC)
-            )
-            candidates.append((ts, email, email))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: (-x[0].timestamp(), x[1]))
-        return candidates[0][2]
+        return await slot_owner_of(
+            self._connection_store, org_id, upstream_id,
+            admin_emails=self._policy_engine.get_admin_emails(),
+        )
 
     def _admin_unavailable_error(
         self, upstream: UpstreamDefinition
@@ -516,9 +539,9 @@ class ToolRouter:
                 isError=True,
             )
 
-        # Merge default arguments
-        defaults = upstream.default_arguments.get(original_name, {})
-        merged_arguments = {**arguments, **defaults}
+        merged_arguments = self.effective_arguments(
+            upstream_id, original_name, arguments,
+        )
 
         # A tool call may be retried after a transport stall only if the tool
         # declares itself safe to repeat (idempotent or read-only); a blind
@@ -645,6 +668,12 @@ class ToolRouter:
         start = time.monotonic()
         response_status = "success"
         did_call = False
+        # The refusal text the caller saw when no live upstream session
+        # was available (first attempt or the retry). It goes on the
+        # audit row: every request that reaches this loop leaves exactly
+        # one row, whether or not anything was dispatched. Analytics and
+        # the per-dispatch log stay gated on ``did_call``.
+        refused_message: str | None = None
         attempts = 0
         stalled = False
         try:
@@ -653,13 +682,8 @@ class ToolRouter:
                     org_id, upstream, user_id,
                 )
                 if session_result.error is not None:
-                    # Session unavailable. On the FIRST attempt no call ever
-                    # ran, so surface without an audit/analytics row (R4 —
-                    # preserves pre-recovery behaviour: route_call returned,
-                    # resources/prompts raised before their finally). On a
-                    # retry (did_call already True) it's a real failure.
-                    if did_call:
-                        response_status = "error"
+                    response_status = "error"
+                    refused_message = _session_error_text(session_result.error)
                     return verb.on_session_error(session_result.error)
                 assert session_result.session is not None
                 session = session_result.session
@@ -687,6 +711,22 @@ class ToolRouter:
                     # and the ``finally`` reclassifies its audit status off
                     # the in-flight exception (so it's never logged as
                     # "success").
+                    if self._client_manager.is_stopped(upstream.id):
+                        # An admin's Stop closed the session under this
+                        # call. Not a fault (no heal, no ERROR): the
+                        # caller gets the same answer as any call on a
+                        # stopped upstream.
+                        response_status = "error"
+                        logger.info(
+                            "upstream.dispatch.stopped_mid_call",
+                            org_id=org_id,
+                            upstream_id=upstream.id,
+                            op=verb.audit_tool,
+                            error=type(exc).__name__,
+                        )
+                        return verb.on_session_error(
+                            self._admin_unavailable_error(upstream),
+                        )
                     is_last = attempt + 1 >= max_attempts
                     # A transport stall poisons the cached session (the E2B
                     # post-reattach stdout stall for the shared
@@ -802,85 +842,92 @@ class ToolRouter:
                 "_dispatch_with_recovery loop exited without returning"
             )
         finally:
-            if did_call:
-                # If we're unwinding because an exception is propagating —
-                # the caller cancelled the request, or a heal re-raised, or
-                # an opaque-error adapter raised (resources/prompts) — the
-                # dispatch did NOT complete successfully. Never audit it as
-                # "success": reclassify off the in-flight exception type.
-                # ``CancelledError`` → "cancelled" (client gave up, no
-                # stall, no heal); anything else → "error".
-                if response_status == "success":
-                    pending_exc = sys.exc_info()[0]
-                    if pending_exc is not None:
-                        response_status = (
-                            "cancelled"
-                            if issubclass(pending_exc, asyncio.CancelledError)
-                            else "error"
-                        )
-                latency_ms = (time.monotonic() - start) * 1000
-                if stalled:
-                    # R8: the retry path's ``latency_ms`` includes the full
-                    # probe interval + ping + heal + re-dispatch, so a
-                    # "successful" recovered call logs ~30s+. This marker
-                    # (for ANY verb) tells operators the latency reflects a
-                    # stall recovery, not a genuinely slow upstream.
-                    logger.info(
-                        "upstream.dispatch.recovered",
-                        org_id=org_id,
-                        upstream_id=upstream.id,
-                        op=verb.audit_tool,
-                        attempts=attempts,
-                        response_status=response_status,
-                        latency_ms=int(latency_ms),
+            # One row per request, written even when nothing was
+            # dispatched (refused, or the session lookup itself raised).
+            # If we're unwinding because an exception is propagating —
+            # the caller cancelled the request, or a heal re-raised, or
+            # an opaque-error adapter raised (resources/prompts) — the
+            # dispatch did NOT complete successfully. Never audit it as
+            # "success": reclassify off the in-flight exception type.
+            # ``CancelledError`` → "cancelled" (client gave up, no
+            # stall, no heal); anything else → "error".
+            if response_status == "success":
+                pending_exc = sys.exc_info()[0]
+                if pending_exc is not None:
+                    response_status = (
+                        "cancelled"
+                        if issubclass(pending_exc, asyncio.CancelledError)
+                        else "error"
                     )
-                if verb.is_tool_call:
-                    # Tool-only observability (R3): latency + outcome per
-                    # dispatch on the structured-log surface so operators can
-                    # grep "is upstream X slow" without Sentry traces or the
-                    # audit table. Gated to call_tool — else every
-                    # resources/read & prompts/get would pollute the tool
-                    # analytics + slow-tool dashboards.
-                    logger.info(
-                        "upstream.tool_call.completed",
-                        org_id=org_id,
-                        upstream_id=upstream.id,
-                        tool=verb.audit_tool,
-                        response_status=response_status,
-                        latency_ms=int(latency_ms),
-                        attempts=attempts,
-                        stalled=stalled,
-                        auth_mode=upstream.auth.mode.value,
-                        user_id=user_id,
-                        session_id=session_id,
-                    )
-                entry = AuditEntry(
-                    timestamp=datetime.now(UTC).isoformat(),
+            latency_ms = (time.monotonic() - start) * 1000
+            if did_call and stalled:
+                # R8: the retry path's ``latency_ms`` includes the full
+                # probe interval + ping + heal + re-dispatch, so a
+                # "successful" recovered call logs ~30s+. This marker
+                # (for ANY verb) tells operators the latency reflects a
+                # stall recovery, not a genuinely slow upstream.
+                logger.info(
+                    "upstream.dispatch.recovered",
                     org_id=org_id,
-                    user_id=user_id,
                     upstream_id=upstream.id,
-                    auth_mode=upstream.auth.mode.value,
-                    auth_identity=auth_identity,
-                    tool=verb.audit_tool,
-                    policy_decision="allowed",
+                    op=verb.audit_tool,
+                    attempts=attempts,
                     response_status=response_status,
-                    latency_ms=latency_ms,
+                    latency_ms=int(latency_ms),
+                )
+            if did_call and verb.is_tool_call:
+                # Tool-only observability (R3): latency + outcome per
+                # dispatch on the structured-log surface so operators can
+                # grep "is upstream X slow" without Sentry traces or the
+                # audit table. Gated to call_tool — else every
+                # resources/read & prompts/get would pollute the tool
+                # analytics + slow-tool dashboards.
+                logger.info(
+                    "upstream.tool_call.completed",
+                    org_id=org_id,
+                    upstream_id=upstream.id,
+                    tool=verb.audit_tool,
+                    response_status=response_status,
+                    latency_ms=int(latency_ms),
+                    attempts=attempts,
+                    stalled=stalled,
+                    auth_mode=upstream.auth.mode.value,
+                    user_id=user_id,
                     session_id=session_id,
                 )
-                await self._audit.log(org_id, entry)
-                if verb.is_tool_call:
-                    get_analytics().track_async(
-                        user_id,
-                        "tool_called",
-                        {
-                            "upstream_id": upstream.id,
-                            "tool_name": verb.audit_tool,
-                            "auth_mode": upstream.auth.mode.value,
-                            "response_status": response_status,
-                            "latency_ms": int(latency_ms),
-                            "had_session_id": session_id is not None,
-                        },
-                    )
+            entry = AuditEntry(
+                timestamp=datetime.now(UTC).isoformat(),
+                org_id=org_id,
+                user_id=user_id,
+                upstream_id=upstream.id,
+                auth_mode=upstream.auth.mode.value,
+                auth_identity=auth_identity,
+                tool=verb.audit_tool,
+                policy_decision="allowed",
+                response_status=response_status,
+                latency_ms=latency_ms,
+                session_id=session_id,
+                error_message=refused_message,
+            )
+            if did_call and verb.is_tool_call:
+                get_analytics().track_async(
+                    user_id,
+                    "tool_called",
+                    {
+                        "upstream_id": upstream.id,
+                        "tool_name": verb.audit_tool,
+                        "auth_mode": upstream.auth.mode.value,
+                        "response_status": response_status,
+                        "latency_ms": int(latency_ms),
+                        "had_session_id": session_id is not None,
+                    },
+                )
+            # Last step: the row is written even if the request is being
+            # cancelled, and a cancellation that arrived meanwhile is
+            # raised from here, after everything above has run.
+            await _write_audit_row(
+                self._audit, org_id, entry, self._audit_write_timeout,
+            )
 
     async def audit_denied(
         self,
@@ -915,7 +962,9 @@ class ToolRouter:
             error_message=reason,
             session_id=session_id,
         )
-        await self._audit.log(org_id, entry)
+        await _write_audit_row(
+            self._audit, org_id, entry, self._audit_write_timeout,
+        )
 
     async def read_resource(
         self,
@@ -966,7 +1015,7 @@ class ToolRouter:
             )
 
         verb: _DispatchVerb[mcp_types.ReadResourceResult] = _DispatchVerb(
-            audit_tool=f"resource:{upstream_id}:{original_uri}",
+            audit_tool=resource_audit_name(upstream_id, original_uri),
             op=lambda s: s.read_resource(AnyUrl(original_uri)),
             retry_safe=True,
             # No readOnlyHint exists for resources, so a read can't declare
@@ -1027,7 +1076,7 @@ class ToolRouter:
             )
 
         verb: _DispatchVerb[mcp_types.GetPromptResult] = _DispatchVerb(
-            audit_tool=f"prompt:{upstream_id}:{original_name}",
+            audit_tool=prompt_audit_name(upstream_id, original_name),
             op=lambda s: s.get_prompt(original_name, arguments),
             retry_safe=True,
             # Same as read_resource: prompts can't declare repeatability, so
@@ -1117,11 +1166,16 @@ class ToolRouter:
                 client_manager=self._client_manager,
                 server_url=self._server_url,
             )
-        except SessionUnavailable:
+        except SessionUnavailable as unavailable:
             # No stored tokens or connection failed.
             # admin_oauth: only an admin can fix this — point at admins.
-            # per_user_oauth: the user can fix it themselves on /my-tools.
-            if upstream.auth.mode == AuthMode.admin_oauth:
+            # per_user_oauth: the user can fix it themselves on /my-tools,
+            # unless an admin stopped the upstream: the user's sign-in is
+            # fine, and only an admin's Start brings it back.
+            if (
+                upstream.auth.mode == AuthMode.admin_oauth
+                or unavailable.reason == UPSTREAM_STOPPED
+            ):
                 return _SessionResult(
                     error=self._admin_unavailable_error(upstream)
                 )
@@ -1188,6 +1242,67 @@ class UpstreamRouterError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+def resource_audit_name(upstream_id: str, original_uri: str) -> str:
+    """The ``tool`` value of a resources/read audit row. Shared with the
+    gateway, which audits a read it refuses before it reaches here."""
+    return f"resource:{upstream_id}:{original_uri}"
+
+
+def prompt_audit_name(upstream_id: str, original_name: str) -> str:
+    """The ``tool`` value of a prompts/get audit row. Shared with the
+    gateway, which audits a prompt it refuses before it reaches here."""
+    return f"prompt:{upstream_id}:{original_name}"
+
+
+async def _write_audit_row(
+    audit_repo: AuditRepository,
+    org_id: str,
+    entry: AuditEntry,
+    timeout_seconds: float,
+) -> None:
+    """Write a gateway request's audit row, even if the request is being
+    cancelled.
+
+    The MCP SDK cancels a request handler through an anyio cancel scope:
+    on the client's ``notifications/cancelled``, when the session's
+    transport closes (a gateway sign-in revoke, a member removal), and
+    when the shutdown leaves the session manager. It is the only cancel
+    a handler gets: the handler runs in the session manager's task group,
+    not in the HTTP request's task, so uvicorn's ``Task.cancel()`` of the
+    requests still running at the end of its graceful shutdown never
+    reaches it. anyio raises that cancellation again at every ``await``
+    until the scope exits, so a write that waits on the network (Mongo's
+    insert does) is cancelled too and the row is lost. The write runs in
+    a task of its own (``finish_despite_cancels``), which that cancel does
+    not reach. Its time limit, which applies cancelled or not, keeps a
+    hung audit store from holding a cancelled request forever, and the
+    closing session manager with it.
+
+    A cancellation that arrived during the write is raised at the end.
+    Returning normally instead would make the SDK answer a request it has
+    already answered as cancelled: it fails with "Request already
+    responded to" and drops the client's whole session.
+    """
+
+    async def write_within_time_limit() -> None:
+        with anyio.move_on_after(timeout_seconds) as write_scope:
+            await write_audit_entry(audit_repo, org_id, entry)
+        if write_scope.cancelled_caught:
+            logger.error(
+                "audit.write_failed",
+                org_id=org_id,
+                action=entry.action,
+                user_id=entry.user_id,
+                upstream_id=entry.upstream_id,
+                tool=entry.tool,
+                timed_out_after_seconds=timeout_seconds,
+            )
+
+    # Held by this call only, as when the write ran inline in the
+    # request: it is never refused, and the request waits for it.
+    await finish_despite_cancels(write_within_time_limit(), held_by=None)
 
 
 def _session_error_text(err: mcp_types.CallToolResult) -> str:

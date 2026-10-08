@@ -2,18 +2,17 @@
 
 The bucket holds two flavours:
 
-- ``is_secret=True`` (the default): the UI obfuscates the value by
-  default (1Password-style: ``••••`` placeholder with an eye toggle
-  to reveal). Designed for credentials.
-- ``is_secret=False``: value is shown in clear in the UI. Designed
-  for non-sensitive configuration like feature flags.
+- ``is_secret=True`` (the default): a **password**. Write-only: once
+  saved, the value never leaves the backend again. Summaries carry
+  only ``has_value`` (set / empty). The only plaintext read path is
+  :meth:`TemplateVarRepository.get_value`, used by substitution at
+  session start.
+- ``is_secret=False``: a plain variable. Summaries carry the value so
+  the UI can render it verbatim (feature flags, regions, ...).
 
-Both flavours return the plaintext ``value`` from
-:meth:`TemplateVarRepository.list_summaries` — the dashboard SPA is
-admin-only and the value is encrypted at rest (cloud) or stored
-plaintext alongside other dev artefacts (standalone). The
-``is_secret`` flag drives **display** style (obfuscate-by-default vs
-verbatim), not server-side filtering.
+:func:`make_template_var_summary` is the single place that decides
+what a summary may carry; both repositories build summaries through
+it, so no caller of ``list_summaries`` can see a password.
 """
 from __future__ import annotations
 
@@ -27,23 +26,6 @@ from pydantic import BaseModel
 # substitution helper at the resolution boundary, so a name accepted
 # here is exactly a name the helper will recognise.
 _NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-
-# Threshold above which a saved secret's ``last_four`` preview is
-# stored. Picked to keep the leak ratio acceptable on modern API
-# tokens — see plan §"Secret storage" for the math (16 → 76% unknown,
-# 11 → 64% unknown).
-#
-# Only meaningful for ``is_secret=True`` rows; plain rows ignore it
-# (their value is shown verbatim in the UI).
-LAST_FOUR_MIN_LENGTH = 16
-
-
-def compute_last_four(value: str) -> str | None:
-    """Last 4 chars when the value is long enough to make the preview safe."""
-    if len(value) > LAST_FOUR_MIN_LENGTH:
-        return value[-4:]
-    return None
-
 
 class MissingTemplateVarError(Exception):
     """Raised by the substitution helper when ``${NAME}`` is unresolved.
@@ -66,23 +48,40 @@ class MissingTemplateVarError(Exception):
 class TemplateVarSummary(BaseModel):
     """View of a template variable — sent to the dashboard SPA.
 
-    Both ``is_secret=True`` and ``is_secret=False`` rows carry the
-    plaintext ``value``. The flag drives **display** style only —
-    secret rows obfuscate by default with an eye toggle to reveal
-    (1Password-style); plain rows render verbatim.
-
-    The dashboard API is admin-scoped; encryption-at-rest still
-    applies uniformly in cloud mode regardless of the flag.
-    ``last_four`` is preserved for the masked preview (used as the
-    obfuscation placeholder when the value is long enough).
+    ``value`` is always ``None`` for a password (``is_secret=True``);
+    ``has_value`` is the only thing a password row says about its
+    value. Build instances with :func:`make_template_var_summary`.
     """
 
     name: str
     is_secret: bool = True
     value: str | None = None
-    last_four: str | None = None
+    has_value: bool = False
     created_at: datetime
     updated_at: datetime
+
+
+def make_template_var_summary(
+    *,
+    name: str,
+    is_secret: bool,
+    stored_value: str | None,
+    created_at: datetime,
+    updated_at: datetime,
+) -> TemplateVarSummary:
+    """Build a summary, dropping the value of a password.
+
+    ``has_value`` is ``False`` for an empty (or missing) value, so the
+    UI can tell "set" from "empty" without seeing the value.
+    """
+    return TemplateVarSummary(
+        name=name,
+        is_secret=is_secret,
+        value=None if is_secret else stored_value,
+        has_value=bool(stored_value),
+        created_at=created_at,
+        updated_at=updated_at,
+    )
 
 
 def is_valid_template_var_name(name: str) -> bool:

@@ -33,12 +33,10 @@
 #   --with-demo    No-op (the demo is on by default; flag kept for
 #                  back-compat with old shell history).
 #
-# Backend, frontend, and the sandbox runner are all auto-started: each
-# one is started if not already running, skipped otherwise. The
-# sandbox runner needs Docker; if Docker can't be brought up, the
-# runner is skipped and stdio MCPs fall back to the unsafe
-# local-subprocess path with a clear warning at boot. Use stop.sh to
-# tear everything down.
+# Backend and frontend are auto-started: each one is started if not
+# already running, skipped otherwise. stdio MCPs run in E2B or in the
+# unsafe local-subprocess runner; see "Sandbox provider" below for how
+# cloud mode picks one. Use stop.sh to tear everything down.
 set -e
 
 # Resolve repo root (the directory containing this script)
@@ -235,10 +233,17 @@ fi
 
 # --- Sandbox provider --------------------------------------------------
 #
-# stdio MCPs run via the SandboxService boundary. Cloud / hosted dev
-# defaults to E2B (set MCPOLIS_E2B_API_KEY in backend/.env.cloud);
-# without an API key the backend falls back to the unsafe
-# local-subprocess path with a clear warning at startup.
+# stdio MCPs run via the SandboxService boundary. Cloud mode never
+# falls back to the unsafe local-subprocess path on its own. The
+# backend/.env.cloud template names MCPOLIS_SANDBOX_PROVIDER=
+# local-subprocess (accepted only on the loopback bind start.sh
+# uses). To use E2B instead, set MCPOLIS_E2B_API_KEY there AND change
+# that provider line to e2b: an explicit provider wins over the key,
+# and the loader above keeps the FIRST line for a key, so edit the
+# line rather than appending a new one. With neither a provider nor a
+# key, the backend refuses to start and the reason is printed below.
+# Standalone mode still falls back to local-subprocess with a startup
+# warning.
 
 # --- Frontend dist cleanup (both modes) --------------------------------
 
@@ -310,6 +315,9 @@ wait_for() {
 }
 
 wait_for backend http://localhost:8080/health || {
+    # Surface a startup-config refusal (e.g. no sandbox provider and
+    # no E2B key in cloud mode) instead of only pointing at the log.
+    grep -m1 -o 'StartupConfigError: .*' /tmp/mcpolis-backend.log || true
     echo "check /tmp/mcpolis-backend.log"
     exit 1
 }

@@ -10,6 +10,8 @@ import type {
   SuperadminAuditAggregatesTopRow,
   SuperadminAuditSearchResponse,
 } from "../../api/types";
+import { AccountActionText, OperatorTag } from "../admin/AuditAccountAction";
+import { isAccountAction } from "../admin/auditAccountActions";
 
 function asString(v: unknown, fallback: string = ""): string {
   return typeof v === "string" ? v : fallback;
@@ -207,17 +209,27 @@ export function AuditPage() {
                     <td className="px-3 py-2 font-mono text-xs">
                       {asString(e.org_id, "—")}
                     </td>
-                    <td className="px-3 py-2">{asString(e.user_id, "—")}</td>
-                    <td className="px-3 py-2 font-mono text-xs">
-                      {asString(e.upstream_id, "—")}
+                    <td className="px-3 py-2">
+                      {asString(e.user_id, "—")}
+                      <OperatorTag entry={e} />
                     </td>
-                    <td className="px-3 py-2">{asString(e.tool, "—")}</td>
+                    <td className="px-3 py-2 font-mono text-xs">
+                      {asString(e.upstream_id) || "—"}
+                    </td>
+                    <td className="px-3 py-2">
+                      {asString(e.tool) ||
+                        (isAccountAction(asString(e.action)) ? (
+                          <AccountActionText entry={e} />
+                        ) : (
+                          "—"
+                        ))}
+                    </td>
                     <td className="px-3 py-2">
                       <span
                         className={`text-xs ${
-                          decision === "deny"
+                          decision === "denied"
                             ? "text-red-700"
-                            : decision === "allow"
+                            : decision === "allowed"
                               ? "text-green-700"
                               : "text-zinc-500"
                         }`}

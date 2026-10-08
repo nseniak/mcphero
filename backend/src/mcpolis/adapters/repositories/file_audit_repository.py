@@ -11,6 +11,7 @@ from typing import Any
 import structlog
 from pythonjsonlogger.json import JsonFormatter
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
 from mcpolis.adapters.repositories.audit_repository import AuditRepository
 from mcpolis.domain.model.audit import AuditEntry
 from mcpolis.domain.model.events import Event
@@ -48,6 +49,7 @@ class FileAuditRepository(AuditRepository):
         handler.setFormatter(JsonFormatter(timestamp=False))
         handler.namer = _rotated_name
         self._audit_logger.addHandler(handler)
+        self._handler = handler
 
     async def log(self, org_id: str, entry: AuditEntry) -> None:
         data = entry.model_dump()
@@ -86,10 +88,32 @@ class FileAuditRepository(AuditRepository):
                     else:
                         kept.append(line)
                 if len(kept) != len(lines):
-                    log_file.write_text(
-                        "\n".join(kept) + ("\n" if kept else "")
+                    # Hidden temp name: ``audit.jsonl.tmp`` would match
+                    # the rotated-file glob in ``_all_log_files``.
+                    write_text_atomic(
+                        log_file,
+                        "\n".join(kept) + ("\n" if kept else ""),
+                        tmp_path=log_file.with_name(f".{log_file.name}.tmp"),
                     )
+                    if log_file == self._log_path:
+                        self._reopen_live_file()
         return removed
+
+    def _reopen_live_file(self) -> None:
+        """Point the log handler at the file now named ``audit.jsonl``.
+
+        The handler keeps the live file open; once a rewrite renamed a new
+        file over it, the handler would go on appending to the old,
+        unlinked one, and every later row would be lost. Closing the
+        stream makes the handler open the path again on its next row
+        (append mode reopens a closed stream)."""
+        self._handler.acquire()
+        try:
+            if self._handler.stream is not None:  # pyright: ignore[reportUnnecessaryComparison]
+                self._handler.stream.close()
+                self._handler.stream = None  # type: ignore[assignment]
+        finally:
+            self._handler.release()
 
     def _all_log_files(self) -> list[Path]:
         """Return all audit log files (current + rotated), newest first."""
@@ -112,6 +136,45 @@ class FileAuditRepository(AuditRepository):
         offset: int = 0,
         since_iso: str | None = None,
     ) -> list[dict[str, Any]]:
+        # The file backend writes a single global jsonl that already
+        # carries ``org_id`` per entry. ``search`` ignores org scoping
+        # because the standalone deployment effectively has one org.
+        return self._scan(
+            org_id=None, user_id=user_id, mcp_id=mcp_id, tool=tool,
+            action=action, limit=limit, offset=offset, since_iso=since_iso,
+        )
+
+    async def search_cross_org(
+        self,
+        org_id: str | None = None,
+        user_id: str | None = None,
+        mcp_id: str | None = None,
+        tool: str | None = None,
+        action: list[str] | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        # Callers are responsible for the superadmin gate.
+        return self._scan(
+            org_id=org_id, user_id=user_id, mcp_id=mcp_id, tool=tool,
+            action=action, limit=limit, offset=offset, since_iso=None,
+        )
+
+    def _scan(
+        self,
+        *,
+        org_id: str | None,
+        user_id: str | None,
+        mcp_id: str | None,
+        tool: str | None,
+        action: list[str] | None,
+        limit: int,
+        offset: int,
+        since_iso: str | None,
+    ) -> list[dict[str, Any]]:
+        """Newest-first pass over every log file. Every filter applies
+        BEFORE ``offset`` / ``limit`` count a row, so a page is never
+        cut short by a filter applied afterwards."""
         results: list[dict[str, Any]] = []
         skipped = 0
         for log_file in self._all_log_files():
@@ -124,6 +187,8 @@ class FileAuditRepository(AuditRepository):
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if org_id and entry.get("org_id") != org_id:
                     continue
                 if user_id and entry.get("user_id") != user_id:
                     continue
@@ -140,47 +205,6 @@ class FileAuditRepository(AuditRepository):
                     # Modern rows always carry one.
                     if isinstance(ts, str) and ts < since_iso:
                         continue
-                if skipped < offset:
-                    skipped += 1
-                    continue
-                results.append(entry)
-        return results
-
-    async def search_cross_org(
-        self,
-        user_id: str | None = None,
-        mcp_id: str | None = None,
-        tool: str | None = None,
-        action: list[str] | None = None,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        # The file backend writes a single global jsonl that already
-        # carries ``org_id`` per entry — ``search`` ignores org scoping
-        # because the standalone deployment effectively has one org. The
-        # cross-org search is the same pass with no org filter applied;
-        # callers are responsible for the superadmin gate.
-        results: list[dict[str, Any]] = []
-        skipped = 0
-        for log_file in self._all_log_files():
-            if len(results) >= limit:
-                break
-            lines = log_file.read_text().strip().splitlines()
-            for line in reversed(lines):
-                if len(results) >= limit:
-                    break
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if user_id and entry.get("user_id") != user_id:
-                    continue
-                if mcp_id and entry.get("upstream_id") != mcp_id:
-                    continue
-                if tool and tool.lower() not in entry.get("tool", "").lower():
-                    continue
-                if action and entry.get("action", "tool_call") not in action:
-                    continue
                 if skipped < offset:
                     skipped += 1
                     continue

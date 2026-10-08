@@ -51,6 +51,15 @@ ERROR_HTML = """<!DOCTYPE html>
 """
 
 
+def _error_page(message: str) -> HTMLResponse:
+    """The page that tells the person their sign-in did not go through,
+    and why."""
+    return HTMLResponse(
+        ERROR_HTML.replace("{{error}}", html.escape(message, quote=True)),
+        status_code=200,
+    )
+
+
 async def _handle_upstream_oauth_callback(request: Request) -> Response:
     coordinator: PendingAuthCoordinator = (
         request.app.state.auth_coordinator
@@ -89,10 +98,7 @@ async def _handle_upstream_oauth_callback(request: Request) -> Response:
                             "error": error,
                         },
                     ))
-        return HTMLResponse(
-            ERROR_HTML.replace("{{error}}", html.escape(error, quote=True)),
-            status_code=200,
-        )
+        return _error_page(error)
 
     if not code or not state:
         return JSONResponse(
@@ -124,6 +130,40 @@ async def _handle_upstream_oauth_callback(request: Request) -> Response:
     # minted before the ``org`` field existed.
     org_id: str = payload.get("org") or current_org_id.get()
 
+    runtime_manager: OrgRuntimeManager = request.app.state.runtime_manager
+    runtime = await runtime_manager.get(org_id)
+    if not runtime.policy_engine.is_member(user_id):
+        # The signed state only proves the flow was started: the person
+        # may have been removed from the org while on the upstream's
+        # consent page. Their code must not become a sign-in.
+        coordinator.abort(org_id, upstream_id, user_id)
+        logger.warning(
+            "upstream.oauth.callback.not_a_member",
+            org_id=org_id,
+            upstream_id=upstream_id,
+            user=user_id,
+        )
+        return _error_page("You are not a member of this organization.")
+
+    waiting = coordinator.waiting_flow(
+        org_id, upstream_id, user_id, original_state,
+    )
+    if waiting is not None:
+        # The sign-in may have become one that must not land since the
+        # flow started: another admin took the upstream's admin sign-in
+        # slot while this admin was on the consent page.
+        refusal = await waiting.check_sign_in()
+        if refusal is not None:
+            coordinator.refuse(waiting, refusal)
+            logger.warning(
+                "upstream.oauth.callback.refused",
+                org_id=org_id,
+                upstream_id=upstream_id,
+                user=user_id,
+                refusal=refusal,
+            )
+            return _error_page(refusal)
+
     # Fast path: if the PendingAuth is still in memory, signal it directly.
     # This completes the MCP SDK's callback_handler immediately.
     pending = coordinator.complete_by_key(
@@ -137,6 +177,21 @@ async def _handle_upstream_oauth_callback(request: Request) -> Response:
             upstream_id=upstream_id,
             user=user_id,
         )
+    elif coordinator.get_pending(org_id, upstream_id, user_id) is not None:
+        # A newer sign-in of this person to this MCP is under way (they
+        # clicked Connect again): this callback is the older one's. Its
+        # code would only spoil the newer sign-in, or the next Connect if
+        # kept on disk.
+        logger.info(
+            "upstream.oauth.callback.superseded",
+            org_id=org_id,
+            upstream_id=upstream_id,
+            user=user_id,
+        )
+        return _error_page(
+            "This sign-in was replaced by a newer one. Finish signing in "
+            "in the most recent sign-in window.",
+        )
     else:
         # Slow path: server restarted between redirect and callback.
         # Defense-in-depth: re-verify that upstream_id refers to a real
@@ -144,10 +199,6 @@ async def _handle_upstream_oauth_callback(request: Request) -> Response:
         # state token already attests to upstream_id, but validating
         # against the registry means a forged state (e.g. from a leaked
         # signing key) can't write pending codes for made-up upstreams.
-        runtime_manager: OrgRuntimeManager = (
-            request.app.state.runtime_manager
-        )
-        runtime = await runtime_manager.get(org_id)
         registered = await runtime.config_service.get_upstream(
             org_id, upstream_id
         )

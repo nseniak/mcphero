@@ -10,12 +10,15 @@ from pathlib import Path
 import pytest
 
 from mcpolis.adapters.repositories.connection_store import OAuthToken
+from mcpolis.adapters.repositories.file_config_store import FileConfigStore
 from mcpolis.adapters.repositories.file_connection_store import (
     FileConnectionStore,
 )
 from mcpolis.adapters.upstream_clients.client_manager import (
     UpstreamClientManager,
 )
+from mcpolis.domain.model.settings import SettingsConfig
+from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.services.upstream_config_service import (
     UpstreamConfigService,
@@ -64,6 +67,8 @@ async def test_remove_upstream_deletes_stored_tokens(tmp_path: Path) -> None:
         cm,
         registry,
         connection_store,
+        config_repo=FileConfigStore(tmp_path / "config.json"),
+        policy_engine=PolicyEngine(SettingsConfig()),
     )
 
     await service.remove_upstream(org_id, upstream_id)
@@ -116,6 +121,8 @@ async def test_remove_upstream_purges_all_oauth_state(tmp_path: Path) -> None:
         cm,
         registry,
         connection_store,
+        config_repo=FileConfigStore(tmp_path / "config.json"),
+        policy_engine=PolicyEngine(SettingsConfig()),
     )
 
     await service.remove_upstream(org_id, upstream_id)

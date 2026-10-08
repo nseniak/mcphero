@@ -638,12 +638,12 @@ async def test_get_prompt_does_not_emit_tool_analytics(
 
 
 @pytest.mark.asyncio
-async def test_read_resource_session_unavailable_writes_no_audit(
+async def test_read_resource_session_unavailable_writes_an_error_row(
     tmp_path: Path,
 ) -> None:
-    """R4 no-audit gate: a session-unavailable read raises the actionable
-    message on the FIRST attempt and emits NO audit row (it raises before
-    any call ran), mirroring route_call's ``did_call`` gate."""
+    """A session-unavailable read raises the actionable message on the
+    FIRST attempt, and still leaves an ``error`` audit row: the caller
+    asked, and the audit log must say the request was refused."""
     upstream = make_upstream_definition(
         id="notion",
         auth=UpstreamAuthConfig(mode=AuthMode.per_user_oauth),
@@ -661,10 +661,10 @@ async def test_read_resource_session_unavailable_writes_no_audit(
             org_id=DEFAULT_ORG_ID, upstream_id="notion",
             original_uri="test://x", user_id="alice", session_id=None,
         )
-    log_path = audit._log_path  # pyright: ignore[reportPrivateUsage]
-    assert not log_path.exists() or log_path.read_text().strip() == "", (
-        "session-unavailable on the first attempt must not write an audit row"
-    )
+    rows = await audit.search(DEFAULT_ORG_ID, limit=10)
+    assert len(rows) == 1
+    assert rows[0]["user_id"] == "alice"
+    assert rows[0]["response_status"] == "error"
 
 
 # --- an invalid-params answer is the caller's mistake on every verb -------

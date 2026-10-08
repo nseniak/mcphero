@@ -24,6 +24,8 @@ import ast
 import re
 from pathlib import Path
 
+from mcpolis.domain.services.org_service import MAX_SLUG_LENGTH
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TYPES_TS = REPO_ROOT / "frontend" / "src" / "api" / "types.ts"
 
@@ -227,3 +229,17 @@ def test_drift_detection_flags_extra_frontend_field(tmp_path: Path) -> None:
     ts_fields = parse_ts_interfaces(ts.read_text())["Thing"]
     assert ts_fields - py_fields == {"c"}
     assert py_fields - ts_fields == set()
+
+
+ORG_SLUG_TS = REPO_ROOT / "frontend" / "src" / "lib" / "org-slug.ts"
+
+
+def test_org_short_name_limit_is_the_same_in_the_forms_and_the_server() -> None:
+    """The Signup and Organizations forms stop org short names at the
+    length the server accepts: a form that allowed more let people type
+    a name the server then refused."""
+    match = re.search(
+        r"export const MAX_SLUG_LENGTH = (\d+);", ORG_SLUG_TS.read_text(),
+    )
+    assert match is not None, "MAX_SLUG_LENGTH not found in org-slug.ts"
+    assert int(match.group(1)) == MAX_SLUG_LENGTH

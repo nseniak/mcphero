@@ -21,9 +21,11 @@
 #   workers buys little and total cost (sandbox-seconds) stays the
 #   same regardless of wall-clock compression.
 #
-# Outputs:
-#   /tmp/mcpolis-integration-junit.xml
-#   /tmp/mcpolis-integration-report.json
+# Outputs, in this run's own folder (tests/run_folder.py), printed at the
+# start and the end; /tmp/mcpolis-test-runs/latest-integration points at
+# the newest:
+#   integration-junit.xml
+#   integration-report.json
 #
 # The tests/integration/ directory ALSO hosts run-on-demand standalone
 # scripts (e2b_real_e2e.py, list_orphan_sandboxes.py, etc.) — those
@@ -67,11 +69,20 @@ done
 
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../run-in-env.sh"
+# This run's own results folder, so a concurrent run can't overwrite its
+# reports. Resolved before the cd, so a relative MCPOLIS_TEST_OUT_DIR means
+# the caller's directory.
+RUN_DIR="$(python "${REPO_ROOT}/tests/run_folder.py" integration)"
+# Exported so pytest prints it again at the very end
+# (backend/tests/conftest.py): this script ``exec``s pytest, so that
+# signals sent to the runner reach pytest itself.
+export MCPOLIS_TEST_OUT_DIR="$RUN_DIR"
 cd "${SCRIPT_DIR}"
 
-JUNIT_OUT="/tmp/mcpolis-integration-junit.xml"
-JSON_OUT="/tmp/mcpolis-integration-report.json"
+JUNIT_OUT="$RUN_DIR/integration-junit.xml"
+JSON_OUT="$RUN_DIR/integration-report.json"
 rm -f "$JUNIT_OUT" "$JSON_OUT"
+echo "Results folder: $RUN_DIR"
 
 PARALLEL_ARGS=()
 if [ "$JOBS" != "1" ]; then

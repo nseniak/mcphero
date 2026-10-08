@@ -140,7 +140,7 @@ Almost all behavior comes down to three environment variables:
 |---|---|---|
 | `MCPOLIS_MODE` | **`standalone`** (default) · `cloud` | **Storage + tenancy.** `standalone` = a single org, file-backed storage, no external services. `cloud` = multi-org SaaS, MongoDB + Redis, encrypted tokens, horizontally scalable. |
 | `MCPOLIS_OAUTH_PROVIDER` | **`dev_stub`** (default) · `google` | **Dashboard auth.** `dev_stub` = pick-an-email with no real login (ideal for local/standalone). `google` = real Google OAuth. Cloud mode forces `google` and rejects `dev_stub` at startup. |
-| `MCPOLIS_SANDBOX_PROVIDER` | **empty = auto** (default) · `e2b` · `local-subprocess` | **How stdio MCP servers execute.** Auto-selects `e2b` (isolated remote sandbox) when `MCPOLIS_E2B_API_KEY` is set, otherwise `local-subprocess` (spawned on the host, no isolation — dev only). Cloud mode requires `e2b`. |
+| `MCPOLIS_SANDBOX_PROVIDER` | **empty = auto** (default) · `e2b` · `local-subprocess` | **How stdio MCP servers execute.** Auto-selects `e2b` (isolated remote sandbox) when `MCPOLIS_E2B_API_KEY` is set, otherwise `local-subprocess` (spawned on the host, no isolation — dev only). Cloud mode requires `e2b`: it refuses to start with neither a provider nor a key, and accepts `local-subprocess` only when named explicitly on a loopback bind (local development). |
 
 The first two combine into the setups you'd actually want:
 
@@ -148,7 +148,7 @@ The first two combine into the setups you'd actually want:
 - **`standalone` + `google`** — a hardened single-tenant deployment you can expose safely.
 - **`cloud` + `google`** — the multi-tenant SaaS (what mcphero.io runs).
 
-`MCPOLIS_SANDBOX_PROVIDER` is mostly automatic: drop in an `MCPOLIS_E2B_API_KEY` and stdio servers run isolated in a remote sandbox; leave it unset and they run as local subprocesses (fine on your own machine, flagged as unsafe at startup). Whether stdio MCPs are allowed at all is a separate gate — `MCPOLIS_ALLOW_STDIO_MCP` (on by default in standalone, off in cloud).
+`MCPOLIS_SANDBOX_PROVIDER` is mostly automatic: while it is empty, drop in an `MCPOLIS_E2B_API_KEY` and stdio servers run isolated in a remote sandbox; leave both unset and they run as local subprocesses (fine on your own machine, flagged as unsafe at startup; in cloud mode the backend refuses to start instead). An explicit value always wins over the key: the cloud dev config that `bash start.sh` creates names `local-subprocess`, so change that line to `e2b` when you add a key. Whether stdio MCPs are allowed at all is a separate gate — `MCPOLIS_ALLOW_STDIO_MCP` (on by default in standalone, off in cloud).
 
 Set these in `backend/.env` (from-source) or your Docker env file. The defaults already give you the standalone experience, so you only touch them when you want real auth, cloud mode, or remote sandboxing.
 
@@ -286,7 +286,7 @@ Most domain logic is shared; divergence is concentrated in the storage factory, 
 | Distributed lock | No-op | Mongo TTL collection |
 | Sandbox refs (E2B reattach) | In-memory (lost on restart) | Mongo-backed (survives restart) |
 | `stdio` MCP default | Allowed | Disabled (override via `MCPOLIS_ALLOW_STDIO_MCP`) |
-| Sandbox provider | `e2b` or `local-subprocess` | `e2b` only |
+| Sandbox provider | `e2b` or `local-subprocess` | `e2b` only (`local-subprocess` only when named on a loopback bind, for local development) |
 | Startup secret validation | Skipped | Enforces session/encryption/Mongo/Redis (+ E2B when used) |
 | Org switcher (`OrgSwitcher`) | Hidden (single `default` org) | Shown |
 | Team page | Shown (manages the `default` org) | Shown |

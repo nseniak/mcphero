@@ -4,6 +4,9 @@ Writes an OAuth token through the standard ``MongoConnectionRepository``
 API, then reads the raw Mongo document (bypassing ``OrgScopedCollection``)
 and asserts that the ``access_token`` field in the stored doc is NOT
 the plaintext value — it must be an ``enc:v1:...`` blob.
+
+The gateway sign-in store's encryption at rest is pinned in
+``test_gateway_oauth_storage.py``.
 """
 from __future__ import annotations
 
@@ -23,14 +26,7 @@ from mcpolis.adapters.repositories.mongo_connection_repository import (
     _oauth_metadata_key,
     _user_key,
 )
-from mcpolis.adapters.repositories.mongo_oauth_state_repository import (
-    MongoOAuthStateRepository,
-)
 from mcpolis.domain.ports import DEFAULT_ORG_ID
-from mcpolis.domain.ports.oauth_state_repository import (
-    OAuthStateSnapshot,
-    StoredAccessToken,
-)
 from tests.unit.mongo_fixture import temp_mongo_database
 
 pytestmark = pytest.mark.asyncio
@@ -130,101 +126,3 @@ async def test_oauth_metadata_stored_unencrypted_in_mongo() -> None:
                 isinstance(value, str) and value.startswith("enc:v1:")
             ), f"unexpected ciphertext in oauth_metadata: {value}"
 
-
-async def test_oauth_state_snapshot_encrypted_in_mongo() -> None:
-    """Whole-snapshot encryption: every sensitive field (client
-    secrets, access tokens, refresh tokens, user emails) is protected
-    at rest by encrypting the serialized JSON blob, not by enumerating
-    individual fields. Pin that the plaintext email never reaches the
-    raw Mongo document."""
-    async with temp_mongo_database() as db:
-        encryptor = FieldEncryptor.from_master_secret("cloud-master")
-        coll = OrgScopedCollection(
-            db["oauth_state"], "oauth_state", encryptor=encryptor,
-        )
-        repo = MongoOAuthStateRepository(coll, encryptor)
-
-        snapshot = OAuthStateSnapshot()
-        snapshot.access_tokens["tok"] = StoredAccessToken(
-            token="tok",
-            client_id="client-1",
-            user_email="alice@co.com",
-            scopes=["read"],
-            expires_at=9999999999,
-        )
-        await repo.save(snapshot)
-
-        # Single global document, keyed under DEFAULT_ORG_ID by the
-        # repo (the OrgScopedCollection wrapper requires a key; the
-        # OAuth state is logically global so we reuse DEFAULT_ORG_ID
-        # as the constant key rather than building a separate
-        # non-org-scoped wrapper).
-        raw = await db["oauth_state"].find_one({"org_id": DEFAULT_ORG_ID})
-        assert raw is not None
-        blob = raw["encrypted_payload"]
-        assert isinstance(blob, str)
-        # Whole payload is encrypted; the plaintext email must not
-        # appear in the raw document at all.
-        assert "alice@co.com" not in blob
-        assert blob.startswith("enc:v1:")
-
-        # Round-trip restores the snapshot.
-        loaded = await repo.load()
-        assert "tok" in loaded.access_tokens
-        assert loaded.access_tokens["tok"].user_email == "alice@co.com"
-
-
-async def test_oauth_state_round_trips_through_global_document() -> None:
-    """Gateway OAuth state is global, not partitioned by org —
-    successive ``save`` calls overwrite the single document. Pin both
-    that the collection only ever holds one document for the gateway
-    snapshot AND that the second save replaces (not merges) the first.
-
-    The org dimension is resolved per request from the URL slug or the
-    user's memberships; tokens themselves are user-scoped. This test
-    is the storage-layer counterpart to that contract — a future
-    refactor that re-introduces per-org partitioning would have to
-    break this test first.
-    """
-    async with temp_mongo_database() as db:
-        encryptor = FieldEncryptor.from_master_secret("cloud-master")
-        coll = OrgScopedCollection(
-            db["oauth_state"], "oauth_state", encryptor=encryptor,
-        )
-        repo = MongoOAuthStateRepository(coll, encryptor)
-
-        snap_first = OAuthStateSnapshot()
-        snap_first.access_tokens["tok-a"] = StoredAccessToken(
-            token="tok-a",
-            client_id="client-a",
-            user_email="alice@co.com",
-            scopes=[],
-            expires_at=9999999999,
-        )
-        snap_second = OAuthStateSnapshot()
-        snap_second.access_tokens["tok-b"] = StoredAccessToken(
-            token="tok-b",
-            client_id="client-b",
-            user_email="bob@co.com",
-            scopes=[],
-            expires_at=9999999999,
-        )
-
-        await repo.save(snap_first)
-        await repo.save(snap_second)
-
-        # Single global doc — not one per save.
-        docs = await db["oauth_state"].find({}).to_list(length=None)
-        assert len(docs) == 1, (
-            f"expected one global oauth_state doc, got {len(docs)}: {docs}"
-        )
-
-        # Replace, not merge: the second save fully overwrites the
-        # first. ``McpGatewayOAuthProvider`` always saves a complete
-        # snapshot (the in-memory map is the source of truth), so a
-        # merge semantic would silently keep stale tokens that the
-        # provider has already evicted in memory.
-        loaded = await repo.load()
-        assert "tok-a" not in loaded.access_tokens
-        assert "tok-b" in loaded.access_tokens
-        assert loaded.access_tokens["tok-b"].user_email == "bob@co.com"

@@ -14,10 +14,11 @@ never branches on it.
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 import structlog
+from pydantic import BaseModel
 
 # Org deletion orchestrates a purge across every org-scoped repository.
 # The legacy abstract bases (``ConnectionStore`` / ``UpstreamConfigStore``
@@ -29,10 +30,10 @@ from mcpolis.adapters.repositories.audit_repository import (
 )
 from mcpolis.adapters.repositories.connection_store import ConnectionStore
 from mcpolis.adapters.repositories.upstream_config_store import UpstreamConfigStore
+from mcpolis.domain.model.email_address import find_address
 from mcpolis.domain.model.reserved_slugs import RESERVED_ORG_SLUGS
 from mcpolis.domain.model.settings import UserDefinition
 from mcpolis.domain.ports import (
-    DEFAULT_ORG_ID,
     ConfigRepository,
     Membership,
     Organization,
@@ -45,6 +46,11 @@ from mcpolis.domain.ports.sandbox_persistence_repository import (
 )
 from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
 from mcpolis.domain.ports.tool_catalog_repository import ToolCatalogRepository
+from mcpolis.domain.services.cancel_shield import runs_to_completion
+from mcpolis.domain.services.sandbox_service import (
+    SandboxProviderName,
+    SandboxService,
+)
 from mcpolis.domain.services.settings_resolver import resolve_settings
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
@@ -82,6 +88,13 @@ class OrgNotFoundError(LookupError):
 
 class NotAMemberError(PermissionError):
     """Raised when the caller is not a member of the target org."""
+
+
+class Invitation(BaseModel):
+    """An org's invitation the invited person has not accepted yet."""
+
+    org: Organization
+    role: str
 
 
 def validate_slug(slug: str) -> None:
@@ -132,6 +145,7 @@ class OrgService:
         template_var_repo: TemplateVarRepository | None = None,
         sandbox_file_repo: SandboxFileRepository | None = None,
         audit_repo: LegacyAuditRepository | None = None,
+        sandbox_services: Mapping[SandboxProviderName, SandboxService] | None = None,
     ) -> None:
         self._org_repo = org_repo
         self._config_repo = config_repo
@@ -148,6 +162,9 @@ class OrgService:
         self._template_var_repo = template_var_repo
         self._sandbox_file_repo = sandbox_file_repo
         self._audit_repo = audit_repo
+        # Provider services used to kill the org's persisted sandboxes
+        # before their refs are purged (see ``_release_sandboxes``).
+        self._sandbox_services = sandbox_services
         # Late-bound by ``create_app`` (after the slug cache exists) to
         # stop the in-memory runtime + invalidate the slug cache on
         # deletion. Kept as a callback so the domain layer stays
@@ -211,42 +228,34 @@ class OrgService:
     # --- Reads ---
 
     async def list_user_orgs(self, email: str) -> list[Organization]:
-        """Return orgs the user belongs to.
-
-        In cloud mode this queries the memberships collection. In
-        standalone mode the file repo returns ``[]`` from
-        ``get_memberships_for_email`` — the service falls back to
-        checking the default-org config, which is the single source of
-        truth for standalone users.
-        """
+        """Return the orgs the user is a member of: one per membership
+        row, i.e. per invitation they accepted (or org they created).
+        Same rule in both modes; a pending invitation is not listed (see
+        ``list_invitations``)."""
         memberships = await self._org_repo.get_memberships_for_email(email)
-        if memberships:
-            orgs: list[Organization] = []
-            for m in memberships:
-                org = await self._org_repo.get_organization(m.org_id)
-                if org is not None:
-                    orgs.append(org)
-            return orgs
-        # Fallback for standalone mode: the user either exists in the
-        # default org's config or they don't. The file repo never
-        # records memberships.
-        default_config = await self._config_repo.load(DEFAULT_ORG_ID)
-        if email in default_config.users:
-            default_org = await self._org_repo.get_organization(DEFAULT_ORG_ID)
-            if default_org is not None:
-                return [default_org]
-        return []
+        orgs: list[Organization] = []
+        for m in memberships:
+            org = await self._org_repo.get_organization(m.org_id)
+            if org is not None:
+                orgs.append(org)
+        return orgs
+
+    async def _has_membership_row(self, org_id: str, email: str) -> bool:
+        memberships = await self._org_repo.get_memberships_for_email(email)
+        return any(m.org_id == org_id for m in memberships)
 
     async def get_user_role(self, org_id: str, email: str) -> str | None:
-        """Return the user's role name in this org, or ``None``."""
+        """Return the member's role name in this org, or ``None`` for
+        anyone who is not a member (a pending invitation included)."""
         config = await self._config_repo.load(org_id)
-        user = config.users.get(email)
-        if user is None:
+        key = find_address(config.users, email)
+        if key is None or not await self._has_membership_row(org_id, email):
             return None
-        return user.role
+        return config.users[key].role
 
     async def is_admin(self, org_id: str, email: str) -> bool:
-        """Return True if the user holds an admin-flagged role in this org.
+        """Return True if the member holds an admin-flagged role in this
+        org. A pending admin invitation grants nothing.
 
         Routes through ``RoleDefinition.is_admin`` — independent of the
         role's *name*, so any role flagged ``is_admin=True`` grants
@@ -255,7 +264,9 @@ class OrgService:
         compare role names against the literal string ``"admin"``.
         """
         config = await self._config_repo.load(org_id)
-        return resolve_settings(config, email).is_admin
+        if not resolve_settings(config, email).is_admin:
+            return False
+        return await self._has_membership_row(org_id, email)
 
     async def get_admin_role_name(self, org_id: str) -> str:
         """Return the seed-time admin role name for this org.
@@ -276,6 +287,8 @@ class OrgService:
         return names[0]
 
     async def is_member(self, org_id: str, email: str) -> bool:
+        """Whether ``email`` accepted an invitation to (or created) the
+        org and is still on its team."""
         return (await self.get_user_role(org_id, email)) is not None
 
     async def resolve_slug(self, slug: str) -> Organization:
@@ -287,37 +300,56 @@ class OrgService:
 
     # --- Memberships ---
 
-    async def ensure_memberships_for_user(self, email: str) -> None:
-        """Create membership rows for every org the user appears in
-        via ``config.users`` but doesn't yet have a membership row.
+    async def list_invitations(self, email: str) -> list[Invitation]:
+        """The invitations ``email`` has not accepted yet: every org whose
+        users include the address (letter case ignored) while it has no
+        membership row there. Oldest org first.
 
-        Called during the login callback so that users added via the
-        Team page's "Add member" (which only writes ``config.users``)
-        are marked as active (have a membership row) on their first
-        sign-in. This is what lets the Team page distinguish
-        "active" from "pending".
+        Invitations are never accepted on the person's behalf. Each one
+        waits for its own explicit Join (see
+        ``UserAdminService.accept_invitation``); until then the org's
+        admins have no power over the person and the person has no
+        access to the org.
+
+        The dashboard asks on every page load (``/api/auth/me``):
+        ``find_user`` answers without reading every org's config.
         """
-        existing = await self._org_repo.get_memberships_for_email(email)
-        existing_org_ids = {m.org_id for m in existing}
-        # Scan all orgs. In cloud mode the number of orgs is bounded
-        # (tens, not millions), so a full scan is fine.
-        all_orgs = await self._org_repo.list_organizations()
-        for org in all_orgs:
-            if org.id in existing_org_ids:
+        entries = await self._config_repo.find_user(email)
+        if not entries:
+            return []
+        joined = {
+            m.org_id
+            for m in await self._org_repo.get_memberships_for_email(email)
+        }
+        invitations: list[Invitation] = []
+        for entry in entries:
+            if entry.org_id in joined:
                 continue
-            config = await self._config_repo.load(org.id)
-            user = config.users.get(email)
-            if user is not None:
-                await self._org_repo.add_membership(
-                    org.id, email, user.role,
-                )
-                logger.info(
-                    "org.membership.created_on_first_sign_in",
-                    member_email=email,
-                    org_id=org.id,
-                    org_slug=org.slug,
-                    role=user.role,
-                )
+            org = await self._org_repo.get_organization(entry.org_id)
+            if org is not None:  # None: the config of a deleted org
+                invitations.append(Invitation(org=org, role=entry.user.role))
+        return sorted(invitations, key=lambda i: i.org.created_at)
+
+    async def invitation_to(self, slug: str, email: str) -> Invitation | None:
+        """``email``'s pending invitation to the org at ``slug``, if any
+        (letter case ignored)."""
+        org = await self._org_repo.get_by_slug(slug)
+        if org is None or await self._has_membership_row(org.id, email):
+            return None
+        config = await self._config_repo.load(org.id)
+        key = find_address(config.users, email)
+        if key is None:
+            return None
+        return Invitation(org=org, role=config.users[key].role)
+
+    async def add_founding_member(
+        self, org_id: str, email: str, role: str,
+    ) -> Membership:
+        """Save the membership of someone who sets the org up rather than
+        being invited into it (the first person to sign in to a fresh
+        standalone install), like ``create_organization`` does for an
+        org's creator."""
+        return await self._org_repo.add_membership(org_id, email, role)
 
     async def list_members(self, org_id: str) -> list[Membership]:
         return await self._org_repo.list_memberships(org_id)
@@ -349,6 +381,7 @@ class OrgService:
             return 0
         return result if isinstance(result, int) else 0
 
+    @runs_to_completion
     async def delete_organization(self, org_id: str) -> None:
         """Delete an organization and PURGE every collection scoped to it.
 
@@ -363,17 +396,43 @@ class OrgService:
            is rejected before any runtime teardown or purge runs (it can't
            tear down the live single-tenant runtime or wipe file data).
            In cloud mode this removes the org doc + memberships.
-        2. Tear down the in-memory runtime (stop live upstream clients,
+        2. Purge the org's service tokens, at once (see below).
+        3. Tear down the in-memory runtime (stop live upstream clients,
            invalidate the slug cache) so nothing writes a row back
            mid-purge.
-        3. Purge each org-scoped repo, best-effort.
+        4. Purge each other org-scoped repo, best-effort.
+        5. Kill every sandbox the org still has on the provider, then
+           purge the sandbox refs. A ref whose kill or volume destroy
+           failed is kept, listing only that, for the boot reconcile to
+           retry: it is the last thing that names such a sandbox (see
+           ``_release_sandboxes``).
 
         Service tokens matter specially: they carry their org in the
         credential and bypass membership gating, so a survivor would keep
         working through the gateway's org-pin path and be unrevocable —
-        the org's dashboard no longer exists.
+        the org's dashboard no longer exists. So they go right after the
+        org itself, before the steps that can take long (closing the
+        runtime's sessions, an E2B kill per sandbox): a deletion stopped
+        in between, by a crash or a deploy's cut, leaves no live token.
+        Nothing writes a token back: using one only updates its
+        ``last_used_at``, never re-creates it. The sandboxes go last for
+        the same reason: an E2B call per sandbox can take long, and a
+        deletion a deploy's shutdown cuts there (once its job drain is
+        over) used to leave the org's config, sign-ins and Variables
+        behind, with no retry: the org was gone.
+
+        Runs to its end once started (``runs_to_completion``), whatever
+        cancels its caller: cut after step 1, the org would be gone, the
+        deletion impossible to retry ("not found") and the rest of its
+        data left behind.
         """
         await self._org_repo.delete_organization(org_id)
+
+        st = self._service_token_repo
+        purged_service_tokens = await self._purge(
+            org_id, "service_tokens",
+            (lambda: st.delete_for_org(org_id)) if st else None,
+        )
 
         if self._runtime_teardown is not None:
             try:
@@ -385,7 +444,6 @@ class OrgService:
                     exc_info=True,
                 )
 
-        st = self._service_token_repo
         cr = self._connection_repo
         uc = self._upstream_config_repo
         tc = self._tool_catalog_repo
@@ -394,10 +452,7 @@ class OrgService:
         sf = self._sandbox_file_repo
         au = self._audit_repo
         counts = {
-            "service_tokens": await self._purge(
-                org_id, "service_tokens",
-                (lambda: st.delete_for_org(org_id)) if st else None,
-            ),
+            "service_tokens": purged_service_tokens,
             "connections": await self._purge(
                 org_id, "connections",
                 (lambda: cr.delete_all_for_org(org_id)) if cr else None,
@@ -414,10 +469,6 @@ class OrgService:
                 org_id, "tool_catalog",
                 (lambda: tc.delete_all_for_org(org_id)) if tc else None,
             ),
-            "sandbox_refs": await self._purge(
-                org_id, "sandbox_refs",
-                (lambda: sp.delete_all_for_org(org_id=org_id)) if sp else None,
-            ),
             "template_vars": await self._purge(
                 org_id, "template_vars",
                 (lambda: tv.delete_all_for_org(org_id)) if tv else None,
@@ -431,8 +482,85 @@ class OrgService:
                 (lambda: au.delete_for_org(org_id)) if au else None,
             ),
         }
+
+        released, kept_sandbox_refs = await self._release_sandboxes(org_id)
+        counts["sandbox_refs"] = await self._purge(
+            org_id, "sandbox_refs",
+            (
+                lambda: self._purge_sandbox_refs(org_id, kept_sandbox_refs)
+            ) if sp else None,
+        )
         logger.info(
             "org.deleted",
             org_id=org_id,
+            sandbox_refs_released=released,
+            sandbox_refs_kept=len(kept_sandbox_refs),
             **{f"purged_{name}": n for name, n in counts.items()},
         )
+
+    async def _release_sandboxes(self, org_id: str) -> tuple[int, set[str]]:
+        """Kill each persisted sandbox of the org and destroy its storage.
+
+        The runtime teardown only reaches sandboxes with a live session.
+        A paused one (DEFERRED_ATTACH, or preserved after E2B paused it)
+        is known only to its persisted ref, so purging the ref alone
+        would leave it on the provider with nothing pointing at it.
+        Same two calls as an upstream's Stop + Delete, fanned out to
+        every provider (each is a no-op when it has nothing). Best-effort:
+        a failure is logged and the deletion goes on.
+
+        Returns the number of refs processed, and the upstreams whose ref
+        a provider kept to finish later (a kill or a destroy that failed,
+        see ``SandboxService.on_upstream_removed``): the purge must leave
+        those for the boot reconcile, the only thing that still retries
+        them. Purged, a sandbox made before the instance id became one
+        value per database stayed on the provider for good.
+        """
+        sp = self._sandbox_persistence_repo
+        if sp is None or not self._sandbox_services:
+            return 0, set()
+        try:
+            refs = await sp.list_for_org(org_id=org_id)
+        except Exception:
+            logger.warning(
+                "org.delete.sandbox_list_failed", org_id=org_id, exc_info=True,
+            )
+            return 0, set()
+        kept: set[str] = set()
+        for ref in refs:
+            for provider, service in self._sandbox_services.items():
+                for step, op in (
+                    ("kill", service.kill_persisted_session),
+                    ("remove", service.on_upstream_removed),
+                ):
+                    try:
+                        ref_kept = await op(
+                            org_id=org_id, upstream_id=ref.upstream_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "org.delete.sandbox_release_failed",
+                            org_id=org_id,
+                            upstream_id=ref.upstream_id,
+                            provider=provider,
+                            step=step,
+                            exc_info=True,
+                        )
+                        continue
+                    if ref_kept:  # only ``on_upstream_removed`` says so
+                        kept.add(ref.upstream_id)
+        return len(refs), kept
+
+    async def _purge_sandbox_refs(self, org_id: str, kept: set[str]) -> int:
+        """Delete the org's sandbox refs, except those of the upstreams in
+        ``kept`` (see ``_release_sandboxes``). Returns how many went."""
+        sp = self._sandbox_persistence_repo
+        assert sp is not None  # the caller checks
+        if not kept:
+            return await sp.delete_all_for_org(org_id=org_id)
+        deleted = 0
+        for ref in await sp.list_for_org(org_id=org_id):
+            if ref.upstream_id not in kept:
+                await sp.delete(org_id=org_id, upstream_id=ref.upstream_id)
+                deleted += 1
+        return deleted

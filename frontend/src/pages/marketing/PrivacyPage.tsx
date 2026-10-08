@@ -64,8 +64,10 @@ export function PrivacyPage() {
           <section className="space-y-3">
             <h2 className="text-xl font-semibold text-zinc-900">5. Data retention</h2>
             <p>
-              Audit log entries are retained for 7 days, then automatically deleted. OAuth refresh
-              tokens are encrypted at rest and deleted when you disconnect.
+              Audit log entries are retained for 1 year on every plan, then automatically deleted.
+              The dashboard shows the last 30 days on the Free plan and the full year on the Team
+              plan. Deleting an organization deletes all of its audit log entries at once. OAuth
+              refresh tokens are encrypted at rest and deleted when you disconnect.
             </p>
           </section>
 

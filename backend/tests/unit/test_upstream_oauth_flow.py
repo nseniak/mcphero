@@ -76,6 +76,7 @@ def make_oauth_token(
 def make_client_manager() -> MagicMock:
     cm = MagicMock()
     cm.replace_user_session = AsyncMock()
+    cm.is_stopped = MagicMock(return_value=False)
     return cm
 
 
@@ -1267,6 +1268,7 @@ async def test_background_terminal_failure_marks_pending_failed(
     )
     storage = MagicMock()
     storage.peek_tokens = AsyncMock(return_value=None)
+    storage.fresh_sign_in_refused = None
     errors: list[tuple[str, OAuthFailureReason]] = []
 
     async def _probe(*_a: Any, **_k: Any) -> None: ...

@@ -32,6 +32,7 @@ import uuid
 import pytest
 
 from mcpolis.adapters.sandbox_e2b import (
+    E2BNotFoundError,
     E2BSDKError,
     RealE2BClient,
 )
@@ -171,6 +172,56 @@ async def test_real_pause_and_resume_round_trip() -> None:
         if target is not None:
             try:
                 await client.kill_sandbox(target)
+            except E2BSDKError:
+                pass
+
+
+# ---------- kill of a paused sandbox ----------
+
+
+# How long to wait for a killed sandbox to leave the listing.
+KILLED_LISTING_POLL_SECONDS = 15.0
+
+
+@pytest.mark.asyncio
+async def test_real_kill_of_a_paused_sandbox_removes_it() -> None:
+    """Nearly every sandbox the boot reconcile reaps is PAUSED (E2B
+    pauses an unused one within minutes), and so is one a Stop kills
+    after a quiet spell. ``kill_sandbox`` on a paused sandbox must remove
+    it: it leaves the listing, and a second kill answers not-found
+    (``E2BNotFoundError``), which also proves a missing sandbox is no
+    longer reported as killed. About $0.01."""
+    client = make_test_client()
+    metadata = make_test_metadata("kill_paused")
+    sandbox = await client.create_sandbox(
+        template=DEFAULT_TEMPLATE,
+        metadata=metadata,
+        timeout_seconds=120,
+    )
+    sandbox_id = sandbox.sandbox_id
+    killed = False
+    try:
+        await sandbox.pause()
+
+        await client.kill_sandbox(sandbox_id)
+        killed = True
+
+        deadline = asyncio.get_running_loop().time() + KILLED_LISTING_POLL_SECONDS
+        while True:
+            listed = await client.list_sandboxes(metadata_filter=metadata)
+            if sandbox_id not in {info.sandbox_id for info in listed}:
+                break
+            assert asyncio.get_running_loop().time() < deadline, (
+                f"killed paused sandbox {sandbox_id} still listed after "
+                f"{KILLED_LISTING_POLL_SECONDS}s"
+            )
+            await asyncio.sleep(1.0)
+        with pytest.raises(E2BNotFoundError):
+            await client.kill_sandbox(sandbox_id)
+    finally:
+        if not killed:
+            try:
+                await client.kill_sandbox(sandbox_id)
             except E2BSDKError:
                 pass
 

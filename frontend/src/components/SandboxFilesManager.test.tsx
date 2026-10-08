@@ -23,7 +23,7 @@ function makeUserVar(name: string, value: string | null) {
     name,
     is_secret: value === null,
     value,
-    last_four: null,
+    has_value: true,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
   };

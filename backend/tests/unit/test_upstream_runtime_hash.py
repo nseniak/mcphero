@@ -3,7 +3,7 @@
 Pure function, no I/O. Verifies the hash is stable across argument
 orderings, sensitive to every input that affects runtime behaviour,
 and insensitive to fields that don't (timestamps on the upstream
-itself, the env var's plaintext, the env-var ``last_four`` preview —
+itself, the env var's plaintext, the env-var ``has_value`` marker —
 all of which are derived from inputs the hash already covers via
 ``updated_at``).
 """
@@ -74,7 +74,7 @@ def _make_summary(
         name=name,
         is_secret=is_secret,
         value=None if is_secret else "debug",
-        last_four="cdef" if is_secret else None,
+        has_value=True,
         created_at=when,
         updated_at=when,
     )
@@ -152,15 +152,15 @@ def test_hash_does_not_carry_secret_plaintext() -> None:
     upstream = _make_stdio_upstream()
     when = datetime(2026, 5, 4, 10, 0, tzinfo=UTC)
     a = TemplateVarSummary(
-        name="SECRET", is_secret=True, value=None, last_four="aaaa",
+        name="SECRET", is_secret=True, value=None, has_value=True,
         created_at=when, updated_at=when,
     )
     b = TemplateVarSummary(
-        name="SECRET", is_secret=True, value=None, last_four="bbbb",
+        name="SECRET", is_secret=True, value=None, has_value=False,
         created_at=when, updated_at=when,
     )
-    # Different ``last_four`` (would only happen if plaintext changed)
-    # but identical updated_at — value/last_four are not part of the
+    # Different ``has_value`` (would only happen if plaintext changed)
+    # but identical updated_at — value/has_value are not part of the
     # hash payload, ``updated_at`` is the proxy.
     assert (
         compute_upstream_runtime_hash(upstream, [a])

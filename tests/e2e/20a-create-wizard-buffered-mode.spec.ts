@@ -63,9 +63,10 @@ test.describe("Per-MCP secrets — create wizard (buffered mode)", () => {
       .getByPlaceholder(/Paste value/)
       .fill("super-secret-value-xyz1234567890");
     await dialog.getByRole("button", { name: /^Save$/ }).click();
-    // Listed with the last-4 preview.
+    // Listed as set; no part of the value is shown.
     await expect(page.getByText("MY_TOKEN")).toBeVisible();
-    await expect(page.getByText(/••••7890/)).toBeVisible();
+    await expect(page.getByText("•••• set")).toBeVisible();
+    await expect(page.getByText(/7890/)).toHaveCount(0);
   });
 
   test("Stdio JSON surfaces system HOME row + does not flag ${HOME} as undefined", async ({

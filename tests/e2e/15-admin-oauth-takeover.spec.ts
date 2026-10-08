@@ -11,16 +11,17 @@
  * Behaviours covered (none of which were previously e2e-tested):
  *   - admin A connects -> slot_owner resolves to A
  *   - admin B sees A's badge from a different session
- *   - admin B's connect attempt 409s with "A is already connected"
- *   - admin B's disconnect releases the slot
- *   - admin B connects -> owner flips to B
+ *   - admin B's connect attempt 409s with "A is already signed in"
+ *   - B signs A out from the admin tab -> B connects -> owner flips to B
+ *   - admin B's Stop (Disconnect) keeps A's sign-in, the gateway
+ *     refuses calls until Start, and Start needs no sign-in
  *   - tools forwarded through the gateway carry B's upstream token
  *     (the fake upstream echoes ``as=<email>`` so the test can read
  *     the slot owner indirectly through the data plane)
  */
 import { test, expect, type APIRequestContext } from "@playwright/test";
 
-import { apiLoginAs, makeMcpClient, mintMcpToken, OAUTH_TEST_MCP_URL, BACKEND_URL as BACKEND } from "./helpers";
+import { apiLoginAs, makeMcpClient, mintMcpToken, OAUTH_TEST_MCP_URL, resetOAuthUpstream, BACKEND_URL as BACKEND } from "./helpers";
 const ORG = "acme-corp";
 const ADMIN_A = "admin@example.com";
 const ADMIN_B = "admin2@example.com";
@@ -105,10 +106,7 @@ test.describe("admin_oauth single-slot take-over", () => {
     // spec's queued email / TTL knob / connected slot can't leak
     // into this test.
     await request.post(`${OAUTH_TEST_MCP_URL}/test/reset`);
-    await adminApi(request, ADMIN_A);
-    await request.post(
-      `${BACKEND}/api/admin/upstreams/${UPSTREAM}/disconnect`
-    );
+    await resetOAuthUpstream(request, UPSTREAM);
   });
 
   test("admin A connect -> owner becomes A; admin B sees A's badge", async ({
@@ -162,20 +160,22 @@ test.describe("admin_oauth single-slot take-over", () => {
     expect(conflict.status()).toBe(409);
     const detail = (await conflict.json()).detail;
     expect(detail).toContain(ADMIN_A);
-    expect(detail.toLowerCase()).toContain("disconnect");
+    expect(detail).toContain("already signed in");
   });
 
-  test("admin B's disconnect releases the slot, then B can claim it", async ({
+  test("B signs A out from the admin tab, then B can claim the slot", async ({
     request,
   }) => {
     await adminApi(request, ADMIN_A);
     await completeAdminOauthConnect(request, ADMIN_A);
 
     await adminApi(request, ADMIN_B);
-    const disconnect = await request.post(
-      `${BACKEND}/api/admin/upstreams/${UPSTREAM}/disconnect`
+    const signOut = await request.post(
+      `${BACKEND}/api/admin/upstreams/${UPSTREAM}/sign-out`,
+      { data: { email: ADMIN_A } },
     );
-    expect(disconnect.status()).toBe(200);
+    expect(signOut.status()).toBe(200);
+    expect((await signOut.json()).email).toBe(ADMIN_A);
     expect(await slotOwner(request)).toBeNull();
 
     await completeAdminOauthConnect(request, ADMIN_B);
@@ -211,11 +211,14 @@ test.describe("admin_oauth single-slot take-over", () => {
       await mcp.close();
     }
 
-    // Admin B takes over. The gateway must now forward B's token —
-    // the tool's ``as=`` field is the cleanest read on which token
-    // is in flight (it's the upstream's view, not MCPolis's).
+    // Admin B signs A out and takes over. The gateway must now forward
+    // B's token — the tool's ``as=`` field is the cleanest read on which
+    // token is in flight (it's the upstream's view, not MCPolis's).
     await adminApi(request, ADMIN_B);
-    await request.post(`${BACKEND}/api/admin/upstreams/${UPSTREAM}/disconnect`);
+    await request.post(
+      `${BACKEND}/api/admin/upstreams/${UPSTREAM}/sign-out`,
+      { data: { email: ADMIN_A } },
+    );
     await completeAdminOauthConnect(request, ADMIN_B);
 
     mcp = await makeMcpClient(tokenB, ORG, "mcp");
@@ -230,5 +233,59 @@ test.describe("admin_oauth single-slot take-over", () => {
     } finally {
       await mcp.close();
     }
+  });
+  test("B's Stop keeps A's sign-in; calls are refused until Start, which needs no sign-in", async ({
+    request,
+  }) => {
+    await adminApi(request, ADMIN_A);
+    await completeAdminOauthConnect(request, ADMIN_A);
+    const tokenB = await mintMcpToken(request, ADMIN_B, ORG);
+
+    async function echo(): Promise<{ text: string; isError: boolean }> {
+      const mcp = await makeMcpClient(tokenB, ORG, "mcp");
+      try {
+        const result = await mcp.callTool({
+          name: `${ORG}__${UPSTREAM}__secret_echo`,
+          arguments: { message: "hello" },
+        });
+        const content = result.content as Array<{ type: string; text?: string }>;
+        return {
+          text: content.find((c) => c.type === "text")?.text ?? "",
+          isError: Boolean(result.isError),
+        };
+      } finally {
+        await mcp.close();
+      }
+    }
+
+    expect((await echo()).text).toContain(`as=${ADMIN_A}`);
+
+    await adminApi(request, ADMIN_B);
+    const stop = await request.post(
+      `${BACKEND}/api/admin/upstreams/${UPSTREAM}/disconnect`
+    );
+    expect(stop.status()).toBe(200);
+    const stopped = await getUpstream(request, UPSTREAM);
+    expect(stopped.ready).toBe(false);
+    expect(stopped.stopped).toBe(true);
+    expect(stopped.slot_owner).toBe(ADMIN_A);
+
+    const refused = await echo();
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("not currently available");
+
+    // Start: A's kept sign-in comes back, no sign-in page.
+    const start = await request.post(
+      `${BACKEND}/api/admin/upstreams/${UPSTREAM}/connect`
+    );
+    expect(start.status()).toBe(200);
+    const body = await start.json();
+    expect(body.authorization_url ?? null).toBeNull();
+    expect(body.connected).toBe(true);
+    expect(await slotOwner(request)).toBe(ADMIN_A);
+
+    const back = await echo();
+    expect(back.isError).toBe(false);
+    expect(back.text).toContain(`as=${ADMIN_A}`);
   });
 });

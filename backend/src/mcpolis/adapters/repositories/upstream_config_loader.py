@@ -129,16 +129,11 @@ def build_upstream(
         )
         auth_mode = AuthMode.service_account
 
-    # Extract token from headers if service_account
-    token = None
-    if auth_mode == AuthMode.service_account and http:
-        auth_header = http.headers.get("Authorization", http.headers.get("authorization", ""))
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-
+    # A service-account token stays in the Authorization header (HTTP)
+    # or the env (stdio) it was saved in; it is not copied out, because
+    # a copy of ``Bearer ${NAME}`` would skip Variable substitution.
     auth = UpstreamAuthConfig(
         mode=auth_mode,
-        token=token,
         client_id=options.get("client_id"),
         client_secret=options.get("client_secret"),
         scopes=options.get("scopes", []),

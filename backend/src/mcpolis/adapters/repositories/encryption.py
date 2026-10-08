@@ -17,9 +17,12 @@ as today.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import os
 from typing import Any
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -29,6 +32,11 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 # produced by this module with the v1 key-derivation parameters.
 _PREFIX = "enc:v1:"
 _NONCE_LEN = 12  # AES-GCM spec-recommended nonce length
+
+# What ``decrypt_string`` raises for a blob it cannot read: one written
+# under another key or altered (``InvalidTag``), or not a blob of this
+# module at all (``ValueError``: no prefix, bad base64, not UTF-8).
+DECRYPTION_ERRORS: tuple[type[Exception], ...] = (InvalidTag, ValueError)
 
 
 def derive_encryption_key(master_secret: str) -> bytes:
@@ -66,6 +74,27 @@ class FieldEncryptor:
                 f"FieldEncryptor requires a 32-byte key, got {len(key)}"
             )
         self._aes = AESGCM(key)
+        # A separate key for ``lookup_hash``, derived from the AES key
+        # so one secret still covers both. Like ``derive_encryption_key``'s
+        # ``info``, this label must never change: stored lookup hashes
+        # would stop matching.
+        self._lookup_key = HKDF(
+            algorithm=SHA256(),
+            length=32,
+            salt=None,
+            info=b"mcpolis-lookup-hash-v1",
+        ).derive(key)
+
+    def lookup_hash(self, value: str) -> str:
+        """A keyed hash (HMAC-SHA256, hex) of ``value``.
+
+        The same value always gives the same hash, so a document can be
+        found by a secret or personal value (a token, an email) without
+        storing that value in clear. Without the key, a hash cannot be
+        checked against a guessed value."""
+        return hmac.new(
+            self._lookup_key, value.encode("utf-8"), hashlib.sha256,
+        ).hexdigest()
 
     @classmethod
     def from_master_secret(cls, master_secret: str) -> FieldEncryptor:

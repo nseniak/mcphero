@@ -1,7 +1,11 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router";
 import { getLoginUrl } from "../api/auth";
-import { fetchPublicOrgInfo } from "../api/orgs";
+import { declineInvitation, fetchPublicOrgInfo, switchOrg } from "../api/orgs";
+import { joinAndOpen } from "../components/PendingInvitations";
+import { useAuth } from "../hooks/useAuth";
+import { useTranslation } from "../i18n/index";
 
 /**
  * Landing page for invite links: ``/orgs/{slug}/join``.
@@ -16,9 +20,10 @@ import { fetchPublicOrgInfo } from "../api/orgs";
  * ("Join acme-corp"), and so we can render an "invite link looks
  * broken" state when the slug doesn't resolve.
  *
- * After Google sign-in, the backend's callback flow auto-accepts a
- * matching invite and lands the user in the org. If the user signs
- * in but isn't a member, the backend redirects back here with
+ * After Google sign-in, an invited person comes back here, signed in:
+ * signing in never joins an organization by itself, so the page offers
+ * Join (and Decline) for their invitation. A member gets a link into the
+ * org. Someone who signs in but isn't invited is sent back here with
  * ``?auth_error=not_a_member`` and a softer message (zinc-700, not
  * red — same tone choice as SignupPage).
  */
@@ -49,19 +54,125 @@ export function JoinPage() {
       </header>
 
       <main className="flex-1 flex items-center justify-center px-6 py-12">
-        <JoinPanel
-          slug={slug}
-          orgLabel={orgLabel}
-          isLoading={isLoading}
-          isInvalidLink={isInvalidLink}
-          authError={authError}
-          errorEmail={errorEmail}
-        />
+        <SignedInJoinPanel slug={slug} orgLabel={orgLabel}>
+          <JoinPanel
+            slug={slug}
+            orgLabel={orgLabel}
+            isLoading={isLoading}
+            isInvalidLink={isInvalidLink}
+            authError={authError}
+            errorEmail={errorEmail}
+          />
+        </SignedInJoinPanel>
       </main>
 
       <footer className="px-6 py-4 text-xs text-zinc-500 text-center">
         Copyright © 2026 Nitsan Seniak.
       </footer>
+    </div>
+  );
+}
+
+/** For a signed-in visitor invited to (or already in) the org: the Join
+ *  and Decline buttons, or a way in. Anyone else sees ``children`` (the
+ *  sign-in panel). */
+function SignedInJoinPanel({
+  slug,
+  orgLabel,
+  children,
+}: {
+  slug: string;
+  orgLabel: string;
+  children: React.ReactNode;
+}) {
+  const { t } = useTranslation();
+  const { user, loading } = useAuth();
+  const [busy, setBusy] = useState<"join" | "decline" | null>(null);
+  const [declined, setDeclined] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (loading) return null;
+  const invited = user?.invitations.some((i) => i.slug === slug) ?? false;
+  const member = user?.orgs.some((o) => o.slug === slug) ?? false;
+  if (!user || (!invited && !member && !declined)) return <>{children}</>;
+
+  async function join() {
+    setBusy("join");
+    setError(null);
+    try {
+      await joinAndOpen(slug);
+    } catch {
+      setError(t("invitations.failed"));
+      setBusy(null);
+    }
+  }
+
+  async function decline() {
+    setBusy("decline");
+    setError(null);
+    try {
+      await declineInvitation(slug);
+      setDeclined(true);
+    } catch {
+      setError(t("invitations.failed"));
+    }
+    setBusy(null);
+  }
+
+  async function open() {
+    await switchOrg(slug);
+    window.location.href = "/app";
+  }
+
+  return (
+    <div className="w-full max-w-md text-center space-y-6">
+      <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">
+        {t("invitations.title")}
+      </p>
+      <h1 className="text-3xl md:text-4xl font-semibold text-zinc-900 tracking-tight">
+        {t("invitations.joinOrg", { org: orgLabel })}
+      </h1>
+      <div className="rounded-xl border border-zinc-200 bg-white shadow-sm p-6 space-y-4">
+        {declined ? (
+          <p className="text-sm text-zinc-700">{t("invitations.declined")}</p>
+        ) : member ? (
+          <>
+            <p className="text-sm text-zinc-700">
+              {t("invitations.alreadyMember", { org: orgLabel })}
+            </p>
+            <button
+              type="button"
+              onClick={open}
+              className="inline-block w-full px-4 py-2.5 bg-zinc-900 text-white rounded-md text-sm font-medium hover:bg-zinc-800 transition-colors"
+            >
+              {t("invitations.openOrg", { org: orgLabel })}
+            </button>
+          </>
+        ) : (
+          <>
+            <p className="text-sm text-zinc-600">
+              {t("invitations.joinExplanation", { org: orgLabel })}
+            </p>
+            <button
+              type="button"
+              onClick={join}
+              disabled={busy !== null}
+              className="inline-block w-full px-4 py-2.5 bg-zinc-900 text-white rounded-md text-sm font-medium hover:bg-zinc-800 disabled:opacity-50 transition-colors"
+            >
+              {busy === "join" ? t("invitations.joining") : t("invitations.join")}
+            </button>
+            <button
+              type="button"
+              onClick={decline}
+              disabled={busy !== null}
+              className="inline-block w-full px-4 py-2.5 border border-zinc-300 text-zinc-700 rounded-md text-sm font-medium hover:bg-zinc-50 disabled:opacity-50 transition-colors"
+            >
+              {busy === "decline" ? t("invitations.declining") : t("invitations.decline")}
+            </button>
+          </>
+        )}
+        {error && <p className="text-xs text-red-600">{error}</p>}
+      </div>
     </div>
   );
 }

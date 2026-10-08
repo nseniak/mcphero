@@ -1,15 +1,18 @@
 # Audit log
 
-Every tool call and every gateway connection event in your organization is logged. The **Audit** page is where you search them.
+Every tool call and every gateway connection event in your organization is logged, along with the account changes listed below. The **Audit** page is where you search them.
 
 ## What gets logged
 
 - **Tool call** — every tool call: who called what, how long it took, whether it succeeded, and whether the call was allowed or denied by your role policies.
 - **Connection** — when a team member's AI client connects or disconnects from the gateway.
+- **Account change** — when an admin invites a teammate, changes a teammate's role or removes a teammate; adds or removes an MCP; creates, renames or deletes a role; creates or revokes a service token; or disconnects a member from the gateway (the **Disconnect** button on the Gateway page). The same changes made through the Admin MCP are logged the same way. MCP Hero operator actions are logged too: changing your plan, signing a member out everywhere, clearing a member's sign-in to an MCP. A row made by an operator carries an **MCP Hero operator** tag next to the operator's email. Changes to what a role may use (its MCPs, tools and argument rules) are not logged here yet.
 
 Arguments and responses are deliberately **not** recorded. Tool arguments routinely carry API keys, tokens and customer data, so the log keeps the fact of the call and its outcome, never the values passed in or returned.
 
-Denied tool calls are logged too — the policy check happens before the call is forwarded, and the deny reason is recorded.
+Denied tool calls are logged too — the policy check happens before the call is forwarded, and the deny reason is recorded. A call that could not run because the MCP was not available (for example, the member has not signed in to it yet) is logged as an error, with the message the member saw.
+
+How far back you can search depends on your plan, and the same limit applies on this page and in the Admin MCP's audit search.
 
 ## Searching the log
 
@@ -22,10 +25,11 @@ The page shows the most recent entries first, capped at 100 per view. Filter usi
   - **All actions** (default)
   - **Tool call** — only tool calls
   - **Connection** — connect and disconnect events together
+  - **Account changes** — the account changes listed above
 
 Filters combine — they all have to match for an entry to appear.
 
-The columns are: **Time**, **Action**, **User**, **MCP**, **Tool / Details**, **Outcome**, **Latency**. The Tool/Details column shows the full tool name for tool calls, or the AI client type (Claude, ChatGPT, etc.) for connection events.
+The columns are: **Time**, **Action**, **User**, **MCP**, **Tool / Details**, **Outcome**, **Latency**. The Tool/Details column shows the full tool name for tool calls, the AI client type (Claude, ChatGPT, etc.) for connection events, or what changed and for whom for account changes.
 
 ## Live updates
 
@@ -38,4 +42,4 @@ Clicking pause doesn't stop logging — it just stops the dashboard from showing
 
 ## Operator access
 
-If you use the hosted MCP Hero, the people who operate the service have a limited support role that can step into your organization to help (for example, to investigate failing connections). That access is recorded, as are the reversible account actions an operator can take on your behalf. It can't read your secrets or your tool-call arguments. See [Operator access](operator-access.md) for the full picture.
+If you use the hosted MCP Hero, the people who operate the service have a limited support role that can step into your organization to help (for example, to investigate failing connections). That access is recorded on our side, and the operator actions listed above appear on this page, tagged **MCP Hero operator**. It can't read your secrets or your tool-call arguments. See [Operator access](operator-access.md) for the full picture.

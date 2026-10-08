@@ -15,18 +15,30 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from mcpolis.adapters.upstream_clients.client_manager import (
     UpstreamClientManager,
 )
+from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.services.upstream_connection_service import (
+    _refresh_upstream_in_background,  # pyright: ignore[reportPrivateUsage]
     SessionUnavailable,
     refresh_tools_in_background,
 )
+from mcpolis.domain.services.secret_scanner import HIDDEN_VALUE
 from tests.unit.factories import make_upstream_definition
+from tests.unit.test_connect_errors_hide_passwords import (
+    PASSWORD,
+    make_http_upstream,
+    make_status_error_text,
+    make_vars,
+)
 
 _ACQUIRE = (
     "mcpolis.domain.services.upstream_connection_service"
@@ -79,13 +91,15 @@ def _kick(
     reg: _FakeToolRegistry,
     on_success: Callable[[], Awaitable[None]],
     on_error: Callable[[str], Awaitable[None]],
+    client_manager: UpstreamClientManager | None = None,
+    upstream: UpstreamDefinition | None = None,
 ) -> "asyncio.Task[None]":
     return refresh_tools_in_background(
         org_id="o1",
-        upstream=make_upstream_definition(id="u1", command="npx"),
+        upstream=upstream or make_upstream_definition(id="u1", command="npx"),
         effective_user="",
         connection_store=None,
-        client_manager=cast(UpstreamClientManager, MagicMock()),
+        client_manager=client_manager or UpstreamClientManager([]),
         tool_registry=cast(ToolRegistry, reg),
         server_url="http://localhost:8000",
         on_success=on_success,
@@ -131,3 +145,84 @@ async def test_session_unavailable_is_formatted_for_the_banner() -> None:
         await _kick(reg, on_success, on_error)
     assert seen.get("error") == "could not reattach session: connect_failed"
     assert reg.unmarked == ["u1"]
+
+
+def make_refreshing_registry(refresh: AsyncMock) -> MagicMock:
+    registry = MagicMock()
+    registry.refreshing_started_at.return_value = None
+    registry.refresh_upstream = refresh
+    return registry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("refresh", "outcome"),
+    [
+        (AsyncMock(return_value=[]), None),
+        (AsyncMock(side_effect=RuntimeError("list_tools timed out")),
+         "list_tools timed out"),
+        (AsyncMock(side_effect=asyncio.CancelledError()),
+         "tool discovery was cancelled"),
+    ],
+)
+async def test_background_refresh_reports_the_discovery_outcome(
+    refresh: AsyncMock, outcome: str | None,
+) -> None:
+    """``on_discovery_done`` hears every outcome, a cancellation
+    included, so an Admin MCP sign-in never waits on a discovery that
+    ended."""
+    outcomes: list[str | None] = []
+
+    try:
+        await _refresh_upstream_in_background(
+            make_refreshing_registry(refresh), UpstreamClientManager([]), "u",
+            on_discovery_done=outcomes.append,
+        )
+    except asyncio.CancelledError:
+        pass
+
+    assert outcomes == [outcome]
+
+
+async def make_manager_holding_password(
+    tmp_path: Path,
+) -> tuple[UpstreamClientManager, UpstreamDefinition, str]:
+    """A manager that substituted ``PASSWORD`` into ``web``'s URL, and
+    the error httpx gives when that URL is refused."""
+    upstream = make_http_upstream("https://mcp.example.com/mcp?q=${PW}")
+    manager = UpstreamClientManager(
+        [upstream], template_var_repo=await make_vars(tmp_path, "web"),
+    )
+    resolved = await manager._resolve_upstream_template_vars(upstream)  # pyright: ignore[reportPrivateUsage]
+    assert resolved.http is not None
+    return manager, upstream, make_status_error_text(resolved.http.url)
+
+
+async def test_refresh_tools_error_carries_no_password(tmp_path: Path) -> None:
+    """Saved, audited and answered to the admin who clicked Refresh."""
+    manager, upstream, error = await make_manager_holding_password(tmp_path)
+    reg = _FakeToolRegistry()
+    seen, on_success, on_error = _make_callbacks()
+    with patch(
+        _ACQUIRE, new_callable=AsyncMock, side_effect=RuntimeError(error),
+    ), patch(_MIN, 0.0):
+        await _kick(reg, on_success, on_error, manager, upstream)
+    shown = cast(str, seen.get("error"))
+    assert "401 Unauthorized" in shown
+    assert HIDDEN_VALUE in shown
+    assert PASSWORD.split()[0] not in shown
+
+
+async def test_discovery_after_connect_reports_no_password(
+    tmp_path: Path,
+) -> None:
+    manager, upstream, error = await make_manager_holding_password(tmp_path)
+    outcomes: list[str | None] = []
+    await _refresh_upstream_in_background(
+        make_refreshing_registry(AsyncMock(side_effect=RuntimeError(error))),
+        manager, upstream.id,
+        on_discovery_done=outcomes.append,
+    )
+    [shown] = outcomes
+    assert shown is not None and HIDDEN_VALUE in shown
+    assert PASSWORD.split()[0] not in shown

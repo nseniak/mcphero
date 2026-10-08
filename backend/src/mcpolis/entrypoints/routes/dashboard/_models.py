@@ -10,14 +10,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from mcpolis.domain.model.settings import (
     ArgumentConstraint,
     McpAccessConfig,
     ToolAccessConfig,
 )
+from mcpolis.domain.model.template_var import TemplateVarSummary
 from mcpolis.domain.model.upstream import ServerInfo
+from mcpolis.domain.services.user_admin_service import UserStatus
 
 
 # --- Upstream summary / detail (admin tab listing + detail panel) ---
@@ -34,12 +36,13 @@ class UpstreamSummary(BaseModel):
     # (has a stored token row). The OAuth modes are deliberately
     # uniform here — Ready ⇔ admin authenticated.
     ready: bool
-    # Email of the admin currently providing readiness for either
-    # OAuth mode, or ``None`` for service_account / when no admin is
-    # signed in. Drives the admin tab's "Authenticated by alice@" +
-    # take-over UX. When multiple admins have rows for the same
-    # ``per_user_oauth`` upstream, the most-recently updated row wins
-    # so the displayed owner is stable across requests.
+    # Email of the admin whose saved sign-in serves either OAuth mode
+    # (and, while stopped, the one Start will reuse), or ``None`` for
+    # service_account / when no admin is signed in. Drives the admin
+    # tab's "Ready, by alice@" and Remove sign-in. When multiple admins
+    # have rows for the same ``per_user_oauth`` upstream, the
+    # most-recently updated row wins so the displayed owner is stable
+    # across requests.
     slot_owner: str | None
     tool_count: int
     # True while the post-connect catalog refresh (list_tools /
@@ -55,6 +58,11 @@ class UpstreamSummary(BaseModel):
     # came from the deleted lifecycle pill / state registry; pure
     # in-process truth, free to compute (no E2B round-trip).
     starting: bool = False
+    # True while an admin's Stop holds (it survives restarts) until an
+    # admin's Start. A stopped OAuth upstream whose admin sign-in Stop
+    # kept still names that admin in ``slot_owner``: Start reuses the
+    # sign-in, so the dashboard offers Connect rather than Authenticate.
+    stopped: bool = False
     url: str | None = None
     disconnect_reason: str | None = None
 
@@ -101,6 +109,8 @@ class UpstreamDetail(BaseModel):
     # "Starting…" across tab switches and reloads while a background
     # ``connect_upstream`` task is in flight.
     starting: bool = False
+    # See ``UpstreamSummary.stopped``.
+    stopped: bool = False
     url: str | None = None
     command: str | None = None
     client_id: str | None = None
@@ -170,7 +180,9 @@ class UserInfo(BaseModel):
     email: str
     role: str
     is_admin: bool
-    status: str = "active"  # "active" (signed in) or "pending" (pre-approved)
+    # No default: an "active" default is how the add answer once called
+    # a teammate who had never signed in "active".
+    status: UserStatus
 
 
 class RoleSummary(BaseModel):
@@ -231,6 +243,13 @@ class UserMcpInfo(BaseModel):
 
 
 # --- OAuth connect/reconnect responses (auth_connect + upstream_admin) ---
+
+
+class SignOutRequest(BaseModel):
+    """Remove sign-in: the admin whose sign-in the dashboard showed when
+    the admin confirmed."""
+
+    email: str
 
 
 class ConnectResponse(BaseModel):
@@ -294,18 +313,30 @@ class AddUpstreamTemplateVarSpec(BaseModel):
 class TemplateVarSummaryView(BaseModel):
     """Wire shape for a per-MCP template-variable summary.
 
-    Both kinds carry the plaintext ``value`` — the SPA obfuscates
-    password rows by default and exposes an eye toggle to reveal
-    (1Password-style). ``last_four`` is still populated for the
-    masked preview placeholder.
+    A password (``is_secret=True``) is write-only: ``value`` is always
+    ``None`` and ``has_value`` says whether a non-empty value is
+    saved. A plain variable carries its ``value``.
     """
 
     name: str
     is_secret: bool
     value: str | None
-    last_four: str | None
+    has_value: bool
     created_at: datetime
     updated_at: datetime
+
+    @classmethod
+    def from_summary(cls, summary: TemplateVarSummary) -> "TemplateVarSummaryView":
+        return cls(
+            name=summary.name,
+            is_secret=summary.is_secret,
+            # Repeats the builder's rule so a hand-built summary
+            # still can't put a password value on the wire.
+            value=None if summary.is_secret else summary.value,
+            has_value=summary.has_value,
+            created_at=summary.created_at,
+            updated_at=summary.updated_at,
+        )
 
 
 class SandboxFileSummaryView(BaseModel):
@@ -378,23 +409,40 @@ class AddUserRequest(BaseModel):
 class UpdateUpstreamTemplateVarSpec(BaseModel):
     """Per-entry shape inside ``UpdateUpstreamRequest.template_var_changes.sets``.
 
-    Mirrors :class:`AddUpstreamTemplateVarSpec` so the buffered create-wizard
-    payload and the deferred edit-page payload share a wire shape.
+    Same shape as :class:`AddUpstreamTemplateVarSpec`, plus the
+    "keep the saved value" form a write-only password needs, because
+    the dashboard never holds a saved password's value:
+
+    - ``value`` set: write this value.
+    - ``value=None``: keep the saved value of ``rename_from`` (a
+      rename) or, without ``rename_from``, of this same name (a
+      no-op). The source row must exist, else the save is rejected
+      with a 400.
+
+    ``value`` must be present (``null`` allowed) and unknown keys are
+    rejected: a client that forgets or misspells ``value`` gets a 422
+    instead of silently keeping the old credential.
     """
 
-    value: str
+    model_config = ConfigDict(extra="forbid")
+
+    value: str | None
     is_secret: bool = True
+    rename_from: str | None = None
 
 
 class UpdateUpstreamTemplateVarChanges(BaseModel):
     """Buffered env-var mutations the deferred Edit/Save flow flushes
     in the same request that updates the upstream config.
 
-    Validated up-front: a bad name or empty value rejects the whole
-    save with a 400 before any sub-mutation is applied. ``sets`` and
-    ``deletes`` may name the same key; ``deletes`` wins (the create
-    is dropped before apply, matching the user-visible "I added then
-    deleted in one session" intent).
+    Validated up-front: a bad name, or a "keep the saved value" entry
+    with nothing to keep, rejects the whole save with a 400 before any
+    sub-mutation is applied. Empty values are accepted.
+
+    A name in both ``sets`` and ``deletes`` replaces the saved row with
+    a new one: the old row is deleted right before the write, so the
+    new row gets the ``is_secret`` this save gives it. (A plain replace
+    keeps the stored row's flag.)
     """
 
     sets: dict[str, UpdateUpstreamTemplateVarSpec] = {}

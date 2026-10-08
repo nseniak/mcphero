@@ -22,25 +22,9 @@ from mcpolis.domain.model.settings import (
     SettingsConfig,
     UserDefinition,
 )
-from mcpolis.domain.ports.oauth_state_repository import (
-    OAuthStateRepository,
-    OAuthStateSnapshot,
-)
 from mcpolis.domain.services.policy_engine import PolicyEngine
+from tests.unit._gateway_oauth_store import InMemoryOAuthStateRepository
 from tests.unit.factories import make_runtime_manager
-
-
-class InMemoryOAuthStateRepository(OAuthStateRepository):
-    """Minimal in-memory stand-in: a single global snapshot."""
-
-    def __init__(self) -> None:
-        self._snapshot = OAuthStateSnapshot()
-
-    async def load(self) -> OAuthStateSnapshot:
-        return self._snapshot
-
-    async def save(self, snapshot: OAuthStateSnapshot) -> None:
-        self._snapshot = snapshot
 
 
 def make_provider(
@@ -146,6 +130,12 @@ async def test_callback_success_returns_redirect() -> None:
     provider = make_provider()
     client = make_client()
     await provider.register_client(client)
+    # Pre-approve this (user, client) so the callback forwards the code
+    # directly instead of parking at the consent gate (covered on its own
+    # in test_gateway_oauth_consent.py).
+    await provider.record_client_approval(
+        "alice@test.com", "test-client", "http://localhost:3000/callback"
+    )
     params = make_auth_params()
 
     await provider.authorize(client, params)

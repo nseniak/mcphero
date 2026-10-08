@@ -266,12 +266,13 @@ async def test_admin_oauth_no_admin_connected_returns_unavailable(
 
 
 @pytest.mark.asyncio
-async def test_admin_oauth_picks_most_recently_refreshed_admin(
+async def test_admin_oauth_uses_the_admin_sign_in_the_dashboard_shows(
     tmp_path: Path,
 ) -> None:
-    """When several admins have stored tokens, the pool returns the
-    one whose token was refreshed most recently — so a freshly
-    reconnected admin starts handling traffic right away."""
+    """When several admins have stored tokens, calls use the one the
+    admin tab shows (``slot_owner_of``: the last to sign in), so a
+    freshly signed-in admin starts handling traffic right away, and
+    Remove sign-in of the shown admin moves calls to the next one."""
     from datetime import UTC, datetime, timedelta
 
     router, client_manager, connection_store = make_oauth_tool_router(
@@ -286,14 +287,20 @@ async def test_admin_oauth_picks_most_recently_refreshed_admin(
             refresh_token=None,
             expires_at=None,
             scopes=[],
-            refresh_token_created_at=now - timedelta(hours=1),
+            # Refreshed and saved last, but signed in first: neither a
+            # refresh nor its save picks the slot, the last sign-in does.
+            refresh_token_created_at=now,
+            updated_at=now,
+            signed_in_at=now - timedelta(hours=2),
         ),
         "bob@co.com": InternalOAuthToken(
             access_token="bob",
             refresh_token=None,
             expires_at=None,
             scopes=[],
-            refresh_token_created_at=now,  # newer
+            refresh_token_created_at=now - timedelta(hours=2),
+            updated_at=now - timedelta(hours=1),
+            signed_in_at=now - timedelta(hours=1),  # the shown admin
         ),
     }
 

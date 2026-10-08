@@ -1,6 +1,8 @@
 """Google OAuth callback route — handles the redirect from Google after login."""
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 import structlog
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
@@ -9,6 +11,17 @@ from starlette.routing import Route
 from mcpolis.adapters.auth.mcp_gateway_oauth_provider import McpGatewayOAuthProvider
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
+
+
+def _loggable_redirect(redirect_url: str) -> str:
+    """Where the browser is sent, minus the query and any userinfo.
+
+    The query carries secrets: the consent token of a parked sign-in, or
+    the gateway authorization code on the client's redirect URI. Logs
+    reach Elastic, so they must never hold either.
+    """
+    parts = urlsplit(redirect_url)
+    return f"{parts.scheme}://{parts.hostname or ''}{parts.path}"
 
 
 async def _handle_google_callback(request: Request) -> Response:
@@ -42,7 +55,7 @@ async def _handle_google_callback(request: Request) -> Response:
         redirect_url = await provider.handle_google_callback(code, state)
         logger.info(
             "google.oauth.callback.success",
-            redirect_url_prefix=redirect_url[:100],
+            redirect_to=_loggable_redirect(redirect_url),
         )
         return RedirectResponse(url=redirect_url, status_code=302)
     except ValueError as e:

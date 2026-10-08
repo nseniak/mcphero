@@ -1,6 +1,6 @@
 """ServiceTokenOrgPinMiddleware unit tests against a synthetic ASGI app.
 
-The middleware reads ``auth_context_var`` (service-token scopes) and
+The middleware reads ``auth_context_var`` (a ``ServiceAccessToken``) and
 ``current_org_id`` (set by OrgContextMiddleware in production); both
 are set directly here.
 """
@@ -16,11 +16,7 @@ from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 
-from mcpolis.domain.model.service_token import (
-    SCOPE_ORG_PREFIX,
-    SCOPE_ROLE_PREFIX,
-    SCOPE_SVC,
-)
+from mcpolis.domain.model.service_token import ServiceAccessToken
 from mcpolis.domain.ports import DEFAULT_ORG_ID, MULTI_ORG_SENTINEL
 from mcpolis.entrypoints.controllers.gateway_controller import (
     current_org_id,
@@ -32,14 +28,12 @@ from mcpolis.entrypoints.middleware.service_token_pin import (
 
 def make_svc_user(org_id: str = "org-a", role: str = "reader") -> AuthenticatedUser:
     return AuthenticatedUser(
-        AccessToken(
+        ServiceAccessToken(
             token="svct_x",
             client_id="svc:ci-bot",
-            scopes=[
-                SCOPE_SVC,
-                SCOPE_ROLE_PREFIX + role,
-                SCOPE_ORG_PREFIX + org_id,
-            ],
+            scopes=[],
+            role_name=role,
+            org_id=org_id,
             expires_at=None,
         ),
     )

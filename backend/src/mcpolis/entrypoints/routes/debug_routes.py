@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from mcpolis.adapters.observability.analytics_client import AnalyticsClient
+from mcpolis.domain.model.email_allowlist import EmailAllowlist
 from mcpolis.domain.ports.email_sender import EmailSender
 
 
@@ -31,7 +32,7 @@ def create_debug_router(
     analytics: AnalyticsClient,
     email_sender: EmailSender,
     get_current_user: Callable[..., str],
-    superadmin_emails: set[str],
+    superadmin_emails: EmailAllowlist,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/debug", tags=["debug"])
 

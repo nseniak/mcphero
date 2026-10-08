@@ -12,6 +12,8 @@ from typing import Any, cast
 
 import structlog
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
+from mcpolis.domain.model.email_address import email_key
 from mcpolis.domain.ports import ADMIN_USER_ID
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
@@ -39,12 +41,17 @@ _PER_UPSTREAM_KEYS_NO_USER = (
 )
 
 
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    write_text_atomic(path, json.dumps(data, indent=2))
+
+
 def _prune_connections_file(
     path: Path,
-    valid_emails: set[str],
+    valid_keys: set[str],
     valid_upstream_ids: set[str],
 ) -> tuple[int, int]:
-    """Remove stale entries from connections.json.
+    """Remove stale entries from connections.json. ``valid_keys`` are the
+    ``email_key`` of every configured user.
 
     Returns (user_removed, upstream_removed).
     """
@@ -75,7 +82,7 @@ def _prune_connections_file(
             user_id = rest[colon + 1:]
             if upstream_id not in valid_upstream_ids:
                 upstream_removed.append(key)
-            elif user_id != ADMIN_USER_ID and user_id not in valid_emails:
+            elif user_id != ADMIN_USER_ID and email_key(user_id) not in valid_keys:
                 user_removed.append(key)
             break
         else:
@@ -91,12 +98,13 @@ def _prune_connections_file(
     for k in user_removed + upstream_removed:
         del data[k]
     if user_removed or upstream_removed:
-        path.write_text(json.dumps(data, indent=2))
+        _write_json_atomic(path, data)
     return (len(user_removed), len(upstream_removed))
 
 
-def _prune_oauth_state_file(path: Path, valid_emails: set[str]) -> int:
-    """Remove access/refresh tokens for users not in valid_emails. Returns # removed."""
+def _prune_oauth_state_file(path: Path, valid_keys: set[str]) -> int:
+    """Remove access/refresh tokens for users whose ``email_key`` is not in
+    valid_keys. Returns # removed."""
     if not path.exists():
         return 0
     try:
@@ -116,12 +124,12 @@ def _prune_oauth_state_file(path: Path, valid_emails: set[str]) -> int:
         for token_str in list(bucket.keys()):
             entry = bucket[token_str]
             email = entry.get("user_email")
-            if isinstance(email, str) and email not in valid_emails:
+            if isinstance(email, str) and email_key(email) not in valid_keys:
                 del bucket[token_str]
                 removed += 1
 
     if removed:
-        path.write_text(json.dumps(raw, indent=2))
+        _write_json_atomic(path, raw)
     return removed
 
 
@@ -136,15 +144,19 @@ def prune_data(
     Operates directly on JSON files, so it must be called BEFORE any store
     or OAuth provider loads them into memory.
 
+    Addresses compare ignoring letter case: a member invited as
+    ``Bob@Acme.com`` keeps the sign-ins saved under ``bob@acme.com``.
+
     ``org_id`` is accepted for API symmetry with the Mongo backend (Phase 2c)
     but is unused by the file implementation — the file layout is single-org.
     """
     del org_id  # unused in single-org file mode
+    valid_keys = {email_key(email) for email in valid_emails}
     user_removed, upstream_removed = _prune_connections_file(
-        data_dir / "connections.json", valid_emails, valid_upstream_ids
+        data_dir / "connections.json", valid_keys, valid_upstream_ids
     )
     oauth_removed = _prune_oauth_state_file(
-        data_dir / "oauth_state.json", valid_emails
+        data_dir / "oauth_state.json", valid_keys
     )
     logger.info(
         "data.prune.completed",

@@ -14,8 +14,8 @@ class AuthMode(StrEnum):
 class UpstreamAuthConfig(BaseModel):
     mode: AuthMode
 
-    # For service_account
-    token: str | None = None
+    # No service_account token field: the token lives in the transport
+    # config the stores persist (see ``with_service_account_token``).
 
     # For OAuth modes (admin_oauth/per_user_oauth)
     client_id: str | None = None

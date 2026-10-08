@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 
 import httpx
 import structlog
@@ -44,6 +44,9 @@ from mcpolis.domain.ports.template_var_repository import TemplateVarRepository
 from mcpolis.domain.ports.sandbox_persistence_repository import (
     SandboxPersistenceRepository,
 )
+from mcpolis.domain.services.background_tasks import BackgroundTaskSet
+from mcpolis.domain.services.backoff import Backoff
+from mcpolis.domain.services.sign_in_refresh_lock import SignInRefreshLock
 from mcpolis.domain.services.system_variables import (
     DEFAULT_SANDBOX_HOME,
     system_variables_for_sandbox,
@@ -56,6 +59,8 @@ from mcpolis.domain.services.template_var_substitution import (
     substitute_string,
 )
 from mcpolis.domain.services.sandbox_resolver import SandboxResolver
+from mcpolis.domain.services.secret_scanner import hide_secrets_in_error
+from mcpolis.domain.services.upstream_health_check import SignInWarner
 from mcpolis.domain.services.upstream_runtime_hash import (
     compute_upstream_runtime_hash,
 )
@@ -92,7 +97,33 @@ ConnectionTask = SandboxConnectionTask | HttpConnectionTask
 
 class UpstreamStopped(ConnectAborted):
     """An admin stopped this upstream, and only their Start opens it
-    again. A tool call gets "not available" instead of starting it."""
+    again, or removed it. A tool call gets "not available" instead of
+    starting it."""
+
+
+# How often a reconnect may force a token refresh the upstream's 401
+# skipped (``upstream_connection_service._reconnect_after_forced_refresh``),
+# per sign-in: at once, then 1, 2, 4, 8 and 16 minutes after each forced
+# refresh, then every 30 minutes, until a session works again. The forced
+# refresh rescues a sign-in from a short burst of 401s; an upstream that
+# still refuses the bearer it just issued gains nothing from more of
+# them, and each one spends a refresh grant, once per tool call before.
+# By 30 minutes the five failures and half hour after which a reconnect
+# deletes the sign-in (``MAX_CONSECUTIVE_TRANSIENT_FAILURES``,
+# ``MIN_TRANSIENT_FAILURE_WINDOW_SECONDS``) are near.
+FORCED_REFRESH_FIRST_DELAY_SECONDS = 60.0
+FORCED_REFRESH_MAX_DELAY_SECONDS = 30 * 60.0
+# A sign-in as that backoff keys it: (upstream, user, sign-in id). A new
+# sign-in of the same person starts over.
+ForcedRefreshKey = tuple[str, str, str | None]
+
+
+# How long ``stop_all`` waits for the connects it aborted and the jobs it
+# cancelled to wind down. What is still running then stays held, and the
+# shutdown's last wait (``drain_every_set``) covers it: a sandbox create
+# a Stop abandoned must land, and record its sandbox, before the stores
+# close.
+STOP_ALL_WAIT_SECONDS = 5.0
 
 
 def _resources_for(upstream: UpstreamDefinition) -> SandboxResources:
@@ -159,7 +190,8 @@ class UpstreamClientManager:
     The state record's only mutation surface is the
     ``transition_to_*`` methods (``transition_to_disabled``,
     ``transition_to_failed``, ``transition_to_deferred_attach``,
-    ``transition_to_connecting``, ``transition_to_live_shared``) plus
+    ``transition_to_connecting``, ``transition_to_live_shared``,
+    ``transition_out_of_disabled``, ``mark_saved_stops``) plus
     the close helper ``_close_shared_inplace``. External
     code should never poke ``_state`` directly — every reader has a
     typed accessor (``is_connected``, ``is_starting``,
@@ -245,6 +277,11 @@ class UpstreamClientManager:
         self._user_tasks: dict[tuple[str, str], ConnectionTask] = {}
         self._user_session_last_used: dict[tuple[str, str], float] = {}
         self._sweep_task: asyncio.Task[None] | None = None
+        # Jobs this manager runs or tracks without awaiting them (the
+        # close of a replaced connection, the admin's Start), held until
+        # each ends: the event loop alone would let them be
+        # garbage-collected mid-flight.
+        self._background_tasks = BackgroundTaskSet()
         # One connect at a time per ``(user, upstream)``. This used to be
         # a lock, which SERIALISED concurrent connects: the second caller
         # waited, then began its own connect by closing the session the
@@ -264,6 +301,10 @@ class UpstreamClientManager:
         # Storage + lifecycle live behind the ``LogBufferRegion``
         # facade (internal/plans/manager-region-split.md, Phase 1).
         self.log_buffers = LogBufferRegion()
+        # Every password Variable value substituted into each upstream
+        # since it was registered, so an error that quotes its URL or
+        # command can be shown without them (``hide_secrets_in_error``).
+        self._substituted_passwords: dict[str, frozenset[str]] = {}
 
         # ── Orthogonal: one shared connect at a time per upstream ──
         # Every shared-session connect runs here: the lazy attach on a
@@ -282,6 +323,24 @@ class UpstreamClientManager:
             "shared", lambda upstream_id: {"upstream_id": upstream_id},
         )
 
+        # ── Orthogonal: an admin's Stop and Start, one at a time ──
+        # Both write the saved state and this manager's state. Run
+        # side by side, the two writes of one could land around the
+        # other's, leaving the app running what storage says is stopped
+        # (or the reverse), until the next restart flips it. A removal
+        # holds it too. Connects never take this lock: a Stop still
+        # aborts them.
+        self._stop_start_locks: dict[str, asyncio.Lock] = {}
+
+        # ── Orthogonal: upstreams an admin removed ─────────────────
+        # Removal drops the state record, so a removed upstream must not
+        # read as "never connected" (which any caller may connect): a
+        # Start, a tool call's reconnect or a boot step still holding its
+        # definition brought it back, with a new sandbox, and nothing
+        # could stop it afterwards. It counts as stopped until it is
+        # added again (``register_upstream``).
+        self._removed: set[str] = set()
+
         # Optional callbacks invoked when an upstream reports that its
         # tools / resources / prompts list has changed. Wired from above
         # (org runtime) so the notifier/registry layers stay decoupled
@@ -289,8 +348,49 @@ class UpstreamClientManager:
         self._on_upstream_tools_changed: OnUpstreamToolsChanged | None = None
         self._on_upstream_resources_changed: OnUpstreamResourcesChanged | None = None
         self._on_upstream_prompts_changed: OnUpstreamPromptsChanged | None = None
+        # Who to email when a reconnect deletes a sign-in the upstream
+        # refused (§5.2). Wired from above (org runtime); None while
+        # health emails are off.
+        self._sign_in_warner: SignInWarner | None = None
+        # One refresh of a sign-in's tokens at a time: this manager's
+        # reconnects and the periodic refresh of this org take it. Wired
+        # from above (org runtime) to the app's lock, which also holds the
+        # distributed lock in cloud mode; this one serves a manager built
+        # on its own.
+        self._sign_in_refresh_lock = SignInRefreshLock()
+        # When a reconnect may force a refresh the upstream's 401 skipped,
+        # per sign-in (upstream, user, sign-in id); see
+        # ``FORCED_REFRESH_FIRST_DELAY_SECONDS``.
+        self._forced_refresh_backoff: Backoff[ForcedRefreshKey] = (
+            Backoff(
+                first_delay_seconds=FORCED_REFRESH_FIRST_DELAY_SECONDS,
+                max_delay_seconds=FORCED_REFRESH_MAX_DELAY_SECONDS,
+            )
+        )
 
     # ── Notification callback wiring ──────────────────────────────
+
+    def set_sign_in_warner(self, warner: SignInWarner | None) -> None:
+        """Register who a reconnect warns after deleting a refused
+        sign-in. Read at each reconnect, so it applies at once."""
+        self._sign_in_warner = warner
+
+    @property
+    def sign_in_warner(self) -> SignInWarner | None:
+        return self._sign_in_warner
+
+    def set_sign_in_refresh_lock(self, lock: SignInRefreshLock) -> None:
+        """Share ``lock`` with the periodic refresh (see
+        ``SignInRefreshLock``). Read at each reconnect."""
+        self._sign_in_refresh_lock = lock
+
+    @property
+    def sign_in_refresh_lock(self) -> SignInRefreshLock:
+        return self._sign_in_refresh_lock
+
+    @property
+    def forced_refresh_backoff(self) -> Backoff[ForcedRefreshKey]:
+        return self._forced_refresh_backoff
 
     def set_on_upstream_tools_changed(
         self, callback: OnUpstreamToolsChanged | None,
@@ -405,6 +505,50 @@ class UpstreamClientManager:
             return UpstreamConnectionState.DISABLED
         return UpstreamConnectionState.FAILED
 
+    def _keeps_stop(self, upstream_id: str, refused: str, reason: str) -> bool:
+        """Whether a transition to ``refused`` must leave the upstream as
+        it is because an admin stopped or removed it.
+
+        Only an admin's Start leaves a Stop (``transition_to_connecting``,
+        ``transition_out_of_disabled``), and nothing brings back a removed
+        upstream but adding it again. The other transitions report what a
+        step that began earlier found: boot reads the saved Stops once,
+        then reads each hosted MCP's cached sandbox ref, and its
+        DEFERRED_ATTACH ("Ready") or FAILED, written after a Stop that
+        landed meanwhile, used to undo it, so the next tool call opened a
+        sandbox for a stopped MCP."""
+        if not self.is_stopped(upstream_id):
+            return False
+        self._log_transition_skipped(
+            upstream_id, refused, reason,
+            kept="removed" if self.is_removed(upstream_id) else "disabled",
+        )
+        return True
+
+    def _keeps_in_use(self, upstream_id: str, refused: str, reason: str) -> bool:
+        """Whether a boot step's transition to ``refused`` must leave the
+        upstream as it is because it is in use (``is_in_use``).
+
+        Boot reads an MCP's cached sandbox ref before it marks it, and a
+        tool call or an admin's Start can open the MCP meanwhile: the
+        check is made here, in the same step as the write."""
+        if not self.is_in_use(upstream_id):
+            return False
+        self._log_transition_skipped(upstream_id, refused, reason, kept="in_use")
+        return True
+
+    @staticmethod
+    def _log_transition_skipped(
+        upstream_id: str, refused: str, reason: str, *, kept: str,
+    ) -> None:
+        logger.info(
+            "upstream.state.transition_skipped",
+            upstream_id=upstream_id,
+            to_state=refused,
+            reason=reason,
+            kept=kept,
+        )
+
     async def _safe_close_task(
         self,
         task: ConnectionTask | None,
@@ -470,8 +614,13 @@ class UpstreamClientManager:
         - an upstream the admin just added or imported, which starts
           stopped.
 
-        Only an admin's Start opens a DISABLED service_account upstream
-        again (see ``_refuse_if_stopped``).
+        Only an admin's Start opens a DISABLED upstream again (see
+        ``_refuse_if_stopped``).
+
+        Closes every user's session too, and stops their running connects:
+        each of these is a stop, so none may leave a session serving calls.
+        At boot this matters: a member's call can open a session before
+        startup re-applies a saved Stop.
 
         Drops cached metadata too: a DISABLED upstream has no live
         session AND should not be served from cache (the admin
@@ -496,7 +645,13 @@ class UpstreamClientManager:
         # A tool call that arrives after this is refused until Start (see
         # ``_refuse_if_stopped``).
         aborted = self._shared_flights.abort(upstream_id)
-        await self._drain_state_resources(upstream_id, old)
+        user_aborted, user_tasks = self._detach_user_slots(
+            lambda key: key[1] == upstream_id,
+        )
+        await asyncio.gather(
+            self._drain_state_resources(upstream_id, old),
+            self._close_user_tasks(user_tasks, user_aborted),
+        )
         if aborted is not None:
             await _wait_until_unwound([aborted])
         # Drained state may have left a persisted live ref behind —
@@ -513,7 +668,8 @@ class UpstreamClientManager:
         last_failure: str | None = None,
         reason: str = "connect_failed",
         cancel_background: bool = True,
-    ) -> None:
+        unless_in_use: bool = False,
+    ) -> bool:
         """Tear down all sessions, mark the upstream FAILED.
 
         Distinct from DISABLED: FAILED says "we tried, it didn't
@@ -531,7 +687,20 @@ class UpstreamClientManager:
         tracked. For a failure the Start shares: it is waiting on the same
         connect and will record the failure itself; cancelling it would
         make it read as a Stop and drop the error.
+
+        A stopped (or removed) upstream stays so: a failure reported by a
+        step that began before the Stop (boot, a connect) must not undo
+        it (see ``_keeps_stop``).
+
+        ``unless_in_use`` (boot's steps) leaves an upstream in use as it
+        is, too (see ``is_in_use``).
+
+        Returns whether it was applied.
         """
+        if self._keeps_stop(upstream_id, "failed", reason):
+            return False
+        if unless_in_use and self._keeps_in_use(upstream_id, "failed", reason):
+            return False
         old = self._state.get(upstream_id)
         new = UpstreamState(
             state=UpstreamConnectionState.FAILED,
@@ -554,6 +723,7 @@ class UpstreamClientManager:
         await self._drain_state_resources(
             upstream_id, old, cancel_background=cancel_background,
         )
+        return True
 
     async def compute_runtime_hash(
         self, upstream: UpstreamDefinition,
@@ -650,7 +820,8 @@ class UpstreamClientManager:
         server_info: ServerInfo,
         self_description: UpstreamSelfDescription,
         started_config_hash: str | None = None,
-    ) -> None:
+        unless_in_use: bool = False,
+    ) -> bool:
         """Mark the upstream DEFERRED_ATTACH with cached metadata.
 
         From the user's POV the upstream is Ready — the cache
@@ -661,7 +832,18 @@ class UpstreamClientManager:
         Tears down any prior sessions: DEFERRED_ATTACH means "no
         live session, only cache." Used at boot when persistence
         carries the cached fields.
+
+        Returns whether it was applied: a Stop (or a removal) that landed
+        while boot read the cache wins (see ``_keeps_stop``), and so, with
+        ``unless_in_use`` (boot), does a session or a Start that a request
+        opened meanwhile (see ``is_in_use``).
         """
+        if self._keeps_stop(upstream_id, "deferred_attach", "boot_cache"):
+            return False
+        if unless_in_use and self._keeps_in_use(
+            upstream_id, "deferred_attach", "boot_cache",
+        ):
+            return False
         old = self._state.get(upstream_id)
         new = UpstreamState(
             state=UpstreamConnectionState.DEFERRED_ATTACH,
@@ -680,6 +862,7 @@ class UpstreamClientManager:
             UpstreamConnectionState.DEFERRED_ATTACH,
         )
         await self._drain_state_resources(upstream_id, old)
+        return True
 
     def transition_to_connecting(
         self,
@@ -785,7 +968,7 @@ class UpstreamClientManager:
             and old.shared_task is not None
             and old.shared_task is not task
         ):
-            asyncio.create_task(
+            self._background_tasks.spawn(
                 self._safe_close_task(old.shared_task, "shared", upstream_id),
                 name=f"close_orphan_shared_{upstream_id}",
             )
@@ -890,7 +1073,10 @@ class UpstreamClientManager:
           goes through the sandbox auto_resume),
         - persistence isn't wired,
         - no ref exists yet (first-ever boot for this upstream),
-        - ref pre-dates the metadata-cache feature.
+        - ref pre-dates the metadata-cache feature,
+        - an admin stopped or removed the upstream while the ref was read,
+        - the upstream is in use (``is_in_use``): a request reached it
+          first, and its session or Start must not be closed.
         """
         if upstream.auth.mode != AuthMode.service_account:
             return False
@@ -905,12 +1091,16 @@ class UpstreamClientManager:
         # state has drifted since boot, the dashboard's dirty banner
         # fires on first read.
         started_config_hash = await self.compute_runtime_hash(upstream)
-        await self.transition_to_deferred_attach(
+        if not await self.transition_to_deferred_attach(
             upstream.id,
             server_info=server_info,
             self_description=self_description,
             started_config_hash=started_config_hash,
-        )
+            unless_in_use=True,
+        ):
+            # Stopped, removed or opened while the cache was read: no
+            # deferral.
+            return False
         await self._persist_started_config_hash(
             upstream.id, started_config_hash,
         )
@@ -1009,12 +1199,19 @@ class UpstreamClientManager:
             return_exceptions=True,
         )
 
-    async def stop_all(self) -> None:
+    async def stop_all(self, *, wait: float = STOP_ALL_WAIT_SECONDS) -> None:
         """Tear down every session. Manager is unusable afterwards.
 
-        Iterates the per-user dicts (shared sessions are inside the
-        state record, so a single pass over ``_state`` drains them via
-        ``_drain_state_resources``).
+        Every job this manager runs is cancelled (an admin's Start still
+        refreshing tools after its connect landed used to record a
+        success for a server the shutdown had just closed, into a store
+        about to close), no new one starts, and every session closes at
+        once, the way Stop closes them (each close can take its full
+        timeout; one by one, a few of them outlasted the shutdown).
+
+        Then waits up to ``wait`` seconds for the cancelled jobs and the
+        aborted connects to wind down. What still runs stays held, for the
+        shutdown's last wait (``drain_every_set``).
         """
         # Cancel sweep task
         if self._sweep_task is not None:
@@ -1022,43 +1219,50 @@ class UpstreamClientManager:
             self._sweep_task = None
 
         # Stop connects still in flight and refuse new ones, so none lands
-        # a session after the teardown below. Bounded: shutdown must not
-        # hang on one. Cancel the admins' Starts first, in the same step,
-        # so they read as cancelled rather than as failed connects that
-        # record an error.
+        # a session after the teardown below. Cancel the admins' Starts,
+        # and every other job, first, in the same step, so the Starts read
+        # as cancelled rather than as failed connects that record an error.
         for state in self._state.values():
             if state.background_task is not None:
                 state.background_task.cancel()
+        self._background_tasks.cancel_all()
         aborted = self._shared_flights.shut_down() + self._user_flights.shut_down()
-        if aborted:
-            await asyncio.wait(aborted, timeout=5.0)
+        # Held until they wind down: an aborted connect still creating its
+        # sandbox finishes that first, and records the sandbox kept for the
+        # next boot, which must happen before the stores close.
+        for flight in aborted:
+            self._background_tasks.hold(flight)
+        self._background_tasks.refuse_new_jobs()
 
-        # Clean up per-user sessions (orthogonal storage).
-        for key, task in list(self._user_tasks.items()):
-            try:
-                await task.close()
-            except BaseException:
-                user_id, upstream_id = key
-                logger.warning(
-                    "upstream.client.user_task.close.failed_ignored",
-                    upstream_id=upstream_id,
-                    user=user_id,
-                )
-        self._user_sessions.clear()
-        self._user_tasks.clear()
+        _, user_tasks = self._detach_user_slots(lambda _key: True)
+        user_tasks += [
+            (key, self._user_tasks.pop(key)) for key in list(self._user_tasks)
+        ]
         self._user_session_last_used.clear()
-
-        # Clean up upstream-level state (shared tasks live in the
-        # state record).
-        for upstream_id, state in list(self._state.items()):
-            try:
-                await self._drain_state_resources(upstream_id, state)
-            except BaseException:
-                logger.warning(
-                    "upstream.client.state.drain.failed_ignored",
-                    upstream_id=upstream_id,
-                )
+        states = list(self._state.items())
         self._state.clear()
+        await asyncio.gather(
+            self._close_user_tasks(user_tasks, []),
+            *(
+                self._drain_state_resources_quietly(upstream_id, state)
+                for upstream_id, state in states
+            ),
+        )
+        await self._background_tasks.drain(wait)
+
+    async def _drain_state_resources_quietly(
+        self, upstream_id: str, state: UpstreamState,
+    ) -> None:
+        """``_drain_state_resources`` for the teardown: a failure is
+        logged, never raised, so the other sessions still close."""
+        try:
+            await self._drain_state_resources(upstream_id, state)
+        except Exception:
+            logger.warning(
+                "upstream.client.state.drain.failed_ignored",
+                upstream_id=upstream_id,
+                exc_info=True,
+            )
 
     async def _resolve_sandbox_files(
         self,
@@ -1126,6 +1330,15 @@ class UpstreamClientManager:
                 ),
             )
         return materialized
+
+    def hide_secrets_in_error(self, upstream_id: str, text: str) -> str:
+        """``text``, an error from connecting ``upstream_id`` or listing
+        its tools, as an admin or member may see it: without the password
+        Variables ever substituted into that upstream, nor what looks like
+        a credential (``secret_scanner.hide_secrets_in_error``)."""
+        return hide_secrets_in_error(
+            text, self._substituted_passwords.get(upstream_id, frozenset()),
+        )
 
     async def _resolve_upstream_template_vars(
         self,
@@ -1212,31 +1425,42 @@ class UpstreamClientManager:
             # as ``None`` so substitute_string raises MissingTemplateVarError.
             return resolved.get(name)
 
-        # Refresh the per-upstream log-redaction set so the next
-        # stderr write that includes a substituted secret value is
+        # Remember which substituted values are passwords: an error
+        # quoting the URL or command is shown without them, and on a
+        # stdio upstream every stderr write that includes one is
         # masked as ``[REDACTED:NAME]`` before it lands in the
         # operator's Server-logs panel. Plain (is_secret=false)
-        # values are operator-visible by design and not redacted.
+        # values are operator-visible by design and not hidden.
         # We only consult ``list_summaries`` for the secret flags;
         # values come from the resolution above. List call is cheap
         # (in-memory file repo / single Mongo query).
-        if upstream.transport == TransportType.stdio and referenced:
+        if referenced:
             try:
                 summaries = await self._template_var_repo.list_summaries(
                     self._org_id, upstream.id,
                 )
+                password_names = {s.name for s in summaries if s.is_secret}
             except Exception:
-                # Listing must not block session start; without
-                # redaction the buffer captures plaintext, which is
-                # the pre-existing behaviour.
-                summaries = []
-            secret_names = {s.name for s in summaries if s.is_secret}
+                # Listing must not block session start. Without the
+                # flags, every substituted user Variable counts as a
+                # password: hiding a plain value costs nothing, showing
+                # a password can't be undone.
+                password_names = set(resolved) - set(sys_vars)
             redactions = {
                 value: name
                 for name, value in resolved.items()
-                if value is not None and name in secret_names
+                if value is not None and name in password_names
             }
-            self.log_buffers.set_redactions(upstream.id, redactions)
+            # Added to, never replaced: a save doesn't close a running
+            # session, so an error from one built with an older value
+            # (before a rotation, or before ``${NAME}`` was edited out)
+            # must still hide it. Dropped when the upstream is removed.
+            self._substituted_passwords[upstream.id] = (
+                self._substituted_passwords.get(upstream.id, frozenset())
+                | frozenset(redactions)
+            )
+            if upstream.transport == TransportType.stdio:
+                self.log_buffers.set_redactions(upstream.id, redactions)
 
         new_stdio: StdioTransportConfig | None = upstream.stdio
         new_http: HttpTransportConfig | None = upstream.http
@@ -1512,26 +1736,110 @@ class UpstreamClientManager:
         """Keep a stopped upstream stopped.
 
         Stop marks the upstream DISABLED, and only the admin's Start may
-        open it again; Start moves it to CONNECTING before it connects.
-        Anything else that would reopen it (a tool call's lazy attach, a
-        heal, a delayed tool refresh) used to start it right back up, and
-        a sandbox with it, minutes after the admin stopped it.
+        open it again: for service_account Start moves it to CONNECTING
+        before it connects, for the OAuth modes it calls
+        ``transition_out_of_disabled``.
+        Anything else that would reopen it (a tool call's lazy attach or
+        stored-token reconnect, a heal, a delayed tool refresh) used to
+        start it right back up minutes after the admin stopped it.
 
-        service_account only. OAuth tool calls run on each user's own
-        session, not this one, and an OAuth upstream can still read
-        DISABLED here after an admin signs in again, until the next
-        restart.
+        Guards the shared session and every per-user one: Stop keeps the
+        saved sign-ins, so without this a member's next call would
+        reconnect from theirs.
+
+        A removed upstream is refused the same way, for good: anything
+        still holding its definition (a Start, a tool call's reconnect, a
+        delayed refresh) used to open it again in a new sandbox.
         """
-        state = self._state.get(upstream.id)
-        if (
-            upstream.auth.mode == AuthMode.service_account
-            and state is not None
-            and state.state == UpstreamConnectionState.DISABLED
-        ):
+        if self.is_removed(upstream.id):
+            raise UpstreamStopped(f"upstream {upstream.id!r} was removed")
+        if self.is_stopped(upstream.id):
             raise UpstreamStopped(
                 f"upstream {upstream.id!r} is stopped; an admin's Start "
                 "opens it again",
             )
+
+    def is_stopped(self, upstream_id: str) -> bool:
+        """True iff an admin stopped the upstream (or it was added and not
+        started yet), until an admin's Start; or removed it, until it is
+        added again."""
+        if upstream_id in self._removed:
+            return True
+        state = self._state.get(upstream_id)
+        return (
+            state is not None
+            and state.state == UpstreamConnectionState.DISABLED
+        )
+
+    def is_removed(self, upstream_id: str) -> bool:
+        """True iff an admin removed the upstream (``unregister_upstream``)
+        and nobody added it again since."""
+        return upstream_id in self._removed
+
+    def stop_count(self, upstream_id: str) -> int:
+        """How many times the upstream was stopped so far: a Stop, a
+        removal, a restarting Start's own Stop (each one closes the shared
+        session, see ``transition_to_disabled``). A step that must know
+        whether one landed while it ran reads this first, then asks
+        ``stopped_since``."""
+        return self._shared_flights.abort_count(upstream_id)
+
+    def stopped_since(self, upstream_id: str, count: int) -> bool:
+        """Whether the upstream was stopped after ``stop_count`` read
+        ``count``. Unlike ``is_stopped``, still true once a later Start
+        has lifted that Stop: the session the Stop closed stays closed."""
+        return self._shared_flights.aborted_since(upstream_id, count)
+
+    def stop_start_lock(self, upstream_id: str) -> asyncio.Lock:
+        """The lock an admin's Stop, Start and removal of ``upstream_id``
+        hold while they write the saved state and this manager's state."""
+        lock = self._stop_start_locks.get(upstream_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._stop_start_locks[upstream_id] = lock
+        return lock
+
+    def mark_saved_stops(self, upstream_ids: Iterable[str]) -> None:
+        """Mark DISABLED the upstreams an admin stopped before a restart,
+        as the runtime is built and before it serves anything: no session
+        exists yet, so nothing needs closing. Startup later runs the full
+        ``transition_to_disabled`` for them (sandbox clean-up)."""
+        for upstream_id in upstream_ids:
+            if upstream_id not in self._upstreams or self.is_stopped(upstream_id):
+                continue
+            old = self._state.get(upstream_id)
+            self._state[upstream_id] = UpstreamState(
+                state=UpstreamConnectionState.DISABLED,
+            )
+            self._log_transition(
+                upstream_id,
+                old.state if old is not None else None,
+                UpstreamConnectionState.DISABLED,
+                reason="saved_stop",
+            )
+
+    def transition_out_of_disabled(self, upstream_id: str) -> None:
+        """An admin's Start of an OAuth upstream: lift the stop so the
+        sessions can open again, from the saved sign-ins.
+
+        OAuth upstreams have no Start connect to move them out of
+        DISABLED (service_account goes through CONNECTING), so the
+        state goes back to the one ``register_upstream`` gives: no shared
+        session, no failure. A no-op on an upstream that is not stopped,
+        and on a removed one (it has no state to lift).
+        """
+        state = self._state.get(upstream_id)
+        if state is None or state.state != UpstreamConnectionState.DISABLED:
+            return
+        self._state[upstream_id] = UpstreamState(
+            state=UpstreamConnectionState.FAILED, last_failure=None,
+        )
+        self._log_transition(
+            upstream_id,
+            UpstreamConnectionState.DISABLED,
+            UpstreamConnectionState.FAILED,
+            reason="admin_start",
+        )
 
     async def reconnect_shared_fresh(
         self,
@@ -1774,6 +2082,15 @@ class UpstreamClientManager:
         service = self._sandbox_services[provider]
         return service.capabilities()
 
+    async def validate_sandbox_resources(
+        self, resources: SandboxResources,
+    ) -> None:
+        """Raise ``ResourcesUnsupported`` when the provider selected for
+        this manager's org cannot run ``resources`` — the same check
+        ``session()`` applies at start, run up front at save time."""
+        provider = await self._sandbox_resolver.resolve(org_id=self._org_id)
+        self._sandbox_services[provider].validate_resources(resources)
+
     async def kill_persisted_session_for_upstream(
         self, upstream_id: str,
     ) -> None:
@@ -1957,8 +2274,12 @@ class UpstreamClientManager:
         """The user's own live session on ``upstream_id``, or ``None``.
 
         Never falls back to the shared session (see ``get_session``).
-        Marks the session used, so the idle sweep keeps it.
+        Marks the session used, so the idle sweep keeps it. ``None`` on a
+        stopped upstream, whatever is still recorded: the caller then
+        connects, and is refused (``_refuse_if_stopped``).
         """
+        if self.is_stopped(upstream_id):
+            return None
         key = (user_id, upstream_id)
         session = self._user_sessions.get(key)
         if session is None:
@@ -2000,6 +2321,10 @@ class UpstreamClientManager:
         key = self._user_key(upstream, user_id)
 
         async def body() -> ClientSession:
+            # Before the token refresh: a call on a stopped upstream gets
+            # no session and does not refresh the sign-in kept for Start.
+            # (The periodic refresh still keeps that sign-in alive.)
+            self._refuse_if_stopped(upstream)
             # Read as the connect starts, before any token refresh: an
             # abort from here on discards what it builds.
             aborts_at_start = self._user_flights.abort_count(key)
@@ -2042,6 +2367,7 @@ class UpstreamClientManager:
         key = self._user_key(upstream, user_id)
 
         async def body() -> ClientSession:
+            self._refuse_if_stopped(upstream)
             return await self._open_user_session(
                 upstream, user_id, auth=auth, bearer_token=bearer_token,
                 aborts_at_start=self._user_flights.abort_count(key),
@@ -2143,8 +2469,11 @@ class UpstreamClientManager:
         otherwise FAILED / DISABLED at the org level: we still want
         to capture the metadata for diagnostics / future cache-reads,
         but we don't want the per-user activity to silently flip
-        the upstream into LIVE / DEFERRED_ATTACH.
+        the upstream into LIVE / DEFERRED_ATTACH. Nor give a removed
+        upstream a state record again.
         """
+        if self.is_removed(upstream_id):
+            return
         state = self._state.get(upstream_id)
         if state is None:
             self._state[upstream_id] = UpstreamState(
@@ -2211,26 +2540,12 @@ class UpstreamClientManager:
         return True
 
     async def _drop_user_session(self, key: tuple[str, str]) -> None:
-        user_id, upstream_id = key
         had_session = key in self._user_sessions
         self._user_sessions.pop(key, None)
         self._user_session_last_used.pop(key, None)
         task = self._user_tasks.pop(key, None)
-        if task is not None:
-            try:
-                await task.close()
-            except Exception:
-                logger.exception(
-                    "upstream.client.user_task.close.failed",
-                    upstream_id=upstream_id,
-                    user=user_id,
-                )
-        if had_session:
-            logger.info(
-                "upstream.client.user_session.closed",
-                upstream_id=upstream_id,
-                user=user_id,
-            )
+        if had_session or task is not None:
+            await self._close_user_task(key, task)
 
     async def disconnect_all_user_sessions(self, user_id: str) -> int:
         """Tear down all of a user's sessions (the user left the org),
@@ -2248,12 +2563,61 @@ class UpstreamClientManager:
         stop the connects still running for them, drop their sessions, and
         return once the stopped connects have let go of their transport.
         Returns the number of sessions dropped."""
+        aborted, tasks = self._detach_user_slots(matches)
+        await self._close_user_tasks(tasks, aborted)
+        return len(tasks)
+
+    def _detach_user_slots(
+        self, matches: Callable[[tuple[str, str]], bool],
+    ) -> tuple[
+        list[asyncio.Task[ClientSession]],
+        list[tuple[tuple[str, str], ConnectionTask | None]],
+    ]:
+        """First half of a teardown, with no await: stop the connects
+        running for the slots ``matches`` selects and take their sessions
+        out of the manager, so no call can pick one up any more. Returns
+        the stopped connects and the detached sessions' tasks, for
+        ``_close_user_tasks``."""
         aborted = self._user_flights.abort_matching(matches)
-        keys = [k for k in self._user_sessions if matches(k)]
-        for key in keys:
-            await self._drop_user_session(key)
+        detached: list[tuple[tuple[str, str], ConnectionTask | None]] = []
+        for key in [k for k in self._user_sessions if matches(k)]:
+            self._user_sessions.pop(key, None)
+            self._user_session_last_used.pop(key, None)
+            detached.append((key, self._user_tasks.pop(key, None)))
+        return aborted, detached
+
+    async def _close_user_tasks(
+        self,
+        detached: list[tuple[tuple[str, str], ConnectionTask | None]],
+        aborted: list[asyncio.Task[ClientSession]],
+    ) -> None:
+        """Second half of a teardown: close the detached sessions, all at
+        once (each close can take its full timeout, so one by one a Stop
+        with many members would outlast the request), then wait for the
+        stopped connects to let go of their transport."""
+        await asyncio.gather(*(
+            self._close_user_task(key, task) for key, task in detached
+        ))
         await _wait_until_unwound(aborted)
-        return len(keys)
+
+    async def _close_user_task(
+        self, key: tuple[str, str], task: ConnectionTask | None,
+    ) -> None:
+        user_id, upstream_id = key
+        if task is not None:
+            try:
+                await task.close()
+            except Exception:
+                logger.exception(
+                    "upstream.client.user_task.close.failed",
+                    upstream_id=upstream_id,
+                    user=user_id,
+                )
+        logger.info(
+            "upstream.client.user_session.closed",
+            upstream_id=upstream_id,
+            user=user_id,
+        )
 
     @property
     def connected_upstream_ids(self) -> list[str]:
@@ -2301,7 +2665,9 @@ class UpstreamClientManager:
         return list(self._upstreams.keys())
 
     def register_upstream(self, upstream: UpstreamDefinition) -> None:
-        """Register an upstream definition (does not connect)."""
+        """Register an upstream definition (does not connect). An upstream
+        removed earlier under the same id is a new one now."""
+        self._removed.discard(upstream.id)
         self._upstreams[upstream.id] = upstream
         if upstream.id not in self._state:
             self._state[upstream.id] = UpstreamState(
@@ -2316,17 +2682,26 @@ class UpstreamClientManager:
         Users' sessions used to outlive the upstream until the idle sweep,
         and one added again under the same id was handed the old session,
         built from the old configuration.
+
+        From the first step on, the upstream counts as removed
+        (``is_removed``), so nothing reopens it while its sessions close,
+        nor afterwards.
         """
+        self._removed.add(upstream_id)
         self._upstreams.pop(upstream_id, None)
+        # Closes users' sessions and stops their connects too.
         await self.transition_to_disabled(
             upstream_id, reason="unregister_upstream",
-        )
-        await self._drop_user_sessions_where(
-            lambda key: key[1] == upstream_id,
         )
         # Drop the state record entirely — the upstream no longer
         # exists, so reads should not return a stale DISABLED entry.
         self._state.pop(upstream_id, None)
+        # Its server logs go with it: the same id added again is a new
+        # MCP and used to show the removed one's logs.
+        self.log_buffers.drop(upstream_id)
+        # And the passwords it was given: the same id added again is a
+        # new MCP, and a removed one's must not stay in memory.
+        self._substituted_passwords.pop(upstream_id, None)
 
     async def connect_upstream(
         self,
@@ -2357,6 +2732,26 @@ class UpstreamClientManager:
         bg = state.background_task
         return bg is not None and not bg.done()
 
+    def is_in_use(self, upstream_id: str) -> bool:
+        """True iff the upstream's shared session is open or opening: a
+        session (a tool call's or a Start's), an admin's Start still
+        running, or a shared connect in flight.
+
+        Boot leaves such an upstream as it is. Any request builds its
+        org's runtime (``OrgRuntimeManager.get``), so a tool call or a
+        Start can reach an org before the boot walk does, and boot's
+        DEFERRED_ATTACH or FAILED would then close that session, killing
+        the sandbox its calls run in, or cancel that Start.
+        """
+        if self._shared_flights.in_flight(upstream_id):
+            return True
+        state = self._state.get(upstream_id)
+        return state is not None and (
+            state.shared_session is not None
+            or state.shared_task is not None
+            or self.is_starting(upstream_id)
+        )
+
     def register_background_connect_task(
         self, upstream_id: str, task: asyncio.Task[None],
     ) -> None:
@@ -2370,7 +2765,20 @@ class UpstreamClientManager:
         in-flight task for the same upstream so a re-click of Start
         doesn't end up racing two warming sandboxes against each
         other.
+
+        The upstream's state record lets go of the task as soon as the
+        connect lands (``transition_to_live_shared``), while the task
+        still refreshes tools and writes the audit entry, so the
+        reference is held separately until the task ends.
+
+        A removed upstream is refused: the task is cancelled before it
+        runs, and ``UpstreamStopped`` raised. (The Start checks under the
+        Stop/Start lock, which a removal holds, so this is the backstop.)
         """
+        if self.is_removed(upstream_id):
+            task.cancel()
+            raise UpstreamStopped(f"upstream {upstream_id!r} was removed")
+        self._background_tasks.hold(task)
         self.transition_to_connecting(
             upstream_id, background_task=task,
         )
@@ -2423,12 +2831,15 @@ class UpstreamClientManager:
     async def disconnect_upstream(
         self, upstream_id: str, *, reset_state: bool = True,
     ) -> None:
-        """Disconnect the upstream's shared session and mark it stopped.
+        """Close every session to the upstream and mark it stopped: the
+        shared one and each user's own, including connects still running
+        for them (``transition_to_disabled``). Saved sign-ins are not
+        touched (see ``stop_upstream``).
 
-        Does NOT touch real per-user sessions — those belong to
-        individual users and survive an admin-initiated upstream
-        disconnect/reconnect. Per-user sessions are reaped by the
-        idle sweep or explicit ``disconnect_user_session`` calls.
+        Users' sessions used to survive, so members kept calling a server
+        the admin had stopped. Marking the upstream DISABLED first means a
+        call arriving while the sessions close is refused, not reconnected
+        (see ``_refuse_if_stopped``).
 
         ``reset_state`` is retained for call-site compatibility but
         no longer toggles behavior — the registry it used to gate

@@ -30,6 +30,7 @@ from mcpolis.adapters.upstream_clients.notification_handler import (
     build_tool_change_message_handler,
 )
 from mcpolis.domain.model.upstream import (
+    STDIO_AUTH_TOKEN_ENV,
     ServerInfo,
     UpstreamDefinition,
     UpstreamSelfDescription,
@@ -341,11 +342,11 @@ class SandboxConnectionTask(ConnectionTaskBase):
             self._log_buffer.clear()
 
         # Per-session env (auth token) layered on top of static
-        # upstream env by the SandboxService.
+        # upstream env by the SandboxService. A service-account token
+        # is already in that static env.
         extra_env: dict[str, str] = {}
-        token = self._bearer_token or self._upstream.auth.token
-        if token:
-            extra_env["MCP_AUTH_TOKEN"] = token
+        if self._bearer_token:
+            extra_env[STDIO_AUTH_TOKEN_ENV] = self._bearer_token
 
         # The legacy egress denylist (Envoy enforcer + admin UI) was
         # deleted in Phase 4; SandboxService.session still accepts a

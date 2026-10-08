@@ -14,8 +14,8 @@ Contract:
   contain dicts. Plain scalars (str, int, None) pass through. List
   elements that aren't themselves dicts are left alone — the
   Caddy/uvicorn-shaped ``[{name, value}]`` headers array is *not*
-  redacted at this layer; that case is handled by the Vector
-  transform's explicit ``del(.request.headers.Cookie)`` etc.
+  redacted at this layer; Caddy's credential headers are removed by
+  the Vector pipeline's ``redact_secrets`` transform.
 - Acceptable false-positives: ``mfa_token_count`` becomes
   ``[REDACTED]``. Over-redacting a counter is fine; the alternative
   (an allowlist) is fragile.

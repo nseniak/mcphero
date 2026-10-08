@@ -180,13 +180,14 @@ async def test_paused_only_ref_round_trips(backend: str) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", BACKENDS)
-async def test_creating_marker_both_none_ref_round_trips(backend: str) -> None:
-    """The E2B in-flight-create "creating" marker is a ref with BOTH
-    ``sandbox_id`` and ``paused_snapshot_id`` None — a state the normal
-    lifecycle never produces, which the reconciler uses as its
-    in-flight discriminator. It must round-trip cleanly (the Mongo strict
-    deserializer must NOT reject a both-None ref as malformed), or BUG-2's
-    fix silently breaks on the cloud backend."""
+async def test_both_none_ref_round_trips(backend: str) -> None:
+    """A ref with BOTH ``sandbox_id`` and ``paused_snapshot_id`` None is
+    what a Stop leaves for an upstream with a persistent disk (only the
+    volume id is kept), and what older code wrote as an in-flight
+    "creating" marker, some of which stay in databases. It must
+    round-trip cleanly (the Mongo strict deserializer must NOT reject a
+    both-None ref as malformed), or the volume id is lost on the cloud
+    backend."""
     async with _make_repo(backend) as repo:
         marker = make_ref(sandbox_id=None, paused_snapshot_id=None)
         await repo.upsert(marker)

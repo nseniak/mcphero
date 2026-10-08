@@ -66,7 +66,7 @@ Open the **Team** page.
 1. Click **Add Member**, enter their Google email, pick a role (it defaults to **user**), and save.
 2. Copy the invite link at the top of the page and send it to them.
 
-When they click the link and sign in with Google, they land directly in your organization with the role you assigned.
+When they open the link and sign in with Google, they see your invitation and click **Join**. They then land in your organization with the role you assigned. Until they join, they have no access to your organization.
 
 Members have to be added before they can join. Someone who signs in to MCP Hero with Google but hasn't been added to your team won't see your organization — they'll be prompted to create their own.
 

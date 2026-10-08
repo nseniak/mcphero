@@ -10,12 +10,10 @@ from mcpolis.adapters.auth.service_token_verifier import (
     ServiceTokenVerifier,
 )
 from mcpolis.domain.model.service_token import (
-    SCOPE_ORG_PREFIX,
-    SCOPE_ROLE_PREFIX,
-    SCOPE_SVC,
-    boundary_role_from_auth_scopes,
+    ServiceAccessToken,
+    boundary_role_from_access_token,
     is_service_token_auth,
-    pinned_org_from_auth_scopes,
+    pinned_org_from_access_token,
 )
 from mcpolis.adapters.repositories.file_service_token_repository import (
     FileServiceTokenRepository,
@@ -128,11 +126,11 @@ async def test_verify_builds_access_token_with_svc_identity_role_org_scopes_and_
     access = await verifier.verify_token(minted.raw_token)
     assert access is not None
     assert access.client_id == "svc:ci-bot"
-    assert access.scopes == [
-        SCOPE_SVC,
-        SCOPE_ROLE_PREFIX + "reader",
-        SCOPE_ORG_PREFIX + "org-a",
-    ]
+    # Role and org ride as typed fields, never as scopes: scopes are
+    # client input on the OAuth path.
+    assert access.scopes == []
+    assert access.role_name == "reader"
+    assert access.org_id == "org-a"
     # Pin the SDK contract: BearerAuthBackend treats expires_at via a
     # truthiness check, so None means non-expiring. If an SDK upgrade
     # changes that, this assertion is the tripwire.
@@ -157,15 +155,20 @@ async def test_revoked_token_verifies_to_none(tmp_path: Path) -> None:
     assert await verifier.verify_token(minted.raw_token) is None
 
 
-def test_scope_helpers_roundtrip() -> None:
-    scopes = [SCOPE_SVC, SCOPE_ROLE_PREFIX + "reader", SCOPE_ORG_PREFIX + "org-a"]
-    assert is_service_token_auth(scopes)
-    assert boundary_role_from_auth_scopes(scopes) == "reader"
-    assert pinned_org_from_auth_scopes(scopes) == "org-a"
-    # Human auth (no svc scope) yields None even if a stray scope
-    # happens to carry the prefixes.
-    human = [SCOPE_ROLE_PREFIX + "reader", SCOPE_ORG_PREFIX + "org-a"]
+def test_token_helpers_trust_type_not_scopes() -> None:
+    svc = ServiceAccessToken(
+        token="svct_x", client_id="svc:ci-bot", scopes=[],
+        role_name="reader", org_id="org-a",
+    )
+    assert is_service_token_auth(svc)
+    assert boundary_role_from_access_token(svc) == "reader"
+    assert pinned_org_from_access_token(svc) == "org-a"
+    # Human auth yields None even when its scopes spell out the old
+    # service-token encoding.
+    human = AccessToken(
+        token="t", client_id="alice@example.com",
+        scopes=["mcpolis:svc", "mcpolis:role:reader", "mcpolis:org:org-a"],
+    )
     assert not is_service_token_auth(human)
-    assert boundary_role_from_auth_scopes(human) is None
-    assert pinned_org_from_auth_scopes(human) is None
-    assert boundary_role_from_auth_scopes([]) is None
+    assert boundary_role_from_access_token(human) is None
+    assert pinned_org_from_access_token(human) is None

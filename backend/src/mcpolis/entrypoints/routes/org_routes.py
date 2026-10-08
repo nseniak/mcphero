@@ -260,9 +260,9 @@ def create_org_router(
           generic "Join acme-corp" that the recipient can't recognize.
 
         Membership data and any per-user information are *not*
-        exposed. If abuse becomes a concern, add a rate limiter
-        keyed on client IP — the existing ``RateLimiter`` adapter
-        is already wired into the app.
+        exposed. Enumeration is bounded by the per-IP sign-in rate
+        limit (``RateLimitMiddleware`` classifies this path with the
+        sign-in endpoints).
         """
         try:
             org = await org_service.resolve_slug(slug)

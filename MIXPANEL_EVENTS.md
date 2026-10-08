@@ -67,8 +67,10 @@ Avoid duplicating these inside individual events.
 | Event | Source | When it fires | Custom properties |
 |---|---|---|---|
 | `user_added` | backend | An admin adds a user via the Teams page. | `target_email_hash` (sha256), `assigned_role`, `is_admin` (bool — whether the assigned role has admin privileges). |
-| `user_removed` | backend | An admin removes a user. | `target_email_hash`, `removed_role`. |
+| `user_removed` | backend | An admin removes a user. | `target_email_hash`, `removed_role`, `was_pending` (bool — the user had not accepted their invitation, so only the invitation was deleted). |
 | `user_role_changed` | backend | An admin changes a user's role. | `target_email_hash`, `from_role`, `to_role`. |
+| `invitation_accepted` | backend | An invited person clicks Join and becomes a member. Distinct id is the invited person. | `assigned_role`. |
+| `invitation_declined` | backend | An invited person clicks Decline; the invitation is deleted. Distinct id is the invited person. | none |
 | `invite_link_copied` | frontend | The user clicks "Copy link" in the invite card on the Teams page. | none |
 
 > **Why `target_email_hash`**: tracking who-added-whom at email
@@ -83,7 +85,7 @@ Avoid duplicating these inside individual events.
 | `upstream_add_attempted` | frontend | The admin clicks "Add" on step 2 of the new-upstream form (regardless of outcome). | `transport` (`streamable_http` \| `stdio`), `entry_method` (`url` \| `json`). |
 | `upstream_added` | backend | The `connect_upstream` route persists a new upstream definition. | `upstream_id`, `transport`, `auth_mode` (`none` \| `oauth` \| `service_account`). |
 | `upstream_removed` | backend | The `disconnect_upstream` route deletes an upstream. | `upstream_id`, `transport`, `auth_mode`. |
-| `upstream_oauth_completed` | backend | A user's per-user OAuth flow against an upstream finishes successfully. | `upstream_id`, `auth_mode`, `oauth_provider_domain` (e.g. `accounts.google.com` — netloc of `upstream.http.url`). |
+| `upstream_oauth_completed` | backend | A user's per-user OAuth flow against an upstream finishes successfully. | `upstream_id`, `auth_mode`, `oauth_provider_domain` (e.g. `accounts.google.com`: the host name of `upstream.http.url`, never its user or password). |
 | `upstream_oauth_failed` | backend | The same flow fails. | `upstream_id`, `auth_mode`, `failure_reason` (enum: `user_denied` — the user cancelled in the popup; `token_exchange` — the OAuth flow ran but no tokens were stored; `discovery` — the upstream was unreachable / timed out before authorization started; `unknown` — fallback for unclassified errors, e.g. post-refresh connection failure). |
 | `upstream_connect_clicked` | frontend | A user clicks "Connect" on the `/connect` page for an upstream. | `upstream_id`. |
 | `stdio_mcp_attempted` | frontend | The admin clicks "Next" on the new-upstream form with JSON that defines a stdio MCP (i.e. has a `command` field). | `was_blocked` (bool — true when `allow_stdio_mcp=false`; the user sees a promotional dialog instead of advancing). |

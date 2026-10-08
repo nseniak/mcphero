@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -32,6 +33,15 @@ class AuditEntry(BaseModel):
     outcome: str | None = None
     error_message: str | None = None
     client_type: str | None = None
+    # Account actions (removing a teammate, an operator signing someone
+    # out): ``user_id`` is who acted, ``target_user_id`` who it was done
+    # to. ``actor_role`` is "operator" when MCP Hero staff acted, so the
+    # customer can tell their own admins' actions from ours.
+    actor_role: Literal["operator"] | None = None
+    target_user_id: str | None = None
+    # Short human-readable fact about the action, e.g. "free → team".
+    # Never tool arguments.
+    detail: str | None = None
 
 
 # Patterns: (regex, friendly name)

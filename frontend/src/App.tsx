@@ -99,12 +99,13 @@ function useTransitTarget(): TransitTarget {
  *
  *  The gateway emits this path when a per-user OAuth connection needs
  *  re-authenticating (``tool_router``), and so does the upstream
- *  health-check email — neither knows the viewer's org slug, only the
- *  org id. Without this route the path fell through to ``path="*"``
- *  and the user landed on the marketing homepage.
+ *  health-check email when it can't resolve the org's slug — neither
+ *  knows the viewer's org slug, only the org id. Without this route the
+ *  path fell through to ``path="*"`` and the user landed on the
+ *  marketing homepage.
  *
- *  The query string is preserved: the health-check link carries a
- *  ``?reauth=`` token that its (still to be built) consumer needs. */
+ *  The query string is preserved, so any parameter still reaches the
+ *  org's page. */
 function MyToolsRedirect() {
   const target = useTransitTarget();
   const { search } = useLocation();

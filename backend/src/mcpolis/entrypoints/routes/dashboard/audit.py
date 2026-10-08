@@ -2,15 +2,11 @@
 # pyright: reportUnusedFunction=false
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-
 from fastapi import APIRouter, Depends
 
 from mcpolis.entrypoints.controllers.gateway_controller import current_org_id
-from mcpolis.entrypoints.routes.dashboard._deps import (
-    DashboardDeps,
-    resolve_plan_limits,
-)
+from mcpolis.domain.services.plan_gates import audit_retention_since
+from mcpolis.entrypoints.routes.dashboard._deps import DashboardDeps
 from mcpolis.entrypoints.routes.dashboard._models import AuditSearchResponse
 
 
@@ -30,13 +26,8 @@ def create_audit_router(deps: DashboardDeps) -> APIRouter:
         offset: int = 0,
     ) -> AuditSearchResponse:
         org_id = current_org_id.get()
-        plan_limits = await resolve_plan_limits(deps, org_id)
-        # Plan-driven retention cap: filter at read time so a Free
-        # org can never read past 30 days even if the global TTL has
-        # not yet purged older rows.
-        since = datetime.now(UTC) - timedelta(
-            days=plan_limits.audit_retention_days,
-        )
+        # Plan-driven retention cap, shared with the Admin MCP search.
+        since_iso = await audit_retention_since(deps.org_repo, org_id)
         entries = await deps.audit_repo.search(
             org_id,
             user_id=user_id or None,
@@ -45,7 +36,7 @@ def create_audit_router(deps: DashboardDeps) -> APIRouter:
             action=[a for a in action.split(",") if a] or None,
             limit=limit,
             offset=offset,
-            since_iso=since.isoformat(),
+            since_iso=since_iso,
         )
         return AuditSearchResponse(entries=entries, count=len(entries))
 

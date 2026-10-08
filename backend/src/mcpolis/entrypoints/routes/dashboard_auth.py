@@ -35,6 +35,7 @@ from mcpolis.entrypoints.controllers.gateway_controller import (
     current_org_slug,
 )
 from mcpolis.domain.ports.session_revocation import SessionRevocationStore
+from mcpolis.domain.services.audit_actions import acting_as_operator
 from mcpolis.domain.services.org_runtime import OrgRuntimeManager
 from mcpolis.domain.services.org_service import OrgService
 from mcpolis.entrypoints.config import Settings
@@ -67,6 +68,14 @@ class CurrentOrgInfo(BaseModel):
     plan: str = "free"
 
 
+class InvitationInfo(BaseModel):
+    """An org's invitation the signed-in person has not accepted yet."""
+
+    slug: str
+    display_name: str
+    role: str
+
+
 class AuthUserInfo(BaseModel):
     email: str
     roles: list[str]
@@ -74,6 +83,7 @@ class AuthUserInfo(BaseModel):
     is_superadmin: bool = False
     orgs: list[OrgMembership] = []
     current_org: CurrentOrgInfo | None = None
+    invitations: list[InvitationInfo] = []
 
 
 class AuthStatus(BaseModel):
@@ -191,11 +201,18 @@ async def _maybe_auto_admin_default_org(
         return False
     admin_role = default_runtime.policy_engine.default_admin_role_name()
     user_def = UserDefinition(role=admin_role)
-    new_config = await policy_store.set_user(
+    new_config = await policy_store.add_first_user(
         DEFAULT_ORG_ID, email, user_def,
     )
+    if new_config is None:
+        # Another first sign-in (or this person's other tab) got there
+        # first: the store checked "no users yet" in its write step.
+        return False
     default_runtime.policy_engine.reload(new_config)
-    await org_service.ensure_memberships_for_user(email)
+    # The person setting the install up is a member from the start, like
+    # an org's creator: there is no invitation for them to accept.
+    await org_service.add_founding_member(DEFAULT_ORG_ID, email, admin_role)
+    runtime_manager.note_member_joined(DEFAULT_ORG_ID, email)
     logger.info(
         "dashboard.auth.first_login.auto_admin",
         email=email,
@@ -212,6 +229,8 @@ class DashboardAuth:
     # ``Depends(...)``, so other routers don't need to change.
     get_current_user: Callable[..., Any]
     require_admin: Callable[..., Any]
+    # Signed in, whatever org: see ``get_session_user``.
+    get_session_user: Callable[..., Any]
 
 
 def create_dashboard_auth(
@@ -234,11 +253,15 @@ def create_dashboard_auth(
     # itself gated on the same allowlist).
     superadmin_emails = settings.parsed_superadmin_emails()
 
-    async def get_current_user(
+    async def get_session_user(
         request: Request,
         mcpolis_session: str | None = Cookie(default=None),
     ) -> str:
-        """FastAPI dependency: get authenticated user email.
+        """FastAPI dependency: the signed-in person, for routes that are
+        not about one org's data (who am I, my orgs and invitations,
+        creating or switching an org). A person with no org yet, or one
+        who has only been invited, gets here with an empty org in their
+        cookie.
 
         Mode-agnostic after the Phase 1 middleware unification:
         ``current_org_id`` is set by ``OrgContextMiddleware`` in both
@@ -273,12 +296,37 @@ def create_dashboard_auth(
             # Super-admins legitimately have no role row in a foreign
             # org they're browsing via the cross-org dashboard, so the
             # "still in policy" check would wrongly 403 them.
+            # ``get`` (not ``get_cached``): an org this process has not
+            # loaded yet (the boot window, or one another backend
+            # created) must still be checked, not waved through.
             org_id = current_org_id.get()
-            runtime = runtime_manager.get_cached(org_id)
-            if runtime is not None and not runtime.policy_engine.get_user_roles(email):
+            runtime = await runtime_manager.get(org_id)
+            if not runtime.policy_engine.get_user_roles(email):
                 raise HTTPException(
                     status_code=403, detail="User has been removed"
                 )
+        return email
+
+    async def get_current_user(
+        request: Request,
+        mcpolis_session: str | None = Cookie(default=None),
+    ) -> str:
+        """FastAPI dependency: a signed-in MEMBER of the request's org
+        (or an MCP Hero operator browsing it), for every route about that
+        org's data.
+
+        Unlike ``get_session_user`` it also refuses an empty org in the
+        cookie: the request then falls back to the default org, which
+        someone with no org, or only an invitation to it, must not see.
+        """
+        email = await get_session_user(request, mcpolis_session)
+        if email in superadmin_emails:
+            return email
+        runtime = await runtime_manager.get(current_org_id.get())
+        if not runtime.policy_engine.get_user_roles(email):
+            raise HTTPException(
+                status_code=403, detail="Not a member of this organization",
+            )
         return email
 
     async def require_admin(
@@ -294,11 +342,14 @@ def create_dashboard_auth(
         org_id = current_org_id.get()
         runtime = await runtime_manager.get(org_id)
         if runtime.policy_engine.is_admin(email):
+            acting_as_operator.set(False)
             return email
         # Super-admins act as admins in any org (the cross-org
         # dashboard drill-down). The org context here is already the
-        # one the super-admin targeted via OrgContextMiddleware.
+        # one the super-admin targeted via OrgContextMiddleware. Audit
+        # rows written during this request are tagged "operator".
         if email in superadmin_emails:
+            acting_as_operator.set(True)
             return email
         raise HTTPException(status_code=403, detail="Admin role required")
 
@@ -338,26 +389,27 @@ def create_dashboard_auth(
             raise HTTPException(400, str(exc)) from exc
         email = completed.email
 
-        # One login flow for both modes.
+        # One login flow for both modes. Signing in never accepts an
+        # invitation: an invited person becomes a member only by
+        # clicking Join on that org's invitation.
         #
-        # 1. Reconcile policy-config memberships with the
-        #    Organization-repo membership rows (Team-page "Add
-        #    member" only writes policy config; the first login
-        #    materialises the row so "Pending" flips to "Joined").
-        # 2. List the user's memberships.
-        # 3. Fresh standalone install (default org has no users yet)
-        #    → auto-admin the first login. Standalone stranger (users
-        #    exist but the caller isn't one of them) → send them
-        #    home with an "auth_error=not_a_member" banner so the
-        #    admin knows to invite them. Cloud users with zero
-        #    memberships just get an empty cookie — the frontend
-        #    renders the SignupPage from ``current_org=null``.
-        # 4. Choose an org (join-link override, else first membership)
-        #    and set the session cookie.
-        await org_service.ensure_memberships_for_user(email)
+        # 1. List the orgs the person is a member of.
+        # 2. Fresh standalone install (default org has no users yet)
+        #    → auto-admin the first login. Standalone stranger (not a
+        #    member, not invited) → send them home with an
+        #    "auth_error=not_a_member" banner so the admin knows to
+        #    invite them. Cloud users with zero memberships just get
+        #    an empty cookie — the frontend renders the SignupPage
+        #    from ``current_org=null``, which lists their invitations.
+        # 3. Choose an org (join-link override, else first membership)
+        #    and set the session cookie. A person still to accept the
+        #    invitation they came for lands on that org's Join page.
         orgs = await org_service.list_user_orgs(email)
 
         was_first_user_auto_admin = False
+        # The org whose Join page to land on: an invitation still to
+        # accept.
+        invited_slug: str | None = None
         if not orgs and settings.mode == "standalone":
             provisioned = await _maybe_auto_admin_default_org(
                 email, runtime_manager, policy_store, org_service,
@@ -366,35 +418,44 @@ def create_dashboard_auth(
                 orgs = await org_service.list_user_orgs(email)
                 was_first_user_auto_admin = True
             else:
-                # Default org already has an admin but the caller
-                # isn't in config.users. Self-hosted installs use
-                # this redirect to nudge the admin to add the user.
-                params = urlencode(
-                    {"auth_error": "not_a_member", "email": email},
-                )
-                return RedirectResponse(
-                    url=f"/?{params}", status_code=302,
-                )
+                # Standalone has one org: an invited person accepts its
+                # invitation on its Join page. Anyone else isn't in
+                # config.users; self-hosted installs use this redirect
+                # to nudge the admin to add the user.
+                invitations = await org_service.list_invitations(email)
+                if not invitations:
+                    params = urlencode(
+                        {"auth_error": "not_a_member", "email": email},
+                    )
+                    return RedirectResponse(
+                        url=f"/?{params}", status_code=302,
+                    )
+                invited_slug = invitations[0].org.slug
 
-        if join_slug:
-            # User came from a join link — check if they're a member
-            # of that specific org, not just any org.
-            joined = any(o.slug == join_slug for o in orgs)
-            if not joined:
+        if join_slug and any(o.slug == join_slug for o in orgs):
+            chosen_slug = join_slug
+        elif join_slug:
+            # Came from a join link without being a member of that org:
+            # either invited (accept on its Join page) or a stranger.
+            if await org_service.invitation_to(join_slug, email) is None:
                 params = urlencode(
                     {"auth_error": "not_a_member", "email": email, "org": join_slug},
                 )
                 return RedirectResponse(
                     url=f"/orgs/{join_slug}/join?{params}", status_code=302,
                 )
-            chosen_slug = join_slug
+            invited_slug = join_slug
+            chosen_slug = orgs[0].slug if orgs else ""
         else:
             chosen_slug = orgs[0].slug if orgs else ""
 
         cookie_value = build_session_cookie(
             settings, email=email, org_slug=chosen_slug,
         )
-        response = RedirectResponse(url="/", status_code=302)
+        response = RedirectResponse(
+            url=f"/orgs/{invited_slug}/join" if invited_slug else "/",
+            status_code=302,
+        )
         response.set_cookie(
             COOKIE_NAME,
             cookie_value,
@@ -421,7 +482,7 @@ def create_dashboard_auth(
 
     @router.get("/me", response_model=AuthUserInfo)
     async def me(
-        email: str = Depends(get_current_user),
+        email: str = Depends(get_session_user),
         mcpolis_session: str | None = Cookie(default=None),
     ) -> AuthUserInfo:
         """Resolve the caller's memberships + active org + admin flag.
@@ -499,6 +560,17 @@ def create_dashboard_auth(
         # superadmin-only UI like /__debug.
         is_superadmin = email in superadmin_emails
 
+        # Invitations still to accept or decline: the dashboard shows
+        # them where the person lands after sign-in.
+        invitations = [
+            InvitationInfo(
+                slug=invitation.org.slug,
+                display_name=invitation.org.display_name,
+                role=invitation.role,
+            )
+            for invitation in await org_service.list_invitations(email)
+        ]
+
         return AuthUserInfo(
             email=email,
             roles=roles,
@@ -506,6 +578,7 @@ def create_dashboard_auth(
             is_superadmin=is_superadmin,
             orgs=orgs_out,
             current_org=current_out,
+            invitations=invitations,
         )
 
     # Test-only endpoint: mint a gateway bearer token for any email
@@ -517,6 +590,16 @@ def create_dashboard_auth(
     if settings.test_mode:
         @router.post("/test-mcp-token")
         async def test_mcp_token(request: Request) -> dict[str, Any]:
+            # Web pages are refused. CORS allows every origin app-wide,
+            # and this route mints a bearer for any email with no
+            # credential, so any website open in the operator's browser
+            # while ``start.sh --fake-auth`` runs could otherwise mint an
+            # admin bearer and drive the admin MCP, whose host check is
+            # off (``mcp_transport_security``). A browser always sends
+            # Origin on such a request; the real callers (the e2e
+            # helpers and orchestrator) send none.
+            if "origin" in request.headers:
+                raise HTTPException(403, "Not available to web pages")
             if gateway_oauth_provider is None:
                 raise HTTPException(400, "OAuth is not enabled")
             body = await request.json()
@@ -529,11 +612,9 @@ def create_dashboard_auth(
             # token model — kept in the request body for backwards
             # compatibility with the test-mode CLI helper that still
             # passes it. We resolve it only to make sure the slug is
-            # valid (so a typo on the test side fails loudly) and so
-            # ``ensure_memberships_for_user`` runs against an existing
-            # org graph.
+            # valid (so a typo on the test side fails loudly). Minting a
+            # token accepts no invitation, as a real sign-in doesn't.
             await org_service.resolve_slug(org_slug_param)
-            await org_service.ensure_memberships_for_user(email)
             token: str = await gateway_oauth_provider.mint_test_token(email)
             return {
                 "access_token": token,
@@ -571,6 +652,7 @@ def create_dashboard_auth(
         router=router,
         get_current_user=get_current_user,
         require_admin=require_admin,
+        get_session_user=get_session_user,
     )
 
 

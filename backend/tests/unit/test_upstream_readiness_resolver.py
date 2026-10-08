@@ -40,7 +40,7 @@ from mcpolis.domain.model.upstream import (
 from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.domain.services.org_runtime import OrgRuntime
 from mcpolis.domain.services.policy_engine import PolicyEngine
-from mcpolis.entrypoints.routes.dashboard._deps import (
+from mcpolis.domain.services.upstream_admin_service import (
     resolve_upstream_readiness as _resolve_upstream_readiness,
 )
 
@@ -74,6 +74,7 @@ def make_runtime(
     """
     client_manager = MagicMock()
     client_manager.is_connected = MagicMock(return_value=sa_connected)
+    client_manager.is_stopped = MagicMock(return_value=False)
     return OrgRuntime(
         org_id=DEFAULT_ORG_ID,
         policy_engine=policy_engine,

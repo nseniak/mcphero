@@ -2,16 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
+from mcpolis.domain.model.email_address import find_address
+from mcpolis.domain.ports import DEFAULT_ORG_ID
+from mcpolis.domain.services.upstream_role_rules import remove_upstream_role_rules
 from mcpolis.domain.services.settings_resolver import (
-    assert_keeps_an_admin,
+    add_user_to_config,
+    remove_user_from_config,
+    set_user_role_in_config,
 )
 from mcpolis.domain.model.settings import (
     ArgumentConstraint,
     DEFAULT_SETTINGS_CONFIG,
     McpAccessConfig,
+    OrgUserEntry,
     RoleDefinition,
     SettingsConfig,
     ToolAccessConfig,
@@ -40,10 +48,7 @@ class FileConfigStore:
 
     def _write(self, config: SettingsConfig) -> None:
         data = config.model_dump(mode="json", exclude_none=True)
-        tmp = self._path.with_suffix(".tmp")
-        tmp.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data, indent=2))
-        tmp.replace(self._path)
+        write_text_atomic(self._path, json.dumps(data, indent=2))
 
     async def load(self, org_id: str) -> SettingsConfig:
         async with self._lock:
@@ -98,36 +103,72 @@ class FileConfigStore:
             self._write(config)
             return config
 
+    async def remove_upstream_role_rules(
+        self, org_id: str, upstream_id: str
+    ) -> SettingsConfig:
+        async with self._lock:
+            config = self._read()
+            if remove_upstream_role_rules(config, upstream_id):
+                self._write(config)
+            return config
+
     # --- Users ---
+
+    async def find_user(self, email: str) -> list[OrgUserEntry]:
+        """The file holds the one org of a standalone install."""
+        async with self._lock:
+            config = self._read()
+        key = find_address(config.users, email)
+        if key is None:
+            return []
+        return [OrgUserEntry(
+            org_id=DEFAULT_ORG_ID, email=key, user=config.users[key],
+        )]
 
     async def set_user(self, org_id: str, email: str, user: UserDefinition) -> SettingsConfig:
         async with self._lock:
             config = self._read()
-            config.users[email] = user
+            add_user_to_config(config, email, user)
             self._write(config)
             return config
 
-    async def remove_user(self, org_id: str, email: str) -> SettingsConfig:
+    async def add_first_user(
+        self, org_id: str, email: str, user: UserDefinition,
+    ) -> SettingsConfig | None:
         async with self._lock:
             config = self._read()
-            if email not in config.users:
-                raise ValueError(f"User '{email}' not found")
+            if config.users:
+                return None
+            add_user_to_config(config, email, user)
+            self._write(config)
+            return config
+
+    async def remove_user(
+        self,
+        org_id: str,
+        email: str,
+        *,
+        eligible: Collection[str] | None = None,
+    ) -> SettingsConfig:
+        async with self._lock:
+            config = self._read()
             # Inside the lock: check + write are one step, so two
             # parallel removals can't each see a surviving admin.
-            assert_keeps_an_admin(config, email)
-            del config.users[email]
+            remove_user_from_config(config, email, eligible=eligible)
             self._write(config)
             return config
 
-    async def set_user_role(self, org_id: str, email: str, role: str) -> SettingsConfig:
+    async def set_user_role(
+        self,
+        org_id: str,
+        email: str,
+        role: str,
+        *,
+        eligible: Collection[str] | None = None,
+    ) -> SettingsConfig:
         async with self._lock:
             config = self._read()
-            if email not in config.users:
-                raise ValueError(f"User '{email}' not found")
-            if role not in config.roles:
-                raise ValueError(f"Role '{role}' not found")
-            assert_keeps_an_admin(config, email, new_role=role)
-            config.users[email].role = role
+            set_user_role_in_config(config, email, role, eligible=eligible)
             self._write(config)
             return config
 
@@ -236,21 +277,24 @@ class FileConfigStore:
         """Create per-role access entries for a newly added MCP.
 
         Each role gets an entry based on its auto_enable_new setting,
-        and a ToolAccessConfig with all tools enabled by default.
+        and a ToolAccessConfig with all tools enabled by default. Rules
+        still stored under this id are dropped first: ones left by a
+        server removed before removal purged them, or written for it
+        after it was removed. The new MCP never inherits them.
         """
         async with self._lock:
             config = self._read()
+            remove_upstream_role_rules(config, mcp_id)
             for role in config.roles.values():
                 enabled = role.settings.mcp_access.auto_enable_new
                 role.settings.mcp_access.mcps[mcp_id] = enabled
-                if mcp_id not in role.settings.tool_access:
-                    role.settings.tool_access[mcp_id] = ToolAccessConfig(
-                        fallback_enabled=True,
-                        category_defaults={
-                            "readOnly": True,
-                            "destructive": True,
-                        },
-                    )
+                role.settings.tool_access[mcp_id] = ToolAccessConfig(
+                    fallback_enabled=True,
+                    category_defaults={
+                        "readOnly": True,
+                        "destructive": True,
+                    },
+                )
             self._write(config)
             return config
 

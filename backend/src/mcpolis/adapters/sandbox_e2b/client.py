@@ -71,8 +71,9 @@ class E2BSandboxInfo(Protocol):
     @property
     def created_at(self) -> datetime:
         """When the sandbox was created on the provider side. Used by
-        the reconciler to GC unknown paused snapshots older than the
-        retention threshold (default 30 days)."""
+        the reconciler to kill paused sandboxes no ref points at once
+        they are older than the grace (``DEFAULT_PAUSED_ORPHAN_GRACE``,
+        one hour)."""
         ...
 
 
@@ -290,9 +291,13 @@ class E2BClient(Protocol):
         reconciler's cross-instance global view)."""
         ...
 
-    async def kill_sandbox(self, sandbox_id: str) -> None: ...
-
-    async def delete_snapshot(self, snapshot_id: str) -> None: ...
+    async def kill_sandbox(self, sandbox_id: str) -> None:
+        """Kill a running OR paused sandbox by id. Raises
+        :class:`E2BNotFoundError` when no such sandbox exists (already
+        killed, or never existed). (There is no separate "delete
+        snapshot" call: the SDK's ``delete_snapshot`` deletes a
+        *template* and answers a sandbox id with a silent not-found.)"""
+        ...
 
     async def create_volume(self, *, name: str) -> str:
         """Provision a fresh persistent volume and return its

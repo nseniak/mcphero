@@ -146,6 +146,15 @@ class MongoOrganizationRepository(OrganizationRepository):
         docs: list[dict[str, Any]] = await cursor.to_list(length=None)
         return [self._membership_from_doc(d) for d in docs]
 
+    async def rename_role(
+        self, org_id: str, old_name: str, new_name: str
+    ) -> int:
+        result = await self._memberships.update_many(
+            {"org_id": org_id, "role": old_name},
+            {"$set": {"role": new_name}},
+        )
+        return result.modified_count
+
     async def add_membership(
         self, org_id: str, email: str, role: str
     ) -> Membership:
@@ -166,6 +175,17 @@ class MongoOrganizationRepository(OrganizationRepository):
             return_document=True,
         )
         return self._membership_from_doc(doc)
+
+    async def update_membership_role(
+        self, org_id: str, email: str, role: str
+    ) -> bool:
+        # One atomic update with no upsert: a removal landing between a
+        # read and a write can't be undone by a role change.
+        result = await self._memberships.update_one(
+            {"org_id": org_id, "email": email},
+            {"$set": {"role": role}},
+        )
+        return result.matched_count > 0
 
     async def remove_membership(self, org_id: str, email: str) -> None:
         await self._memberships.delete_one({"org_id": org_id, "email": email})

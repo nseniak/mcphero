@@ -19,6 +19,8 @@ def test_limits_for_free() -> None:
     # is also the model default — so the wizard default, the no-resource
     # create fallback, and the plan allow-list all agree on Free.
     assert limits.allowed_sandbox_combos == ((1, 1024),)
+    assert limits.tool_calls_per_min_per_caller == 60
+    assert limits.tool_calls_per_min_per_org == 120
 
 
 def test_limits_for_team() -> None:
@@ -28,6 +30,8 @@ def test_limits_for_team() -> None:
     assert limits.max_http_upstreams is None
     assert limits.max_stdio_upstreams is None
     assert limits.max_custom_roles is None
+    assert limits.tool_calls_per_min_per_caller == 120
+    assert limits.tool_calls_per_min_per_org == 600
     assert limits.allow_argument_constraints is True
     assert limits.audit_retention_days == 365
     # Team is unrestricted: ``None`` means the sandbox-combo gate is a
@@ -47,3 +51,15 @@ def test_free_sandbox_combos_exist_on_e2b_grid() -> None:
     grid = set(CPU_RAM_PAIRS)
     for pair in FREE.allowed_sandbox_combos:
         assert pair in grid, f"Free combo {pair} is not a published E2B template"
+
+
+def test_team_tool_call_limits_are_never_stricter_than_free() -> None:
+    assert TEAM.tool_calls_per_min_per_caller >= FREE.tool_calls_per_min_per_caller
+    assert TEAM.tool_calls_per_min_per_org >= FREE.tool_calls_per_min_per_org
+
+
+def test_one_caller_cannot_use_a_whole_org_quota() -> None:
+    """The per-caller limit sits below the org limit on every plan, so
+    one runaway agent is stopped before its teammates are."""
+    for limits in (FREE, TEAM):
+        assert limits.tool_calls_per_min_per_caller < limits.tool_calls_per_min_per_org

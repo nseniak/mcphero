@@ -37,8 +37,11 @@ organizations. The main trust boundaries:
 - **Untrusted MCP code.** `stdio` MCP servers run behind a
   `SandboxService` boundary. The production backend (E2B) executes them
   in isolated sandboxes; the `local-subprocess` backend runs them
-  without isolation and is **dev-only** (cloud mode refuses to start
-  with it).
+  without isolation and is **dev-only**: cloud mode never picks it on
+  its own, and accepts it only when named explicitly with the server
+  bound to a loopback address (local development). A loopback bind
+  behind a reverse proxy still serves users, so it is not a safe
+  production setup.
 - **Access control.** The gateway enforces a per-role access policy over
   which upstream tools each user may reach, and audits tool calls.
 - **Secrets in transit/logs.** Secret-shaped values are redacted from

@@ -16,6 +16,7 @@ from mcpolis.adapters.gateway_session_registry import GatewaySessionRegistry
 from mcpolis.adapters.repositories.file_audit_repository import (
     FileAuditRepository,
 )
+from mcpolis.adapters.repositories.file_config_store import FileConfigStore
 from mcpolis.adapters.repositories.file_connection_store import (
     FileConnectionStore,
 )
@@ -157,7 +158,11 @@ async def test_upstream_config_service_uses_caller_org(
     cm = UpstreamClientManager([])
     registry = ToolRegistry([], cm)
     connection_store = FileConnectionStore(tmp_path)
-    service = UpstreamConfigService(spy_store, cm, registry, connection_store)  # type: ignore[arg-type]
+    service = UpstreamConfigService(
+        spy_store, cm, registry, connection_store,  # type: ignore[arg-type]
+        config_repo=FileConfigStore(tmp_path / "config.json"),
+        policy_engine=PolicyEngine(SettingsConfig()),
+    )
 
     await service.list_upstreams("acme")
     assert received["org_id"] == "acme"
@@ -167,11 +172,11 @@ async def test_upstream_config_service_uses_caller_org(
 
 
 @pytest.mark.asyncio
-async def test_periodic_token_refresh_uses_caller_org(
+async def test_refresh_token_for_user_accepts_caller_org(
     tmp_path: Path,
 ) -> None:
-    """periodic_token_refresh passes its org_id to get_all_stored_tokens —
-    so per-org token refresh in cloud mode picks up the right tenant."""
+    """refresh_token_for_user takes the caller's org_id, so per-org
+    token refresh in cloud mode picks up the right tenant."""
     from mcpolis.domain.services.upstream_connection_service import (
         refresh_token_for_user,
     )

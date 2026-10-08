@@ -6,7 +6,7 @@ import contextlib
 import shutil
 from pathlib import Path
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import structlog
@@ -14,9 +14,9 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from structlog.contextvars import (
     bind_contextvars,
-    bound_contextvars,
     clear_contextvars,
 )
+from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import StreamableHTTPASGIApp
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
@@ -42,6 +42,7 @@ from mcpolis.adapters.observability.analytics_client import (
 from mcpolis.adapters.observability.sentry_setup import init_sentry
 from mcpolis.adapters.observability.structlog_setup import configure_structlog
 from mcpolis.adapters.gateway_session_registry import GatewaySessionRegistry
+from mcpolis.domain.services.audit_actions import write_audit_entry
 from mcpolis.adapters.upstream_clients.session_single_flight import (
     ConnectAborted,
 )
@@ -49,12 +50,14 @@ from mcpolis.domain.model.upstream import UpstreamDefinition
 from mcpolis.adapters.repositories.audit_repository import (
     AuditRepository as LegacyAuditRepository,
 )
+from mcpolis.adapters.repositories.connection_store import ConnectionStore
 from mcpolis.adapters.repositories.oauth_apps_loader import load_oauth_apps
 from mcpolis.adapters.repositories.upstream_config_loader import load_merged_config
 from mcpolis.dev.demo_mcp_server import (
     DEMO_UPSTREAM_DISPLAY_NAME,
     build_demo_app,
 )
+from mcpolis.domain.model.email_allowlist import EmailAllowlist
 from mcpolis.domain.model.policy import AuthMode, UpstreamAuthConfig
 from mcpolis.domain.model.service_token import SVC_IDENTITY_PREFIX
 from mcpolis.domain.model.settings import OAuthAppsConfig
@@ -64,13 +67,35 @@ from mcpolis.domain.model.upstream import (
 )
 from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.domain.ports.dashboard_oauth_provider import DashboardOAuthProvider
+from mcpolis.domain.ports.config_repository import ConfigWriteConflictError
 from mcpolis.domain.ports.event_stream import EventStream
 from mcpolis.domain.ports.oauth_state_repository import OAuthStateRepository
-from mcpolis.domain.services.org_runtime import OrgRuntimeManager
+from mcpolis.domain.services.background_tasks import BackgroundTaskSet
+from mcpolis.domain.services.oauth_refresh import (
+    TOKEN_REFRESH_INTERVAL,
+    refresh_org_sign_ins,
+)
+from mcpolis.domain.services.org_runtime import OrgRuntime, OrgRuntimeManager
+from mcpolis.domain.services.plan_gates import resolve_plan
 from mcpolis.domain.services.plan_policy import PlanLimitExceeded
+from mcpolis.domain.services.admin_actions import AdminActionRefused
+from mcpolis.domain.services.rate_limit_service import (
+    RateLimitReporter,
+    RateLimitService,
+    RequestRateLimits,
+)
 from mcpolis.domain.services.org_service import OrgService as OrgServiceCls
 from mcpolis.domain.services.policy_notifier import PolicyNotifier
 from mcpolis.domain.services.service_token_service import ServiceTokenService
+from mcpolis.domain.services.sign_in_refresh_lock import SignInRefreshLock
+from mcpolis.domain.services.upstream_admin_service import (
+    resolve_upstream_readiness,
+)
+from mcpolis.domain.services.upstream_health_check import (
+    HEALTH_EMAIL_INTERVAL,
+    SignInWarner,
+    run_health_check_for_org,
+)
 from mcpolis.entrypoints.storage_factory import (
     StorageBundle,
     build_storage,
@@ -82,13 +107,38 @@ from mcpolis.entrypoints.config import (
     effective_gateway_url,
     validate_startup_secrets,
 )
-from mcpolis.entrypoints.lifecycle import DrainCoordinator
+from mcpolis.entrypoints.lifecycle import (
+    DrainCoordinator,
+    DrainMiddleware,
+    McpEndpoints,
+    ShutdownSteps,
+    install_sigterm_drain,
+    shut_down,
+)
+from mcpolis.entrypoints.middleware.run_to_completion import (
+    RunToCompletionMiddleware,
+)
+from mcpolis.entrypoints.controllers.admin_action_errors import (
+    refusal_detail,
+    refusal_status,
+)
+from mcpolis.entrypoints.gateway_auth_routes import gateway_auth_routes
+from mcpolis.entrypoints.mcp_transport_security import mcp_transport_security
+from mcpolis.entrypoints.middleware.mcp_request_identity import (
+    bind_request_identity,
+)
+from mcpolis.entrypoints.middleware.session_owner_guard import (
+    SessionOwnerGuard,
+)
 from mcpolis.entrypoints.controllers.admin_mcp_controller import create_admin_mcp_server
 from mcpolis.entrypoints.controllers.gateway_controller import (
     create_mcp_server,
     current_org_id,
     current_session_id,
     current_user_id,
+)
+from mcpolis.entrypoints.middleware.rate_limit_middleware import (
+    RateLimitMiddleware,
 )
 from mcpolis.entrypoints.routes.dashboard_api import (
     StartupStatusResponse,
@@ -157,49 +207,27 @@ class _GatewayLogContextBindMiddleware:
 class _SessionRegistrationMiddleware:
     """ASGI middleware that registers MCP session → user mapping.
 
-    Also returns 404 (instead of the library's 400) for stale session IDs
-    so that MCP clients know to re-initialise.
+    Runs behind ``SessionOwnerGuard``, which has already answered 404
+    to stale session ids and to anyone but a session's owner, so the
+    (org, user) registered here is always the session's owner.
     """
 
     def __init__(
         self,
         app: ASGIApp,
         session_registry: GatewaySessionRegistry,
-        session_manager: StreamableHTTPSessionManager,
         audit_repo: LegacyAuditRepository | None = None,
     ) -> None:
         self.app = app
         self._registry = session_registry
-        self._session_manager = session_manager
         self._audit_repo = audit_repo
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "http":
             from starlette.requests import Request as StarletteRequest
-            from starlette.responses import Response as StarletteResponse
 
             request = StarletteRequest(scope)
             session_id = request.headers.get("mcp-session-id")
-
-            # Workaround for modelcontextprotocol/python-sdk#1727:
-            # StreamableHTTPSessionManager returns 400 for unknown session IDs,
-            # but the MCP spec requires 404 so clients know to re-initialise.
-            # Without this, clients (e.g. Claude Code) get stuck after a server
-            # restart because they keep replaying the stale session ID.
-            if (
-                session_id is not None
-                and session_id not in self._session_manager._server_instances  # pyright: ignore[reportPrivateUsage]
-            ):
-                logger.info(
-                    "session.stale.rejected",
-                    session_id_prefix=session_id[:8],
-                )
-                response = StarletteResponse(
-                    "Not Found: Session has been terminated",
-                    status_code=404,
-                )
-                await response(scope, receive, send)
-                return
 
             if session_id is not None:
                 # User is set by the OAuth auth middleware above us.
@@ -230,7 +258,9 @@ class _SessionRegistrationMiddleware:
                         client_type=client_type,
                         outcome="success",
                     )
-                    await self._audit_repo.log(org_id, entry)
+                    # Never fails the request: a down audit store must
+                    # not stop the client from connecting.
+                    await write_audit_entry(self._audit_repo, org_id, entry)
         await self.app(scope, receive, send)
 
 
@@ -297,6 +327,23 @@ class _MultiOrgUserOrgsPrefetchMiddleware:
             current_user_orgs.reset(token)
 
 
+def _serve_sessions_per_caller(
+    mcp_app: ASGIApp,
+    session_manager: StreamableHTTPSessionManager,
+    on_session_end: Callable[[str], None] | None = None,
+) -> ASGIApp:
+    """``mcp_app`` serving each session of ``session_manager`` only to the
+    caller that opened it, running each request with its own caller and
+    session id, and releasing ended or idle sessions (each end reported
+    to ``on_session_end``). Every MCP app with sessions goes through
+    here."""
+    guard = SessionOwnerGuard(
+        mcp_app, session_manager, on_session_end=on_session_end,
+    )
+    bind_request_identity(session_manager.app, guard.busy)
+    return guard
+
+
 def _build_mcp_app_with_oauth(
     session_manager: StreamableHTTPSessionManager,
     settings: Settings,
@@ -311,7 +358,6 @@ def _build_mcp_app_with_oauth(
     """Build the MCP Starlette app with OAuth auth routes and middleware."""
     from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
     from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
-    from mcp.server.auth.routes import create_auth_routes
     from pydantic import AnyHttpUrl
     from starlette.middleware.authentication import AuthenticationMiddleware
 
@@ -324,6 +370,7 @@ def _build_mcp_app_with_oauth(
         ServiceTokenOrgPinMiddleware,
     )
     from mcpolis.entrypoints.routes.google_callback import create_google_callback_route
+    from mcpolis.entrypoints.routes.oauth_consent import create_consent_route
 
     # Gateway OAuth issuer + Google callback live under the gateway's
     # public base URL — which may be a subdomain (``mcp.mcphero.io``)
@@ -340,13 +387,26 @@ def _build_mcp_app_with_oauth(
         runtime_manager=runtime_manager,
         state_repository=oauth_state_repo,
         event_bus=event_bus,
+        dashboard_url=settings.server_url,
     )
 
     raw_mcp_app: ASGIApp = StreamableHTTPASGIApp(session_manager)
     if session_registry is not None:
         raw_mcp_app = _SessionRegistrationMiddleware(
-            raw_mcp_app, session_registry, session_manager, audit_repo=audit_repo,
+            raw_mcp_app, session_registry, audit_repo=audit_repo,
         )
+    # Outermost, so a request on someone else's session never reaches
+    # the registry or the SDK (which would run it as the session's
+    # creator). Inside the auth + org middleware, whose results it reads.
+    raw_mcp_app = _serve_sessions_per_caller(
+        raw_mcp_app,
+        session_manager,
+        # An ended session leaves the registry at once, which writes its
+        # client_disconnect audit row.
+        on_session_end=(
+            session_registry.unregister if session_registry is not None else None
+        ),
+    )
 
     # Auth middleware. The composite verifier dispatches svct_-prefixed
     # bearers to the service-token registry and everything else to the
@@ -388,15 +448,7 @@ def _build_mcp_app_with_oauth(
     routes: list[Route] = []
 
     # OAuth endpoints (metadata, authorize, token, register)
-    from mcp.server.auth.settings import ClientRegistrationOptions
-
-    routes.extend(
-        create_auth_routes(
-            provider=provider,
-            issuer_url=issuer_url,
-            client_registration_options=ClientRegistrationOptions(enabled=True),
-        )
-    )
+    routes.extend(gateway_auth_routes(provider, issuer_url))
 
     # Protected resource metadata (tells clients where the auth server
     # is). Slug-aware: in cloud mode the handler reads the current org
@@ -427,18 +479,18 @@ def _build_mcp_app_with_oauth(
         ),
     )
 
-    # Google callback route
+    # Google callback route + the mcpolis consent page (confused-deputy
+    # gate — see McpGatewayOAuthProvider.handle_google_callback).
     callback_route = create_google_callback_route()
     routes.append(callback_route)
+    routes.append(create_consent_route())
 
     # MCP endpoint wrapped with slug-aware bearer middleware so the 401
     # ``WWW-Authenticate`` header points at the slug-scoped metadata URL.
     routes.append(
         Route(
             "/",
-            endpoint=SlugAwareRequireAuthMiddleware(
-                raw_mcp_app, [], mcp_base_url,
-            ),
+            endpoint=SlugAwareRequireAuthMiddleware(raw_mcp_app, mcp_base_url),
             methods=["GET", "POST", "DELETE"],
         ),
     )
@@ -454,7 +506,7 @@ def _build_mcp_app_with_oauth(
 
 
 def _build_admin_app_with_oauth(
-    admin_mcp_starlette_app: ASGIApp,
+    admin_mcp: FastMCP,
     provider: Any,
     settings: Settings,
     runtime_manager: OrgRuntimeManager,
@@ -465,7 +517,6 @@ def _build_admin_app_with_oauth(
         auth_context_var,
     )
     from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
-    from mcp.server.auth.routes import create_auth_routes
     from pydantic import AnyHttpUrl
     from starlette.middleware.authentication import AuthenticationMiddleware
 
@@ -485,17 +536,7 @@ def _build_admin_app_with_oauth(
 
     routes: list[Route] = []
 
-    from mcp.server.auth.settings import ClientRegistrationOptions
-
-    routes.extend(
-        create_auth_routes(
-            provider=provider,
-            issuer_url=issuer_url,
-            client_registration_options=ClientRegistrationOptions(
-                enabled=True
-            ),
-        )
-    )
+    routes.extend(gateway_auth_routes(provider, issuer_url))
 
     # Slug-aware metadata handler — same rationale as the gateway app.
     from mcp.server.auth.routes import cors_middleware
@@ -581,12 +622,20 @@ def _build_admin_app_with_oauth(
                     return
             await self.app(scope, receive, send)
 
+    # ``streamable_http_app()`` creates the session manager the guard
+    # watches. Role check first: a non-admin gets the same 403 with or
+    # without a session id. Then the owner check, so an admin can't run
+    # another admin's session (captured with that admin's identity and
+    # org).
+    admin_mcp_app = admin_mcp.streamable_http_app()
+    owned_admin_mcp_app = _serve_sessions_per_caller(
+        admin_mcp_app, admin_mcp.session_manager,
+    )
     routes.append(
         Route(
             "/",
             endpoint=SlugAwareRequireAuthMiddleware(
-                AdminRoleMiddleware(admin_mcp_starlette_app),
-                [],
+                AdminRoleMiddleware(owned_admin_mcp_app),
                 admin_base_url,
             ),
             methods=["GET", "POST", "DELETE"],
@@ -596,7 +645,9 @@ def _build_admin_app_with_oauth(
     from mcpolis.entrypoints.routes.google_callback import (
         create_google_callback_route,
     )
+    from mcpolis.entrypoints.routes.oauth_consent import create_consent_route
     routes.append(create_google_callback_route())
+    routes.append(create_consent_route())
 
     admin_app = Starlette(routes=routes, middleware=middleware)
     admin_app.state.mcp_gateway_oauth_provider = provider  # type: ignore[attr-defined]
@@ -604,10 +655,10 @@ def _build_admin_app_with_oauth(
 
 
 def _build_superadmin_app_with_oauth(
-    superadmin_mcp_app: ASGIApp,
+    superadmin_mcp: FastMCP,
     provider: Any,
     settings: Settings,
-    allowed_emails: set[str],
+    allowed_emails: EmailAllowlist,
 ) -> Starlette:
     """Build superadmin MCP app: same OAuth as gateway, email allowlist check."""
     from mcp.server.auth.middleware.auth_context import (
@@ -618,7 +669,6 @@ def _build_superadmin_app_with_oauth(
         BearerAuthBackend,
         RequireAuthMiddleware,
     )
-    from mcp.server.auth.routes import create_auth_routes
     from pydantic import AnyHttpUrl
     from starlette.middleware.authentication import AuthenticationMiddleware
 
@@ -638,15 +688,7 @@ def _build_superadmin_app_with_oauth(
 
     routes: list[Route] = []
 
-    from mcp.server.auth.settings import ClientRegistrationOptions
-
-    routes.extend(
-        create_auth_routes(
-            provider=provider,
-            issuer_url=issuer_url,
-            client_registration_options=ClientRegistrationOptions(enabled=True),
-        )
-    )
+    routes.extend(gateway_auth_routes(provider, issuer_url))
 
     from mcp.server.auth.handlers.metadata import ProtectedResourceMetadataHandler
     from mcp.server.auth.routes import cors_middleware
@@ -695,11 +737,16 @@ def _build_superadmin_app_with_oauth(
     resource_metadata_url = AnyHttpUrl(
         f"{server_url}/admin-mcp/system/.well-known/oauth-protected-resource"
     )
+    # Allowlist first, then the owner check (see the admin app).
+    superadmin_mcp_app = superadmin_mcp.streamable_http_app()
+    owned_superadmin_mcp_app = _serve_sessions_per_caller(
+        superadmin_mcp_app, superadmin_mcp.session_manager,
+    )
     routes.append(
         Route(
             "/",
             endpoint=RequireAuthMiddleware(
-                SuperadminEmailMiddleware(superadmin_mcp_app),
+                SuperadminEmailMiddleware(owned_superadmin_mcp_app),
                 [],
                 resource_metadata_url,
             ),
@@ -708,7 +755,9 @@ def _build_superadmin_app_with_oauth(
     )
 
     from mcpolis.entrypoints.routes.google_callback import create_google_callback_route
+    from mcpolis.entrypoints.routes.oauth_consent import create_consent_route
     routes.append(create_google_callback_route())
+    routes.append(create_consent_route())
 
     sa_app = Starlette(routes=routes, middleware=middleware)
     sa_app.state.mcp_gateway_oauth_provider = provider  # type: ignore[attr-defined]
@@ -730,15 +779,20 @@ def _build_sandbox_provider_plumbing(
 
     - ``e2b`` (default in cloud) — ``E2BSandboxService`` backed by
       ``RealE2BClient(api_key=settings.e2b_api_key)``.
-    - ``local-subprocess`` (dev only; rejected in cloud by the
-      startup validator) — ``LocalSubprocessSandboxService``.
+    - ``local-subprocess`` (dev only; in cloud the startup validator
+      accepts it only when named explicitly on a loopback bind) —
+      ``LocalSubprocessSandboxService``.
 
     Empty ``MCPOLIS_SANDBOX_PROVIDER`` falls back to ``e2b`` when
-    an API key is configured, else ``local-subprocess`` (dev).
+    an API key is configured, else ``local-subprocess`` (standalone
+    only: in cloud the startup validator refuses an empty value
+    without a key, so this fallback never runs there).
 
-    The ``mcpolis_instance`` UUID is minted per process so the
-    E2B reconciler can distinguish "my sandboxes" from another
-    instance's during multi-instance deploys (plan §"Resilience").
+    The ``mcpolis_instance`` UUID minted here is PROVISIONAL: when
+    sandbox refs are durable, the lifespan swaps it for the store's
+    stable id (``_adopt_stable_sandbox_instance``) before any MCP
+    connects. A per-process id would hide every orphan a previous
+    process left from the boot reconciler.
     """
     import uuid
 
@@ -786,11 +840,12 @@ def _build_sandbox_provider_plumbing(
     if provider == "local-subprocess":
         # No-isolation dev path: stdio MCPs run as ordinary host
         # subprocesses (no CPU/RAM/disk enforcement, no egress filter,
-        # full host filesystem and network). Cloud mode rejects this
-        # provider outright in ``validate_startup_secrets``; here
-        # (standalone / dev) we allow it but flag it loudly so the
-        # operator knows the boundary is off. The README's "flagged as
-        # unsafe at startup" promise is this line.
+        # full host filesystem and network). In cloud mode
+        # ``validate_startup_secrets`` lets it through only when named
+        # explicitly on a loopback bind (local dev, e2e); wherever it
+        # runs we flag it loudly so the operator knows the boundary is
+        # off. The README's "flagged as unsafe at startup" promise is
+        # this line.
         logger.warning(
             "sandbox.provider.local_subprocess.unsafe",
             provider=provider,
@@ -798,14 +853,76 @@ def _build_sandbox_provider_plumbing(
                 "Sandbox provider resolved to 'local-subprocess': stdio "
                 "MCPs run UNSANDBOXED as host subprocesses with no "
                 "isolation (no resource limits, no egress filtering, "
-                "full host access). This is a dev-only path. Set "
-                "MCPOLIS_E2B_API_KEY (or MCPOLIS_SANDBOX_PROVIDER=e2b) to "
-                "run stdio MCPs in an isolated E2B sandbox."
+                "full host access). This is a dev-only path. To run "
+                "stdio MCPs in an isolated E2B sandbox, set "
+                "MCPOLIS_E2B_API_KEY AND set MCPOLIS_SANDBOX_PROVIDER to "
+                "'e2b' (or leave it empty): an explicit "
+                "'local-subprocess' wins over the key."
             ),
         )
 
     resolver = SandboxResolver(global_provider=provider)
     return resolver, services, persistence, instance_id
+
+
+def _sandbox_refs_are_durable(storage: StorageBundle) -> bool:
+    """False in standalone mode, where refs live in memory and die with
+    the process: there is nothing to reconcile against, and no previous
+    process whose sandboxes we could recognize."""
+    from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (  # noqa: PLC0415
+        InMemorySandboxPersistenceRepository,
+    )
+
+    return not isinstance(
+        storage.sandbox_persistence_repo, InMemorySandboxPersistenceRepository,
+    )
+
+
+async def _adopt_stable_sandbox_instance(
+    *,
+    storage: StorageBundle,
+    sandbox_services: dict[SandboxProviderName, SandboxService],
+    runtime_manager: OrgRuntimeManager,
+    provisional: str,
+) -> str:
+    """Swap the provisional per-process instance id for the store's
+    stable one, everywhere it is used. Returns the id now in force.
+
+    Must run before any MCP connects (the E2B service refuses
+    otherwise) and before the boot reconciler, which lists sandboxes
+    by this id. Standalone keeps the provisional id.
+    """
+    if not _sandbox_refs_are_durable(storage):
+        return provisional
+    from mcpolis.adapters.sandbox_e2b import E2BSandboxService  # noqa: PLC0415
+
+    instance_id = await storage.sandbox_persistence_repo.get_or_create_instance_id()
+    for service in sandbox_services.values():
+        if isinstance(service, E2BSandboxService):
+            service.adopt_instance_id(instance_id)
+    runtime_manager.adopt_instance_id(instance_id)
+    logger.info(
+        "sandbox.instance_id.adopted",
+        mcpolis_instance=instance_id,
+        provisional=provisional,
+    )
+    return instance_id
+
+
+# Upper bound on the boot cleanup. It runs before the app serves
+# anything, and each E2B call it makes may take up to the SDK's own 60 s
+# timeout, so a degraded E2B API could otherwise hold the boot for
+# minutes per orphan. Past the bound the boot goes on; what is left is
+# cleaned at the next boot. A normal cleanup takes a few seconds (one
+# listing, one kill per orphan).
+#
+# Well under the container's health check (docker-compose.yml): until the
+# boot is done nothing answers /health, and three failed checks after its
+# 15 s start period (about 40 s after the container starts) mark the
+# backend unhealthy, which stops a deploy from starting nginx
+# (``depends_on: service_healthy``). At 60 s a hung E2B listing did that.
+# ``tests/unit/test_container_timing.py`` keeps this under half of it.
+BOOT_RECONCILE_TIMEOUT_SECONDS: float = 15.0
 
 
 async def _run_sandbox_reconcile_at_boot(
@@ -815,6 +932,7 @@ async def _run_sandbox_reconcile_at_boot(
     sandbox_services: dict[SandboxProviderName, SandboxService] | None,
     mcpolis_instance: str,
     event_stream: EventStream,
+    timeout_seconds: float = BOOT_RECONCILE_TIMEOUT_SECONDS,
 ) -> None:
     """Run the per-backend startup reconciler before traffic flows.
 
@@ -828,10 +946,14 @@ async def _run_sandbox_reconcile_at_boot(
       orphan and kill them all; the plan explicitly forbids this.
     - The startup validator already passed, so credentials are
       present.
+    - No MCP has connected yet: the reconciler kills every sandbox no
+      ref points at, which would include one a start is creating.
 
     Skip silently when any precondition fails — the reconciler is a
     durability optimisation, not a correctness gate. Failures inside
-    ``reconcile()`` are logged + swallowed by the reconciler itself.
+    ``reconcile()`` are logged + swallowed by the reconciler itself,
+    and a reconcile still running after ``timeout_seconds`` is cut
+    short: the boot goes on without its report.
     """
     if settings.sandbox_provider != "e2b":
         return
@@ -841,13 +963,7 @@ async def _run_sandbox_reconcile_at_boot(
     # Standalone mode keeps refs in memory — there's no durable
     # source of truth to cross-reference against, so reconcile would
     # kill everything. Cloud mode flips to Mongo.
-    from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (  # noqa: PLC0415
-        InMemorySandboxPersistenceRepository,
-    )
-
-    if isinstance(
-        storage.sandbox_persistence_repo, InMemorySandboxPersistenceRepository,
-    ):
+    if not _sandbox_refs_are_durable(storage):
         logger.info(
             "sandbox.reconcile.skipped",
             reason="in-memory persistence — no durable refs to compare against",
@@ -868,7 +984,17 @@ async def _run_sandbox_reconcile_at_boot(
         storage.sandbox_persistence_repo,
         mcpolis_instance=mcpolis_instance,
     )
-    report = await reconciler.reconcile()
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            report = await reconciler.reconcile()
+    except TimeoutError:
+        logger.warning(
+            "sandbox.reconcile.timed_out",
+            provider="e2b",
+            mcpolis_instance=mcpolis_instance,
+            timeout_seconds=timeout_seconds,
+        )
+        return
     # SSE event so the admin UI can show "boot reconcile: killed N
     # orphans, kept M paused snapshots, GC'd K stale snapshots."
     # Reconcile is a cross-org operator-level operation; publish
@@ -886,11 +1012,80 @@ async def _run_sandbox_reconcile_at_boot(
                 "provider": report.provider,
                 "mcpolis_instance": report.mcpolis_instance,
                 "killed_orphan_sandboxes": report.killed_orphan_sandboxes,
+                "kept_tracked_sandboxes": report.kept_tracked_sandboxes,
                 "kept_paused_snapshots": report.kept_paused_snapshots,
                 "gc_old_unknown_snapshots": report.gc_old_unknown_snapshots,
                 "skipped_other_instance": report.skipped_other_instance,
             },
         ),
+    )
+
+
+class _RuntimeOrgFacts:
+    """``OrgFacts`` for the §5.2 sign-in warner, read from the live
+    runtime manager. Admins come from the org's policy config (the
+    membership row's role may lag a policy edit, and any role flagged
+    ``is_admin`` counts); readiness is ``resolve_upstream_readiness``,
+    the rule the dashboard shows."""
+
+    def __init__(
+        self,
+        runtime_manager: OrgRuntimeManager,
+        connection_store: ConnectionStore,
+    ) -> None:
+        self._runtime_manager = runtime_manager
+        self._connection_store = connection_store
+
+    async def admin_emails(self, org_id: str) -> list[str]:
+        runtime = await self._runtime_manager.get(org_id)
+        return runtime.policy_engine.get_admin_emails()
+
+    def slug(self, org_id: str) -> str | None:
+        return self._runtime_manager.get_slug(org_id)
+
+    def display_name(self, org_id: str) -> str | None:
+        return self._runtime_manager.get_display_name(org_id)
+
+    async def has_admin_sign_in(
+        self, org_id: str, upstream: UpstreamDefinition,
+    ) -> bool:
+        # The owner, not "Ready": a stopped upstream is never Ready, yet
+        # the admin sign-in Stop kept is still there for Start to reuse.
+        runtime = await self._runtime_manager.get(org_id)
+        _ready, owner = await resolve_upstream_readiness(
+            upstream, org_id, self._connection_store, runtime,
+        )
+        return owner is not None
+
+    async def is_member(self, org_id: str, email: str) -> bool:
+        runtime = await self._runtime_manager.get(org_id)
+        return runtime.policy_engine.is_member(email)
+
+    async def is_stopped(self, org_id: str, upstream_id: str) -> bool:
+        runtime = await self._runtime_manager.get(org_id)
+        return runtime.client_manager.is_stopped(upstream_id)
+
+
+async def _refresh_sign_ins_of_org(
+    runtime: OrgRuntime,
+    connection_store: ConnectionStore,
+    server_url: str,
+    *,
+    warner: SignInWarner | None,
+) -> None:
+    """One org's round of the periodic token refresh, read from its live
+    runtime: its MCPs as they are now, who is a member, which MCPs an
+    admin stopped, and the one-refresh-per-sign-in lock its reconnects
+    take."""
+    await refresh_org_sign_ins(
+        runtime.org_id,
+        runtime.live_upstreams(),
+        connection_store,
+        server_url,
+        is_member=runtime.policy_engine.is_member,
+        is_stopped=runtime.client_manager.is_stopped,
+        refresh_lock=runtime.client_manager.sign_in_refresh_lock,
+        warner=warner,
     )
 
 
@@ -971,6 +1166,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         mcpolis_instance=mcpolis_instance,
         template_var_repo=storage.template_var_repo,
         sandbox_file_repo=storage.sandbox_file_repo,
+        org_repo=storage.organization_repo,
     )
 
     drain = DrainCoordinator(drain_timeout=settings.drain_timeout)
@@ -986,8 +1182,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.mcp_json_path, upstream_options, oauth_apps=oauth_apps,
             allow_stdio=settings.allow_stdio_mcp,
         )
+        # Only addresses that accepted their invitation (a membership
+        # row) count as members of the org.
+        standalone_members = (
+            [
+                m.email
+                for m in storage.file_org_repo.list_memberships_sync(
+                    DEFAULT_ORG_ID,
+                )
+            ]
+            if storage.file_org_repo is not None else None
+        )
         runtime_manager.create_runtime_sync(
             DEFAULT_ORG_ID, app_config, standalone_upstreams,
+            members=standalone_members,
         )
         # Standalone mode runs as a single org whose slug equals
         # DEFAULT_ORG_ID. The wrapped resource URI scheme bakes the
@@ -1024,7 +1232,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ``StorageBundle`` (storage_factory.py) — keep it complete: an
     # omitted repo silently leaks that collection on org deletion. The
     # runtime-teardown hook is registered further down, once the slug
-    # cache exists. (``oauth_state`` is global, not org-scoped; ``locks``
+    # cache exists. (``gateway_oauth`` is global, not org-scoped; ``locks``
     # is ephemeral — both deliberately excluded.)
     org_service = OrgServiceCls(
         org_repo=storage.organization_repo,
@@ -1037,12 +1245,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         template_var_repo=storage.template_var_repo,
         sandbox_file_repo=storage.sandbox_file_repo,
         audit_repo=storage.audit_repo,
+        sandbox_services=sandbox_services,
+    )
+
+    # Request rate limits: gateway + Admin MCP tool calls (inside their
+    # handlers), sign-in endpoints + dashboard API (RateLimitMiddleware
+    # below). Counters live in ``storage.rate_limiter``: in-memory in
+    # standalone, Redis in cloud.
+    org_repo_for_plans = storage.organization_repo
+    rate_limits = RateLimitService(
+        storage.rate_limiter,
+        RequestRateLimits(
+            enabled=settings.rate_limit_enabled,
+            sign_in_per_min=settings.rate_limit_sign_in_per_min,
+            dashboard_per_min=settings.rate_limit_dashboard_per_min,
+            admin_mcp_per_min=settings.rate_limit_admin_mcp_per_min,
+        ),
+        plan_for_org=lambda org_id: resolve_plan(org_repo_for_plans, org_id),
+        reporter=RateLimitReporter(track=analytics.track_async),
     )
 
     # Create low-level MCP server (gateway)
-    mcp_server = create_mcp_server(runtime_manager, org_service=org_service)
-    session_manager = StreamableHTTPSessionManager(app=mcp_server)
+    mcp_server = create_mcp_server(
+        runtime_manager, org_service=org_service, rate_limits=rate_limits,
+    )
+    session_manager = StreamableHTTPSessionManager(
+        app=mcp_server, security_settings=mcp_transport_security(),
+    )
     session_registry = GatewaySessionRegistry()
+
+    # Jobs started from sync callbacks (the client_disconnect audit
+    # write, the SIGTERM drain), held until each ends.
+    background_tasks = BackgroundTaskSet()
 
     # Log client_disconnect when sessions are cleaned up
     def _on_session_disconnect(
@@ -1060,15 +1294,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             session_id=session_id,
             outcome="success",
         )
-        asyncio.get_event_loop().create_task(audit_repo.log(org_id, entry))
+        background_tasks.spawn(write_audit_entry(audit_repo, org_id, entry))
 
     session_registry.set_on_disconnect(_on_session_disconnect)
 
+    service_token_service = ServiceTokenService(storage.service_token_repo)
     policy_notifier = PolicyNotifier(
         session_manager, session_registry, runtime_manager,
         connection_store=connection_store,
         server_url=settings.server_url,
         debounce_seconds=settings.policy_notifier_debounce_seconds,
+        service_token_service=service_token_service,
     )
     # Forward upstream-side {tools,resources,prompts}/list_changed
     # notifications through the same notifier so downstream MCP clients
@@ -1089,8 +1325,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # only ``mint_test_token`` works (test_mode minted bearer tokens).
     # The dashboard browser-login path is decoupled — see
     # ``effective_dashboard_provider`` / ``dashboard_oauth_provider``
-    # below.
-    service_token_service = ServiceTokenService(storage.service_token_repo)
+    # below. (``service_token_service`` is built above, with the
+    # policy notifier, which needs it too.)
 
     mcp_app = _build_mcp_app_with_oauth(
         session_manager, settings, runtime_manager,
@@ -1119,15 +1355,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_stdio_mcp=settings.allow_stdio_mcp,
         org_repo=storage.organization_repo,
         service_token_service=service_token_service,
+        rate_limits=rate_limits,
+        template_var_repo=storage.template_var_repo,
     )
-    admin_mcp_starlette = admin_mcp.streamable_http_app()
-
     admin_guarded_app: ASGIApp = _build_admin_app_with_oauth(
-        admin_mcp_starlette, gateway_provider, settings, runtime_manager,
+        admin_mcp, gateway_provider, settings, runtime_manager,
     )
+
+    # Session managers of every mounted MCP endpoint. Starlette's
+    # ``Mount`` never runs a mounted app's lifespan, so the app lifespan
+    # starts each manager on this list; an endpoint whose manager is
+    # missing answers every request with 500 ("Task group is not
+    # initialized"). Append a manager where its endpoint is mounted
+    # (superadmin and demo, further down).
+    mcp_session_managers: list[StreamableHTTPSessionManager] = [
+        session_manager,
+        admin_mcp.session_manager,
+    ]
 
     # FastAPI lifespan: start session managers + upstream connections
-    admin_session_manager = admin_mcp.session_manager
     startup_task: asyncio.Task[None] | None = None
 
     async def _connect_all_orgs_background() -> None:
@@ -1185,6 +1431,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         await runtime.config_service.add_upstream(
             target_org_id, upstream_def,
+        )
+        # Like every new upstream: without its role access entries no
+        # role could use the demo after a remove and a restart.
+        await runtime.config_service.grant_role_access(
+            target_org_id, settings.demo_upstream_id,
         )
         try:
             await runtime.client_manager.connect_shared(upstream_def)
@@ -1254,14 +1505,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             name=f"policy-listener-{org_id}",
         )
 
-    # Shared §5.2 re-auth notification wiring. Built once so the
-    # periodic token-refresh loop (which notifies inline before deleting
-    # an invalid_grant token) and the hourly health-email sweep can't
-    # drift in how they reach users. A configured ``MCPOLIS_SMTP_HOST``
-    # selects the real SMTP transport (Google Workspace submission in
-    # prod); empty falls back to the logging ``StubEmailSender`` for
-    # dev / standalone. Reuses ``signing_key`` (built above) as the
-    # re-auth link HMAC key.
+    # Shared §5.2 re-auth notification wiring. Built once so every
+    # sender (the periodic token refresh and a reconnect, which both
+    # warn right after deleting a refused sign-in, and the hourly
+    # health-email sweep) reaches users the same way. A configured
+    # ``MCPOLIS_SMTP_HOST`` selects the real SMTP transport (Google
+    # Workspace submission in prod); empty falls back to the logging
+    # ``StubEmailSender`` for dev / standalone.
     from mcpolis.domain.ports.email_sender import EmailSender
     health_email_sender: EmailSender
     if settings.smtp_host:
@@ -1284,66 +1534,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from mcpolis.adapters.email.stub_email_sender import StubEmailSender
         health_email_sender = StubEmailSender()
 
-    async def _resolve_org_admin_emails(org_id: str) -> list[str]:
-        # Source of truth is the org's policy config — the membership
-        # row's ``role`` is a denormalization that may lag a policy edit.
-        # Routing through ``policy_engine`` also picks up *any* role
-        # flagged ``is_admin=True``, not just one literally named "admin".
-        runtime = await runtime_manager.get(org_id)
-        return runtime.policy_engine.get_admin_emails()
+    # None while the feature flag is off: every sender then skips the
+    # email, and deleting a dead sign-in works as before.
+    sign_in_warner = (
+        SignInWarner(
+            email_sender=health_email_sender,
+            orgs=_RuntimeOrgFacts(runtime_manager, connection_store),
+            server_url=settings.server_url,
+        )
+        if settings.upstream_health_email_enabled
+        else None
+    )
+    runtime_manager.set_sign_in_warner(sign_in_warner)
+    # One refresh of a sign-in's tokens at a time, across the periodic
+    # refresh and every org's reconnects (and, in cloud mode, across
+    # backends).
+    runtime_manager.set_sign_in_refresh_lock(
+        SignInRefreshLock(storage.distributed_lock),
+    )
 
     async def _periodic_token_refresh_all() -> None:
         """Background loop that refreshes OAuth tokens for all orgs."""
-        from mcpolis.domain.services.oauth_refresh import (
-            TOKEN_REFRESH_INTERVAL,
-        )
         while True:
             await asyncio.sleep(TOKEN_REFRESH_INTERVAL)
-            # Only thread the §5.2 notifier through when the feature flag
-            # is on; otherwise the inline notify is skipped (deps stay
-            # None) and the loop just deletes the dead token as before.
-            notify_on = settings.upstream_health_email_enabled
             for org_id, runtime in list(runtime_manager.all_runtimes.items()):
                 try:
-                    from mcpolis.domain.services.oauth_refresh import (
-                        refresh_token_for_user,
+                    await _refresh_sign_ins_of_org(
+                        runtime, connection_store, settings.server_url,
+                        warner=sign_in_warner,
                     )
-                    from mcpolis.domain.model.policy import AuthMode
-                    oauth_upstreams = [
-                        u for u in runtime.live_upstreams()
-                        if u.auth.mode in (AuthMode.admin_oauth, AuthMode.per_user_oauth)
-                    ]
-                    upstream_by_id = {u.id: u for u in oauth_upstreams}
-                    all_tokens = await connection_store.get_all_stored_tokens(org_id)
-                    for upstream_id, user_id in all_tokens:
-                        upstream = upstream_by_id.get(upstream_id)
-                        if upstream is None:
-                            continue
-                        # Bind per-iteration context so log lines emitted
-                        # during this refresh — including the MCP SDK's
-                        # ``mcp.client.auth.oauth2`` ERROR records and any
-                        # httpx output, which carry no upstream/user of
-                        # their own — automatically gain org/upstream/user
-                        # via ``foreign_pre_chain``'s ``merge_contextvars``.
-                        # Scoped via ``bound_contextvars`` so each iteration's
-                        # bindings can't leak into the next.
-                        with bound_contextvars(
-                            org_id=org_id,
-                            upstream_id=upstream.id,
-                            user_id=user_id,
-                        ):
-                            await refresh_token_for_user(
-                                org_id, upstream, user_id,
-                                connection_store, settings.server_url,
-                                distributed_lock=storage.distributed_lock,
-                                email_sender=(
-                                    health_email_sender if notify_on else None
-                                ),
-                                admin_email_resolver=(
-                                    _resolve_org_admin_emails if notify_on else None
-                                ),
-                                hmac_key=signing_key if notify_on else None,
-                            )
                 except Exception:
                     logger.exception(
                         "oauth.token.refresh.periodic.failed",
@@ -1352,22 +1571,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     async def _periodic_health_email_all() -> None:
         """§5.2 loop: hourly, for each org, check stored tokens and
-        send re-auth emails to users whose refresh has been
-        recorded as ``invalid_grant``. Uses the ``StubEmailSender``
-        today — real adapter swap lands in a follow-up. Stays
-        on-by-default because the stub is a no-op outward (just logs
-        + in-memory record); the ``upstream_health_email_enabled``
-        flag controls whether anything leaves the process once a
-        real adapter is wired.
+        send re-auth emails to users whose last refresh was refused
+        with a terminal code (``invalid_grant`` / ``invalid_client``).
+        Idle while the ``upstream_health_email_enabled`` flag is off
+        (``sign_in_warner`` is None).
         """
-        from mcpolis.domain.services.upstream_health_check import (
-            HEALTH_EMAIL_INTERVAL,
-            run_health_check_for_org,
-        )
-
         while True:
             await asyncio.sleep(HEALTH_EMAIL_INTERVAL)
-            if not settings.upstream_health_email_enabled:
+            if sign_in_warner is None:
                 logger.debug("upstream.health_email.disabled_flag_skipped_tick")
                 continue
             for org_id, runtime in list(runtime_manager.all_runtimes.items()):
@@ -1376,10 +1587,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         org_id=org_id,
                         upstreams=runtime.live_upstreams(),
                         connection_store=connection_store,
-                        email_sender=health_email_sender,
-                        admin_email_resolver=_resolve_org_admin_emails,
-                        server_url=settings.server_url,
-                        hmac_key=signing_key,
+                        warner=sign_in_warner,
                     )
                 except Exception:
                     logger.exception(
@@ -1418,11 +1626,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def app_lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        nonlocal startup_task
+        nonlocal startup_task, mcpolis_instance
         # Cloud mode: create Mongo indexes and sync membership rows.
         # Standalone mode: ensure the default org + roles exist.
         await initialize_storage(
             storage, audit_retention_days=settings.audit_retention_days,
+        )
+
+        # Stable sandbox instance id, before anything creates a sandbox
+        # or the reconciler lists them.
+        mcpolis_instance = await _adopt_stable_sandbox_instance(
+            storage=storage,
+            sandbox_services=sandbox_services,
+            runtime_manager=runtime_manager,
+            provisional=mcpolis_instance,
         )
 
         # MCPOLIS_E2B_FRESH_SANDBOXES one-shot override. Operator
@@ -1481,19 +1698,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
 
         await gateway_provider.load_state()
-        # Build a stack of session-manager contexts. The bundled demo
-        # adds one more if mounted — its ``session_manager.run()`` MUST
-        # run for /dev/mcp-demo/mcp requests to succeed (Starlette Mount
-        # does not propagate the inner FastMCP lifespan).
-        async with contextlib.AsyncExitStack() as stack:
-            await stack.enter_async_context(session_manager.run())
-            await stack.enter_async_context(admin_session_manager.run())
-            if settings.demo_mount:
-                demo_mcp_obj = getattr(app.state, "demo_mcp", None)
-                if demo_mcp_obj is not None:
-                    await stack.enter_async_context(
-                        demo_mcp_obj.session_manager.run(),
-                    )
+        # Start every mounted MCP endpoint (see ``mcp_session_managers``).
+        mcp_endpoints = McpEndpoints(mcp_session_managers)
+        try:
+            await mcp_endpoints.start()
+            if settings.mode == "standalone":
+                # The default runtime was built before the event loop
+                # ran; apply the saved Stops before any request.
+                await runtime_manager.apply_saved_stops(DEFAULT_ORG_ID)
             startup_task = asyncio.create_task(_connect_all_orgs_background())
             # Spawn one policy-event listener per existing org so events
             # from every tenant reach PolicyNotifier. New orgs created
@@ -1521,31 +1733,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 _periodic_health_email_all()
             )
 
-            # Register SIGTERM handler for graceful drain.
-            import signal
-            loop = asyncio.get_running_loop()
+            # SIGTERM: drain, then let uvicorn shut down and run the
+            # teardown below.
+            install_sigterm_drain(drain, background_tasks)
 
-            def _on_sigterm() -> None:
-                logger.info("app.sigterm.drain_started")
-                asyncio.create_task(drain.drain())
-
-            try:
-                loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
-            except NotImplementedError:
-                pass  # Windows doesn't support add_signal_handler
-
-            try:
-                yield
-            finally:
-                # Wait for in-flight requests to finish.
-                await drain.drain()
-                token_refresh_task.cancel()
-                liveness_probe_task.cancel()
-                health_email_task.cancel()
-                for _task in policy_listener_tasks.values():
-                    _task.cancel()
-                if startup_task and not startup_task.done():
-                    startup_task.cancel()
+            def _keep_sandboxes() -> None:
                 # Mark every active sandbox session as
                 # preserve-on-close BEFORE tearing down runtimes.
                 # Without this, the per-session finally block in the
@@ -1576,14 +1768,61 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         provider=getattr(_svc, "name", "?"),
                         marked=marked,
                     )
-                await runtime_manager.shutdown_all()
+
+            async def _close_stores() -> None:
                 await storage.event_stream.close()
                 await storage.rate_limiter.close()
                 await storage.distributed_lock.close()
                 if storage.mongo is not None:
                     storage.mongo.close()
 
+            try:
+                yield
+            finally:
+                # Must fit in the container's stop_grace_period, after
+                # the drain (docker-compose.yml); see ``ShutdownBudget``.
+                loops: list[asyncio.Task[None]] = [
+                    startup_task,
+                    token_refresh_task,
+                    liveness_probe_task,
+                    health_email_task,
+                    # Including the listeners of orgs created since boot.
+                    *policy_listener_tasks.values(),
+                ]
+                await shut_down(drain, ShutdownSteps(
+                    loops=loops,
+                    # Leaves every MCP endpoint's session manager now, all
+                    # at once, before the runtimes stop and Mongo closes.
+                    close_mcp_sessions=mcp_endpoints.close,
+                    keep_sandboxes=_keep_sandboxes,
+                    # Waits for none of their jobs: the shutdown's job
+                    # drain waits for all of them.
+                    stop_runtimes=lambda: runtime_manager.shutdown_all(wait=0),
+                    # Gateway sign-in deletions still on their way to
+                    # storage (a revoke made just before the deploy) must
+                    # land before Mongo closes, or the restart brings
+                    # them back.
+                    flush_gateway_sign_ins=gateway_provider.flush,
+                    close_stores=_close_stores,
+                ))
+        finally:
+            # After the shutdown above, a no-op. If the startup failed
+            # once the endpoints started, this leaves them.
+            await mcp_endpoints.close()
+
     app = FastAPI(title="MCP Hero Gateway", version="0.1.0", lifespan=app_lifespan)
+
+    @app.exception_handler(ConfigWriteConflictError)
+    async def _config_write_conflict_handler(
+        request: Request, exc: ConfigWriteConflictError,
+    ) -> JSONResponse:
+        # The org's settings kept changing under this write and nothing
+        # was saved, so the same request can simply be sent again. The
+        # store logged config.write_conflict with the org.
+        del request
+        return JSONResponse(
+            status_code=409, content={"detail": str(exc)},
+        )
 
     @app.exception_handler(PlanLimitExceeded)
     async def _plan_limit_exceeded_handler(
@@ -1599,6 +1838,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "limit": exc.limit,
                 "message": exc.message,
             },
+        )
+
+    @app.exception_handler(AdminActionRefused)
+    async def _admin_action_refused_handler(
+        request: Request, exc: AdminActionRefused,
+    ) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=refusal_status(exc),
+            content={"detail": refusal_detail(exc)},
         )
 
     # Starlette Mount only routes "/mcp/..." (with trailing slash).  Clients
@@ -1620,6 +1869,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.add_middleware(_TrailingSlashMiddleware)  # type: ignore[arg-type]
 
+    # Rate limits for sign-in endpoints and the dashboard API. Added
+    # before CORS so it runs inside it (``add_middleware`` is LIFO): a
+    # 429 still carries the CORS headers a browser-based MCP client
+    # needs to read it. Tool calls are limited in their MCP handlers.
+    app.add_middleware(
+        RateLimitMiddleware,  # type: ignore[arg-type]
+        service=rate_limits,
+        settings=settings,
+    )
+
+    # Refuses new requests while draining; counts in-flight ones until
+    # their last byte, so the drain waits for MCP tool calls. Added before
+    # CORS, like the rate limits, so it runs inside it: its 503 carries
+    # the CORS headers a browser-based MCP client needs to read it.
+    app.add_middleware(DrainMiddleware, drain=drain)
+
     # CORS for browser-based MCP clients (MCP Inspector, Claude.ai).
     # Non-browser clients (Claude Code, Claude desktop) ignore these
     # headers. OAuth discovery endpoints are public by design; the
@@ -1635,12 +1900,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # clients (MCP Inspector) so they can include it on subsequent
         # POSTs. Without this expose, the browser hides the header and
         # the next POST fails with "Bad Request: Missing session ID".
-        expose_headers=["WWW-Authenticate", "mcp-session-id"],
+        # ``Retry-After`` so a browser-based client can read the wait on
+        # a rate-limit 429.
+        expose_headers=["WWW-Authenticate", "mcp-session-id", "Retry-After"],
     )
-
-    # Rate limiting removed — the MCP gateway is behind OAuth so
-    # anonymous abuse isn't possible. Re-add in Phase 4 when real
-    # production traffic data is available to size limits against.
 
     # Bind per-request context (request_id, path, method) so every log
     # line emitted during the request automatically carries these
@@ -1676,23 +1939,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # which runs earlier in the ASGI chain so its decision is in
     # effect by the time this middleware fires.
     @app.middleware("http")
-    async def drain_middleware(request: Request, call_next: Any) -> Response:
-        # Health checks bypass drain so the LB can query status.
-        if request.url.path in ("/healthz", "/health"):
-            return await call_next(request)
-        if drain.is_draining:
-            return JSONResponse(
-                {"detail": "Server is shutting down"},
-                status_code=503,
-            )
-        drain.request_started()
-        try:
-            response: Response = await call_next(request)
-            return response
-        finally:
-            drain.request_finished()
-
-    @app.middleware("http")
     async def user_identity_middleware(request: Request, call_next: Any) -> Response:
         # User identity for log/audit/sentry binding. Two paths feed it:
         #
@@ -1704,7 +1950,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         #   request still showed up as ``user_id: anonymous`` in the
         #   uvicorn.access output.
         # * MCP / admin-mcp OAuth bearer paths set ``auth_context_var``
-        #   later in the chain; ``_get_current_user`` reads that first,
+        #   later in the chain; ``current_caller_id`` reads that first,
         #   so this middleware doesn't need to handle them.
         user_id = "anonymous"
         cookie_value = request.cookies.get(SESSION_COOKIE_NAME)
@@ -1838,6 +2084,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.connection_store = connection_store  # type: ignore[attr-defined]
     app.state.event_bus = event_bus  # type: ignore[attr-defined]
     app.state.runtime_manager = runtime_manager  # type: ignore[attr-defined]
+    app.state.policy_notifier = policy_notifier  # type: ignore[attr-defined]
 
     # Surface the gateway OAuth provider on the outer app's state so
     # tests / integration callers can mint bearer tokens via
@@ -1922,6 +2169,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _spawn_policy_listener(new_org.id)
         runtime_manager.register_display_name(new_org.id, new_org.display_name)
         runtime_manager.register_slug(new_org.id, new_org.slug)
+        # The creator's membership row was just saved. A runtime built
+        # before that (a request naming the new slug) must count them.
+        if new_org.created_by_email:
+            runtime_manager.note_member_joined(
+                new_org.id, new_org.created_by_email,
+            )
 
     async def _teardown_org_runtime(org_id: str) -> None:
         # Run by ``OrgService.delete_organization`` before the persistence
@@ -1938,13 +2191,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         create_org_router(
             settings,
             org_service,
-            dashboard_auth.get_current_user,
+            dashboard_auth.get_session_user,
             upstream_config_store=storage.upstream_config_repo,
             on_org_created=_on_org_created,
         ),
     )
-    # Add the org-context middleware AFTER rate limiting so it runs
-    # first in the ASGI stack (FastAPI LIFO). One code path for both
+    # Add the org-context middleware (almost) last so it runs before the
+    # others in the ASGI stack (FastAPI LIFO); only the run-to-completion
+    # wrapper below sits outside it. One code path for both
     # modes — in standalone the middleware injects ``/default`` into
     # slug-less ``/mcp`` paths so the same slug-aware pipeline handles
     # every request.
@@ -1954,6 +2208,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         org_service=org_service,
         slug_cache=slug_cache,
     )
+    # Every dashboard / operator request that changes something runs to
+    # its end once started, whatever cancels it. Must stay the outermost
+    # middleware (added last): see ``run_to_completion``.
+    app.add_middleware(RunToCompletionMiddleware)
     app.state.org_service = org_service  # type: ignore[attr-defined]
 
     def _get_startup_status() -> StartupStatusResponse:
@@ -1977,6 +2235,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         gateway_url=effective_gateway_url(settings),
         get_current_user=dashboard_auth.get_current_user,
         require_admin=dashboard_auth.require_admin,
+        get_session_user=dashboard_auth.get_session_user,
         get_startup_status=_get_startup_status,
         get_gateway_connected_users=gateway_connected_users_fn,
         revoke_gateway_user=revoke_gateway_user_fn,
@@ -1989,6 +2248,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         template_var_repo=storage.template_var_repo,
         sandbox_file_repo=storage.sandbox_file_repo,
         service_token_service=service_token_service,
+        superadmin_emails=settings.parsed_superadmin_emails(),
     )
     app.include_router(dashboard_api_router)
 
@@ -2092,15 +2352,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 runtime_manager=runtime_manager,
                 org_service=org_service,
             )
-            superadmin_starlette = superadmin_mcp.streamable_http_app()
 
             superadmin_provider = mcp_app.state.mcp_gateway_oauth_provider  # type: ignore[union-attr]
             superadmin_guarded = _build_superadmin_app_with_oauth(
-                superadmin_starlette,
+                superadmin_mcp,
                 superadmin_provider,
                 settings,
                 superadmin_emails_set,
             )
+            # The builder created the session manager (its
+            # ``streamable_http_app()`` call); the lifespan starts it.
+            mcp_session_managers.append(superadmin_mcp.session_manager)
             app.mount("/admin-mcp/system", superadmin_guarded)  # type: ignore[arg-type]
             logger.info(
                 "superadmin.mcp.enabled",
@@ -2116,14 +2378,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # the SPA fallback (registered below) catches everything else.
     # Auto-registration on an org is gated by the separate
     # ``MCPOLIS_DEMO_SEED`` flag and runs from inside the lifespan via
-    # ``_seed_demo_upstream`` defined above. ``app.state.demo_mcp``
-    # carries the FastMCP instance so the lifespan can enter its
-    # ``session_manager.run()`` context; without that, mounted MCP
-    # requests fail with "Task group is not initialized."
+    # ``_seed_demo_upstream`` defined above. Its session manager joins
+    # ``mcp_session_managers`` so the lifespan starts it.
     if settings.demo_mount:
         demo_app, demo_mcp = build_demo_app(public_url=settings.server_url)
         app.mount("/dev/mcp-demo", demo_app)  # type: ignore[arg-type]
-        app.state.demo_mcp = demo_mcp  # type: ignore[attr-defined]
+        mcp_session_managers.append(demo_mcp.session_manager)
         logger.info(
             "demo_upstream.mounted",
             mount_path="/dev/mcp-demo",
@@ -2291,4 +2551,8 @@ def run() -> None:
         host=settings.host,
         port=settings.port,
         log_config=None,
+        # After the SIGTERM drain, open connections (dashboard event
+        # streams, MCP streams) get this long before they are cut, so
+        # they cannot hold the shutdown open until Docker kills it.
+        timeout_graceful_shutdown=settings.graceful_shutdown_timeout,
     )

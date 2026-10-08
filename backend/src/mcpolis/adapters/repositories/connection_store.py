@@ -34,6 +34,25 @@ class OAuthToken:
     # ``put_user_token_if_same_sign_in``. ``None`` for rows saved before
     # sign-in ids existed, and ``None`` matches them.
     sign_in: str | None = None
+    # When the user made this sign-in: set by ``put_user_token``, kept by
+    # every refresh of it (unlike ``updated_at``). Orders admins' sign-ins
+    # for the admin sign-in slot (``slot_owner_of``), through
+    # ``sign_in_time``. ``None`` for rows saved before it existed.
+    signed_in_at: datetime | None = None
+
+    @property
+    def sign_in_time(self) -> datetime | None:
+        """When the user made this sign-in, as the admin sign-in slot
+        orders sign-ins: ``signed_in_at``.
+
+        A row saved before ``signed_in_at`` existed (every row at the
+        deploy that added it) has none: its last save (``updated_at``)
+        stands in, the time the slot was ordered by until then, so the
+        deploy leaves the slot with the admin it had. The first refresh of
+        such a row saves this time as its ``signed_in_at`` (see
+        ``put_user_token_if_same_sign_in``), so later refreshes no longer
+        move it. ``None`` for a row with neither."""
+        return self.signed_in_at if self.signed_in_at is not None else self.updated_at
 
 
 @dataclass(frozen=True)
@@ -59,8 +78,9 @@ class ConnectionStore:
     async def put_user_token(
         self, org_id: str, user_id: str, upstream_id: str, token: OAuthToken,
     ) -> SavedSignIn:
-        """Save ``token`` as a new sign-in of the user, whatever is stored.
-        Returns the new sign-in's id and the row's revision."""
+        """Save ``token`` as a new sign-in of the user, whatever is stored,
+        signed in now (``signed_in_at``). Returns the new sign-in's id and
+        the row's revision."""
         raise NotImplementedError
 
     async def put_user_token_if_same_sign_in(
@@ -69,10 +89,11 @@ class ConnectionStore:
     ) -> str | None:
         """Save a token refresh only while the stored row still belongs to
         ``expected_sign_in``, the sign-in it was refreshed from, whichever
-        of that sign-in's refreshes is stored now. Returns the new
-        revision, or ``None`` when the user has signed in again (another
-        sign-in) or disconnected (no row): writing then would undo either.
-        Atomic."""
+        of that sign-in's refreshes is stored now. The row keeps the
+        sign-in's time (``OAuthToken.sign_in_time`` of the stored row, saved
+        as its ``signed_in_at``). Returns the new revision, or ``None``
+        when the user has signed in again (another sign-in) or
+        disconnected (no row): writing then would undo either. Atomic."""
         raise NotImplementedError
 
     async def delete_user_token(self, org_id: str, user_id: str, upstream_id: str) -> None:

@@ -38,13 +38,14 @@ from typing import Any
 import structlog
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.prompts import base
-from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ServerCapabilities
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
+
+from mcpolis.entrypoints.mcp_transport_security import mcp_transport_security
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
@@ -155,13 +156,9 @@ def build_demo_mcp(public_url: str) -> FastMCP:
         stateless_http=True,
         json_response=True,
         # Tunneled/proxied origins (ngrok, Vite dev proxy) hand the
-        # backend a non-loopback Host. FastMCP's default allow-list
-        # rejects those with 421. Disabling DNS-rebinding protection is
-        # required for the demo to work behind the Vite proxy at
-        # ``dev.example.com``. See FINDINGS §1.2.
-        transport_security=TransportSecuritySettings(
-            enable_dns_rebinding_protection=False,
-        ),
+        # backend a non-loopback Host, which FastMCP's default host
+        # check rejects with 421; see ``mcp_transport_security``.
+        transport_security=mcp_transport_security(),
     )
 
     # ── E2E-fixture tools (preserved from the old test_mcp_server.py)
@@ -527,10 +524,9 @@ def build_demo_app(public_url: str) -> tuple[Starlette, FastMCP]:
     to the parent — Starlette only honors its own
     ``Starlette(lifespan=...)`` callback. Without entering the demo's
     ``session_manager.run()`` ourselves, the first MCP request fails
-    with "Task group is not initialized." The backend's lifespan
-    threads ``demo_mcp.session_manager.run()`` into the existing
-    ``async with`` chain alongside the gateway's session managers
-    (see ``app.py``).
+    with "Task group is not initialized." The backend adds
+    ``demo_mcp.session_manager`` to the session managers its
+    lifespan starts (``mcp_session_managers`` in ``app.py``).
 
     We extend the Starlette app FastMCP returns rather than wrapping
     it for the same reason: a parent Starlette wrapping wouldn't

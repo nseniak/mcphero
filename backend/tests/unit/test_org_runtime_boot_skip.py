@@ -31,6 +31,7 @@ from mcpolis.adapters.upstream_clients.client_manager import UpstreamClientManag
 from mcpolis.adapters.upstream_clients.upstream_state import (
     UpstreamConnectionState,
 )
+from mcpolis.domain.model.settings import SettingsConfig
 from mcpolis.domain.model.upstream import (
     ServerInfo,
     TransportType,
@@ -44,7 +45,7 @@ from mcpolis.domain.services.org_runtime import (
     OrgRuntimeManager,
     StartupStatus,
 )
-from tests.unit.factories import make_upstream_definition
+from tests.unit.factories import make_oauth_upstream, make_upstream_definition
 
 
 def _seed_cached_ref(
@@ -487,3 +488,54 @@ async def test_a_stop_during_the_boot_connect_is_not_a_boot_failure(
     ], "a Stop during boot raised an ERROR (Sentry) event"
     connection_repo.set_disabled.assert_not_awaited()
     await mgr.stop_all()
+
+
+def _make_org_manager_with_saved_stop(
+    upstream_id: str,
+) -> OrgRuntimeManager:
+    """``OrgRuntimeManager`` whose repos hold one upstream, saved as
+    stopped by an admin before the restart."""
+    config_repo = MagicMock()
+    config_repo.load = AsyncMock(return_value=SettingsConfig())
+    upstream_config_repo = MagicMock()
+    upstream_config_repo.get_all = AsyncMock(
+        return_value=[make_oauth_upstream(id=upstream_id)],
+    )
+    connection_repo = MagicMock()
+    connection_repo.get_disabled_ids = AsyncMock(return_value={upstream_id})
+    return OrgRuntimeManager(
+        config_repo=config_repo,
+        upstream_config_repo=upstream_config_repo,
+        connection_repo=connection_repo,
+        audit_repo=MagicMock(),
+        tool_catalog_repo=MagicMock(),
+        server_url="http://localhost:8080",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_runtime_is_stopped_where_saved_before_it_serves_anything() -> None:
+    """After a restart, the first request can build an org's runtime
+    before startup reaches that org. A saved Stop must already hold for
+    that request: otherwise a member's call reconnects from their saved
+    sign-in and keeps a session the Stop never closes."""
+    org_manager = _make_org_manager_with_saved_stop("drop")
+
+    runtime = await org_manager.get("acme")
+
+    assert runtime.client_manager.is_stopped("drop")
+
+
+@pytest.mark.asyncio
+async def test_standalone_saved_stops_apply_before_serving() -> None:
+    """Standalone builds its runtime before the event loop runs, so the
+    saved Stops are applied separately, before the first request."""
+    org_manager = _make_org_manager_with_saved_stop("drop")
+    runtime = org_manager.create_runtime_sync(
+        "default", SettingsConfig(), [make_oauth_upstream(id="drop")],
+    )
+    assert not runtime.client_manager.is_stopped("drop")
+
+    await org_manager.apply_saved_stops("default")
+
+    assert runtime.client_manager.is_stopped("drop")

@@ -182,3 +182,64 @@ def test_prune_data_still_drops_admin_rows_for_removed_upstreams(
     remaining = json.loads(conn_path.read_text())
     assert "user:removed-mcp:__admin__" not in remaining
     assert "user:notion:__admin__" in remaining
+
+
+def test_prune_data_keeps_a_member_invited_with_capitals(tmp_path: Path) -> None:
+    """Invited as ``Bob@Co.com``, bob joined and signed in as
+    ``bob@co.com``: his sign-ins are saved under that spelling. Letter
+    case carries no meaning, so a restart keeps them."""
+    conn_path = tmp_path / "connections.json"
+    _write_connections(conn_path, {
+        "user:notion:bob@co.com": {"token": {"access_token": "bob-at"}},
+        "client_info:notion:bob@co.com": {"client_id": "cid"},
+    })
+    (tmp_path / "oauth_state.json").write_text(json.dumps({
+        "access_tokens": {"at-1": {"user_email": "bob@co.com"}},
+        "refresh_tokens": {"rt-1": {"user_email": "orphan@co.com"}},
+    }))
+
+    prune_data(
+        org_id="default",
+        data_dir=tmp_path,
+        valid_emails={"Bob@Co.com"},
+        valid_upstream_ids={"notion"},
+    )
+
+    assert set(json.loads(conn_path.read_text())) == {
+        "user:notion:bob@co.com", "client_info:notion:bob@co.com",
+    }
+    gateway = json.loads((tmp_path / "oauth_state.json").read_text())
+    assert set(gateway["access_tokens"]) == {"at-1"}
+    assert gateway["refresh_tokens"] == {}
+
+
+def test_prune_data_keeps_sign_ins_saved_under_a_capitalized_address(
+    tmp_path: Path,
+) -> None:
+    """The other way round: bob is in the users as ``bob@co.com`` and his
+    sign-ins were saved as ``Bob@Co.com``. Letter case is ignored on the
+    saved side too; an orphan's sign-ins still go."""
+    conn_path = tmp_path / "connections.json"
+    _write_connections(conn_path, {
+        "user:notion:Bob@Co.com": {"token": {"access_token": "bob-at"}},
+        "oauth_metadata:notion:Bob@Co.com": {"issuer": "https://auth.example"},
+        "user:notion:Orphan@Co.com": {"token": {"access_token": "orphan-at"}},
+    })
+    (tmp_path / "oauth_state.json").write_text(json.dumps({
+        "access_tokens": {"at-1": {"user_email": "Bob@Co.com"}},
+        "refresh_tokens": {"rt-1": {"user_email": "Orphan@Co.com"}},
+    }))
+
+    prune_data(
+        org_id="default",
+        data_dir=tmp_path,
+        valid_emails={"bob@co.com"},
+        valid_upstream_ids={"notion"},
+    )
+
+    assert set(json.loads(conn_path.read_text())) == {
+        "user:notion:Bob@Co.com", "oauth_metadata:notion:Bob@Co.com",
+    }
+    gateway = json.loads((tmp_path / "oauth_state.json").read_text())
+    assert set(gateway["access_tokens"]) == {"at-1"}
+    assert gateway["refresh_tokens"] == {}

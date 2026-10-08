@@ -20,6 +20,7 @@ import hashlib
 import secrets
 from datetime import datetime
 
+from mcp.server.auth.provider import AccessToken
 from pydantic import BaseModel
 
 # Raw-token prefix. Lets the gateway's composite verifier dispatch to
@@ -58,38 +59,53 @@ def is_service_identity(user_id: str) -> bool:
     return user_id.startswith(SVC_IDENTITY_PREFIX)
 
 
-# --- Auth-scope encoding ---
+# --- Auth-boundary encoding ---
 #
-# The boundary-resolved (role, org) ride in the SDK-blessed channel —
-# ``AccessToken.scopes`` — minted by the gateway's service-token
-# verifier and read back by the gateway controller / org-pin
-# middleware. The encoding is a domain concern (it defines what a
-# service-token credential *means*); the adapter only mints it.
+# The boundary-resolved (role, org) ride on the AccessToken itself, as
+# typed fields of ``ServiceAccessToken``. Only the service-token
+# verifier constructs one, so only a registry lookup can confer a
+# service identity. They used to ride as scopes (``mcpolis:svc``,
+# ``mcpolis:role:<role>``, ``mcpolis:org:<org>``); scopes are client
+# input on the OAuth path (dynamic client registration accepts any
+# scope string), so a human could request them and be treated as an
+# admin service identity pinned to any org.
 
-SCOPE_SVC = "mcpolis:svc"
-SCOPE_ROLE_PREFIX = "mcpolis:role:"
-SCOPE_ORG_PREFIX = "mcpolis:org:"
+# Scope namespace the platform reserves, matched case-insensitively.
+# The gateway OAuth provider refuses to register it and strips it from
+# anything it issues or loads, so a token never carries it. This is a
+# second barrier: nothing authorizes on scopes in the first place.
+RESERVED_SCOPE_PREFIX = "mcpolis:"
 
 
-def is_service_token_auth(scopes: list[str]) -> bool:
-    return SCOPE_SVC in scopes
+class ServiceAccessToken(AccessToken):
+    """AccessToken minted by the service-token verifier, and only there."""
+
+    role_name: str
+    org_id: str
 
 
-def boundary_role_from_auth_scopes(scopes: list[str]) -> str | None:
+def is_reserved_scope(scope: str) -> bool:
+    return scope.casefold().startswith(RESERVED_SCOPE_PREFIX)
+
+
+def strip_reserved_scopes(scopes: list[str] | None) -> list[str]:
+    return [s for s in scopes or [] if not is_reserved_scope(s)]
+
+
+def is_service_token_auth(token: AccessToken) -> bool:
+    return isinstance(token, ServiceAccessToken)
+
+
+def boundary_role_from_access_token(token: AccessToken) -> str | None:
     """Role carried by a service-token auth, or None for human auth."""
-    if SCOPE_SVC not in scopes:
-        return None
-    for scope in scopes:
-        if scope.startswith(SCOPE_ROLE_PREFIX):
-            return scope[len(SCOPE_ROLE_PREFIX):]
+    if isinstance(token, ServiceAccessToken):
+        return token.role_name
     return None
 
 
-def pinned_org_from_auth_scopes(scopes: list[str]) -> str | None:
-    """Org a service token is pinned to, or None for human auth."""
-    if SCOPE_SVC not in scopes:
-        return None
-    for scope in scopes:
-        if scope.startswith(SCOPE_ORG_PREFIX):
-            return scope[len(SCOPE_ORG_PREFIX):]
+def pinned_org_from_access_token(token: AccessToken) -> str | None:
+    """Org a service token is pinned to, or None for human auth (or an
+    empty org, which callers must treat as fail-closed)."""
+    if isinstance(token, ServiceAccessToken):
+        return token.org_id or None
     return None

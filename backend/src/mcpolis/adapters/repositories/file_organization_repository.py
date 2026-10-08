@@ -2,16 +2,16 @@
 
 Standalone mode pretends the whole installation is one organization
 named ``default`` — ``create_organization`` always raises because
-multi-org is a cloud-mode feature. But memberships (the "has signed
-in at least once" log that drives the Team tab's Pending/Joined
-status) are persisted to ``<data_dir>/memberships.json`` so the same
-``OrgService`` + ``list_users`` code paths work identically in both
-modes.
+multi-org is a cloud-mode feature. But memberships (the accepted
+invitations that drive the Team tab's Pending/Joined status and make
+someone a member) are persisted to ``<data_dir>/memberships.json`` so
+the same ``OrgService`` + ``list_users`` code paths work identically in
+both modes.
 
-The users dict of ``config.json`` remains the allowlist: who is
-permitted to sign in and with what role. The membership file is the
-sign-in log: one row per ``(org_id, email)`` that has actually
-signed in.
+The users dict of ``config.json`` holds the members and the pending
+invitations, each with its role. The membership file has one row per
+``(org_id, email)`` that accepted its invitation (or set the install
+up): only those are members.
 """
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from typing import Any
 
 import structlog
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
 from mcpolis.domain.model.subscription import PlanName, Subscription
 from mcpolis.domain.ports import DEFAULT_ORG_ID, Membership, Organization
 from mcpolis.domain.ports.organization_repository import OrganizationRepository
@@ -80,9 +81,10 @@ class FileOrganizationRepository(OrganizationRepository):
             )
 
     def _persist_subscription(self) -> None:
-        tmp = self._subscription_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._subscription.model_dump(mode="json"), indent=2))
-        tmp.replace(self._subscription_path)
+        write_text_atomic(
+            self._subscription_path,
+            json.dumps(self._subscription.model_dump(mode="json"), indent=2),
+        )
 
     def _load(self) -> None:
         if not self._path.exists():
@@ -121,9 +123,7 @@ class FileOrganizationRepository(OrganizationRepository):
             }
             for m in self._memberships.values()
         ]
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        tmp.replace(self._path)
+        write_text_atomic(self._path, json.dumps(data, indent=2))
 
     # --- Organizations ---
 
@@ -155,6 +155,12 @@ class FileOrganizationRepository(OrganizationRepository):
     # --- Memberships ---
 
     async def list_memberships(self, org_id: str) -> list[Membership]:
+        return self.list_memberships_sync(org_id)
+
+    def list_memberships_sync(self, org_id: str) -> list[Membership]:
+        """``list_memberships`` for the standalone boot, which builds the
+        org's runtime before the event loop runs. The rows are loaded
+        from disk in ``__init__``, so no I/O happens here."""
         return [
             m for m in self._memberships.values() if m.org_id == org_id
         ]
@@ -176,9 +182,33 @@ class FileOrganizationRepository(OrganizationRepository):
         self._persist()
         return membership
 
+    async def update_membership_role(
+        self, org_id: str, email: str, role: str
+    ) -> bool:
+        existing = self._memberships.get((org_id, email))
+        if existing is None:
+            return False
+        self._memberships[(org_id, email)] = existing.model_copy(
+            update={"role": role},
+        )
+        self._persist()
+        return True
+
     async def remove_membership(self, org_id: str, email: str) -> None:
         if self._memberships.pop((org_id, email), None) is not None:
             self._persist()
+
+    async def rename_role(
+        self, org_id: str, old_name: str, new_name: str
+    ) -> int:
+        moved = 0
+        for key, m in list(self._memberships.items()):
+            if m.org_id == org_id and m.role == old_name:
+                self._memberships[key] = m.model_copy(update={"role": new_name})
+                moved += 1
+        if moved:
+            self._persist()
+        return moved
 
     async def delete_organization(self, org_id: str) -> None:
         raise ValueError("Cannot delete organizations in standalone mode")

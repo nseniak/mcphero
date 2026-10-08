@@ -30,17 +30,15 @@ without breaking HTTPS upstreams.
 from __future__ import annotations
 
 import ipaddress
-import os
 from urllib.parse import urlsplit
 
 import httpx
 
 from mcpolis.domain.services.url_safety import (
     UnsafeUpstreamUrl,
+    loopback_switch_on,
     validate_upstream_url,
 )
-
-_TEST_LOOPBACK_FLAG = "MCPOLIS_TEST_SAFE_HTTP_ALLOW_LOOPBACK"
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -75,7 +73,7 @@ class SafeAsyncHTTPTransport(httpx.AsyncHTTPTransport):
             validate_upstream_url(url_str)
         except UnsafeUpstreamUrl:
             if (
-                os.environ.get(_TEST_LOOPBACK_FLAG) == "1"
+                loopback_switch_on()
                 and _is_loopback_url(url_str)
             ):
                 # Test escape hatch: only loopback, only when the env

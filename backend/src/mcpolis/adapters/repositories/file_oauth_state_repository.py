@@ -1,123 +1,95 @@
 """JSON-file backed ``OAuthStateRepository`` for standalone mode.
 
 Single global ``oauth_state.json`` file — the gateway OAuth namespace
-is no longer partitioned by org. Standalone mode never had a real
+is not partitioned by org. Standalone mode never had a real
 multi-tenant story for gateway tokens anyway.
+
+A file has no size ceiling, so the state stays one file: each change
+is applied to a copy kept in memory and the whole file is rewritten
+atomically (temporary file, then rename). A failed write leaves the
+previous file in place; the provider writes the same changes again
+later, and that rewrite includes them.
+
+Files written by older builds still load: tokens and approvals keep
+their layout (``data_pruner`` edits the token sections too), and a
+client stored as the bare registration reads as one that never
+expires (``StoredClient.from_before_expiry``).
 """
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
-from typing import Any
 
 import structlog
-from mcp.shared.auth import OAuthClientInformationFull
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
+from mcpolis.adapters.repositories.oauth_state_codec import (
+    ACCESS_TOKENS,
+    CLIENT_APPROVALS,
+    CLIENTS,
+    REFRESH_TOKENS,
+    ItemCodec,
+    JsonObject,
+)
 from mcpolis.domain.ports.oauth_state_repository import (
+    OAuthStateChanges,
     OAuthStateRepository,
     OAuthStateSnapshot,
-    StoredAccessToken,
-    StoredRefreshToken,
 )
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
-# Refresh tokens expire after this many seconds (also enforced at mint
-# time in ``mcp_gateway_oauth_provider``). Loaded tokens beyond the TTL are
-# dropped on load so a restart cleans up expired state.
-REFRESH_TOKEN_TTL = 30 * 86400
+
+def _encode_kind[T](codec: ItemCodec[T], items: dict[str, T]) -> JsonObject:
+    return {key: codec.encode(item) for key, item in items.items()}
 
 
 class FileOAuthStateRepository(OAuthStateRepository):
     def __init__(self, data_dir: Path) -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
         self._path = data_dir / "oauth_state.json"
+        self._state: OAuthStateSnapshot | None = None
 
     async def load(self) -> OAuthStateSnapshot:
+        self._state = self._read()
+        return self._state.copy()
+
+    async def apply(self, changes: OAuthStateChanges) -> None:
+        if self._state is None:
+            self._state = self._read()
+        self._state.apply(changes)
+        self._write(self._state)
+
+    def _read(self) -> OAuthStateSnapshot:
         if not self._path.exists():
             return OAuthStateSnapshot()
         try:
-            data: dict[str, Any] = json.loads(self._path.read_text())
+            data: object = json.loads(self._path.read_text())
         except (json.JSONDecodeError, OSError):
             logger.warning(
                 "oauth_state.read.failed",
                 path=str(self._path),
             )
             return OAuthStateSnapshot()
-
-        snapshot = OAuthStateSnapshot()
-        now = int(time.time())
-
-        for client_id, client_data in data.get("clients", {}).items():
-            try:
-                snapshot.clients[client_id] = (
-                    OAuthClientInformationFull.model_validate(client_data)
-                )
-            except Exception:
-                logger.warning(
-                    "oauth_state.client_registration.invalid",
-                    client_id=client_id,
-                )
-
-        for token_str, token_data in data.get("access_tokens", {}).items():
-            stored = StoredAccessToken(
-                token=token_data["token"],
-                client_id=token_data["client_id"],
-                user_email=token_data["user_email"],
-                scopes=token_data.get("scopes", []),
-                expires_at=token_data["expires_at"],
-            )
-            if stored.expires_at > now:
-                snapshot.access_tokens[token_str] = stored
-
-        for token_str, token_data in data.get("refresh_tokens", {}).items():
-            stored_r = StoredRefreshToken(
-                token=token_data["token"],
-                client_id=token_data["client_id"],
-                user_email=token_data["user_email"],
-                scopes=token_data.get("scopes", []),
-                created_at=token_data["created_at"],
-            )
-            if time.time() - stored_r.created_at <= REFRESH_TOKEN_TTL:
-                snapshot.refresh_tokens[token_str] = stored_r
-
-        logger.info(
-            "oauth_state.loaded",
-            clients_count=len(snapshot.clients),
-            access_tokens_count=len(snapshot.access_tokens),
-            refresh_tokens_count=len(snapshot.refresh_tokens),
+        if not isinstance(data, dict):
+            return OAuthStateSnapshot()
+        raw: JsonObject = data  # pyright: ignore[reportUnknownVariableType]
+        return OAuthStateSnapshot(
+            clients=CLIENTS.decode_all(raw.get(CLIENTS.kind)),
+            access_tokens=ACCESS_TOKENS.decode_all(raw.get(ACCESS_TOKENS.kind)),
+            refresh_tokens=REFRESH_TOKENS.decode_all(raw.get(REFRESH_TOKENS.kind)),
+            client_approvals=CLIENT_APPROVALS.decode_all(
+                raw.get(CLIENT_APPROVALS.kind),
+            ),
         )
-        return snapshot
 
-    async def save(self, snapshot: OAuthStateSnapshot) -> None:
-        data: dict[str, Any] = {
-            "clients": {
-                cid: client.model_dump(mode="json")
-                for cid, client in snapshot.clients.items()
-            },
-            "access_tokens": {
-                t: {
-                    "token": s.token,
-                    "client_id": s.client_id,
-                    "user_email": s.user_email,
-                    "scopes": s.scopes,
-                    "expires_at": s.expires_at,
-                }
-                for t, s in snapshot.access_tokens.items()
-            },
-            "refresh_tokens": {
-                t: {
-                    "token": s.token,
-                    "client_id": s.client_id,
-                    "user_email": s.user_email,
-                    "scopes": s.scopes,
-                    "created_at": s.created_at,
-                }
-                for t, s in snapshot.refresh_tokens.items()
-            },
+    def _write(self, state: OAuthStateSnapshot) -> None:
+        data: JsonObject = {
+            CLIENTS.kind: _encode_kind(CLIENTS, state.clients),
+            ACCESS_TOKENS.kind: _encode_kind(ACCESS_TOKENS, state.access_tokens),
+            REFRESH_TOKENS.kind: _encode_kind(REFRESH_TOKENS, state.refresh_tokens),
+            CLIENT_APPROVALS.kind: _encode_kind(
+                CLIENT_APPROVALS, state.client_approvals,
+            ),
         }
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        tmp.replace(self._path)
+        write_text_atomic(self._path, json.dumps(data, indent=2))

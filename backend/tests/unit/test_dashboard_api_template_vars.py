@@ -3,7 +3,8 @@
 Pins the wire shape of:
 
 - ``GET    /api/admin/upstreams/{id}/secrets`` — returns
-  ``[TemplateVarSummaryView]`` with ``last_four`` but no ``value``.
+  ``[TemplateVarSummaryView]``; a password row carries ``has_value``
+  but never its ``value`` (write-only).
 - ``PUT    /api/admin/upstreams/{id}/template-vars/{name}`` — accepts
   ``{value}``, returns the post-write summary.
 - ``DELETE /api/admin/upstreams/{id}/template-vars/{name}`` — idempotent.
@@ -19,14 +20,30 @@ which is sometimes the intended value.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
+from mcpolis.adapters.repositories.file_template_var_repository import (
+    FileTemplateVarRepository,
+)
+from mcpolis.domain.model.template_var import TemplateVarSummary
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
+from mcpolis.entrypoints.routes.dashboard._models import (
+    TemplateVarSummaryView,
+    UpdateUpstreamTemplateVarChanges,
+    UpdateUpstreamTemplateVarSpec,
+)
+from mcpolis.entrypoints.routes.dashboard.upstream_admin import (
+    _apply_template_var_changes,
+)
 from tests.unit._dev_stub_login import login_as
+from tests.unit.factories import make_config_users_accepted
 
 MCP_JSON = json.dumps({
     "mcpServers": {
@@ -57,6 +74,7 @@ def make_test_client(
     mcp_json.write_text(MCP_JSON)
     config = tmp_path / "config.json"
     config.write_text(CONFIG_JSON)
+    make_config_users_accepted(tmp_path / "data", CONFIG_JSON)
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         mcp_json_path=mcp_json,
@@ -79,6 +97,16 @@ def make_test_client(
     if login is not None:
         login_as(client, login)
     return client
+
+
+def read_stored_value(tmp_path: Path, upstream_id: str, name: str) -> str:
+    """The saved plaintext, read from the standalone file store.
+
+    The API never returns a password, so tests that check what got
+    saved read the store directly.
+    """
+    data = json.loads((tmp_path / "data" / "template_vars.json").read_text())
+    return data["default"][upstream_id][name]["value"]
 
 
 # --- list_secrets ---
@@ -109,28 +137,20 @@ def test_set_secret_round_trips_summary(tmp_path: Path) -> None:
     assert resp.status_code == 200
     data = resp.json()
     assert data["name"] == "GH_TOKEN"
-    assert data["last_four"] == "hars"
-    # Both kinds carry the plaintext now — UI obfuscates by default
-    # via an eye toggle (1Password-style).
-    assert data["value"] == "ghp_long_value_more_than_16_chars"
+    assert data["value"] is None
+    assert data["has_value"] is True
     assert data["is_secret"] is True
-    # GET reflects the new state.
-    listing = client.get("/api/admin/upstreams/github/template-vars").json()
+    assert "ghp_long_value_more_than_16_chars" not in resp.text
+    # GET reflects the new state, still without the value.
+    resp = client.get("/api/admin/upstreams/github/template-vars")
+    listing = resp.json()
     assert len(listing) == 1
     assert listing[0]["name"] == "GH_TOKEN"
-    assert listing[0]["last_four"] == "hars"
-    assert listing[0]["value"] == "ghp_long_value_more_than_16_chars"
+    assert listing[0]["value"] is None
+    assert listing[0]["has_value"] is True
     assert listing[0]["is_secret"] is True
-
-
-def test_set_secret_short_value_has_no_last_four(tmp_path: Path) -> None:
-    client = make_test_client(tmp_path)
-    resp = client.put(
-        "/api/admin/upstreams/github/template-vars/SHORT",
-        json={"value": "short-value"},
-    )
-    assert resp.status_code == 200
-    assert resp.json()["last_four"] is None
+    assert "ghp_long_value_more_than_16_chars" not in resp.text
+    assert "last_four" not in listing[0]
 
 
 def test_set_secret_replace_keeps_created_at(tmp_path: Path) -> None:
@@ -145,7 +165,7 @@ def test_set_secret_replace_keeps_created_at(tmp_path: Path) -> None:
     ).json()
     assert first["created_at"] == second["created_at"]
     assert second["updated_at"] >= first["updated_at"]
-    assert second["last_four"] == "3210"
+    assert second["value"] is None
 
 
 def test_set_secret_rejects_invalid_name(tmp_path: Path) -> None:
@@ -174,9 +194,9 @@ def test_set_secret_accepts_empty_value(tmp_path: Path) -> None:
     assert resp.status_code == 200
     listing = client.get("/api/admin/upstreams/github/template-vars").json()
     assert listing[0]["name"] == "GH_TOKEN"
-    assert listing[0]["value"] == ""
-    # Empty value has no last-4 preview.
-    assert listing[0]["last_four"] is None
+    assert listing[0]["value"] is None
+    # An empty password reads as "not set".
+    assert listing[0]["has_value"] is False
 
 
 def test_set_secret_requires_admin(tmp_path: Path) -> None:
@@ -240,16 +260,14 @@ def test_add_upstream_with_env_vars_persists_them(tmp_path: Path) -> None:
     listing = client.get("/api/admin/upstreams/atomic/template-vars").json()
     by_name = {s["name"]: s for s in listing}
     assert set(by_name.keys()) == {"GITHUB_TOKEN", "LOG_LEVEL", "SHORT"}
-    assert by_name["GITHUB_TOKEN"]["last_four"] == "hars"
-    assert by_name["GITHUB_TOKEN"]["value"] == "ghp_value_more_than_16_chars"
+    assert by_name["GITHUB_TOKEN"]["value"] is None
+    assert by_name["GITHUB_TOKEN"]["has_value"] is True
     assert by_name["GITHUB_TOKEN"]["is_secret"] is True
     # Plain row carries the value verbatim.
     assert by_name["LOG_LEVEL"]["value"] == "debug"
     assert by_name["LOG_LEVEL"]["is_secret"] is False
-    # Short secret value: no last-4, but the plaintext now surfaces
-    # too (UI obfuscates by default with the eye toggle).
-    assert by_name["SHORT"]["last_four"] is None
-    assert by_name["SHORT"]["value"] == "tiny"
+    assert by_name["SHORT"]["value"] is None
+    assert by_name["SHORT"]["has_value"] is True
 
 
 def test_add_upstream_rejects_invalid_env_var_name(tmp_path: Path) -> None:
@@ -367,10 +385,11 @@ def test_replace_preserves_secret_flag_against_body_false(tmp_path: Path) -> Non
     assert resp.status_code == 200
     data = resp.json()
     assert data["is_secret"] is True
-    # Replace honours the new value; the SPA obfuscates password
-    # rows by default but the plaintext is now part of the API
-    # contract (1Password-style reveal toggle).
-    assert data["value"] == "rotated-value-9876543210"
+    assert data["value"] is None
+    assert (
+        read_stored_value(tmp_path, "github", "GH_TOKEN")
+        == "rotated-value-9876543210"
+    )
 
 
 def test_legacy_record_without_is_secret_reads_back_as_secret(
@@ -379,7 +398,6 @@ def test_legacy_record_without_is_secret_reads_back_as_secret(
     """A v1-era stored record (no ``is_secret`` field) must default
     to ``is_secret=True`` on read so old data doesn't accidentally
     leak."""
-    import json
     client = make_test_client(tmp_path)
     # Hand-write a legacy record into the file store.
     secrets_path = tmp_path / "data" / "template_vars.json"
@@ -389,7 +407,6 @@ def test_legacy_record_without_is_secret_reads_back_as_secret(
             "github": {
                 "LEGACY": {
                     "value": "value-from-v1",
-                    "last_four": "rom1",
                     "created_at": "2026-04-01T00:00:00+00:00",
                     "updated_at": "2026-04-01T00:00:00+00:00",
                 },
@@ -400,9 +417,7 @@ def test_legacy_record_without_is_secret_reads_back_as_secret(
     by_name = {s["name"]: s for s in listing}
     assert "LEGACY" in by_name
     assert by_name["LEGACY"]["is_secret"] is True
-    # v1 records stored the plaintext under ``value`` already; the new
-    # contract returns it for password rows too (SPA obfuscates).
-    assert by_name["LEGACY"]["value"] == "value-from-v1"
+    assert by_name["LEGACY"]["value"] is None
 
 
 # --- update_upstream extended with template_var_changes (PR 4: deferred Save) ---
@@ -431,8 +446,12 @@ def test_update_upstream_template_var_changes_sets_new_row(tmp_path: Path) -> No
     listing = client.get("/api/admin/upstreams/github/template-vars").json()
     by_name = {s["name"]: s for s in listing}
     assert set(by_name.keys()) == {"GH_TOKEN", "LOG_LEVEL"}
-    assert by_name["GH_TOKEN"]["last_four"] == "hars"
-    assert by_name["GH_TOKEN"]["value"] == "ghp_value_more_than_16_chars"
+    assert by_name["GH_TOKEN"]["value"] is None
+    assert by_name["GH_TOKEN"]["has_value"] is True
+    assert (
+        read_stored_value(tmp_path, "github", "GH_TOKEN")
+        == "ghp_value_more_than_16_chars"
+    )
     assert by_name["LOG_LEVEL"]["value"] == "debug"
 
 
@@ -465,8 +484,11 @@ def test_update_upstream_template_var_changes_replace_preserves_is_secret(
     listing = client.get("/api/admin/upstreams/github/template-vars").json()
     row = next(s for s in listing if s["name"] == "GH_TOKEN")
     assert row["is_secret"] is True, "replace must not flip the flag"
-    assert row["value"] == "rotated-value-9876543210"
-    assert row["last_four"] == "3210"
+    assert row["value"] is None
+    assert (
+        read_stored_value(tmp_path, "github", "GH_TOKEN")
+        == "rotated-value-9876543210"
+    )
 
 
 def test_update_upstream_template_var_changes_deletes_row(tmp_path: Path) -> None:
@@ -526,7 +548,10 @@ def test_update_upstream_template_var_changes_sets_and_deletes_combined(
     listing = client.get("/api/admin/upstreams/github/template-vars").json()
     by_name = {s["name"]: s for s in listing}
     assert set(by_name.keys()) == {"A_NEW", "B_NEW", "D_REPLACE"}
-    assert by_name["D_REPLACE"]["last_four"] == "zzzz"
+    assert (
+        read_stored_value(tmp_path, "github", "D_REPLACE")
+        == "after-value-zzzzzzzzz"
+    )
 
 
 def test_update_upstream_template_var_changes_invalid_name_rolls_back(
@@ -575,7 +600,8 @@ def test_update_upstream_template_var_changes_empty_value_is_accepted(
     listing = client.get("/api/admin/upstreams/github/template-vars").json()
     assert len(listing) == 1
     assert listing[0]["name"] == "VALID_NAME"
-    assert listing[0]["value"] == ""
+    assert listing[0]["has_value"] is False
+    assert read_stored_value(tmp_path, "github", "VALID_NAME") == ""
 
 
 def test_update_upstream_template_var_changes_delete_then_set_lands_as_set(
@@ -650,3 +676,337 @@ def test_add_upstream_with_no_secrets_field_works(tmp_path: Path) -> None:
     )
     assert resp.status_code == 201
     assert client.get("/api/admin/upstreams/legacy/template-vars").json() == []
+
+
+# --- write-only passwords: "keep the saved value" on save ---
+
+
+def seed_password(client: TestClient, name: str, value: str) -> None:
+    resp = client.put(
+        f"/api/admin/upstreams/github/template-vars/{name}",
+        json={"value": value, "is_secret": True},
+    )
+    assert resp.status_code == 200
+
+
+def save_template_var_changes(
+    client: TestClient, sets: dict[str, object], deletes: list[str],
+) -> httpx.Response:
+    return client.put(
+        "/api/admin/upstreams/github",
+        json={"template_var_changes": {"sets": sets, "deletes": deletes}},
+    )
+
+
+def test_list_never_returns_any_saved_password(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+    seed_password(client, "GH_TOKEN", "ghp_secret_password_value")
+    client.put(
+        "/api/admin/upstreams/github/template-vars/REGION",
+        json={"value": "eu-west-1", "is_secret": False},
+    )
+    resp = client.get("/api/admin/upstreams/github/template-vars")
+    assert "ghp_secret_password_value" not in resp.text
+    by_name = {s["name"]: s for s in resp.json()}
+    assert by_name["GH_TOKEN"]["value"] is None
+    assert by_name["GH_TOKEN"]["has_value"] is True
+    assert by_name["REGION"]["value"] == "eu-west-1"
+
+
+def test_save_with_unchanged_password_keeps_saved_value(tmp_path: Path) -> None:
+    """The dashboard sends ``value: null`` for a password it didn't
+    change; the saved value must survive, not become a mask."""
+    client = make_test_client(tmp_path)
+    seed_password(client, "GH_TOKEN", "ghp_secret_password_value")
+    resp = save_template_var_changes(
+        client, {"GH_TOKEN": {"value": None, "is_secret": True}}, [],
+    )
+    assert resp.status_code == 200
+    assert (
+        read_stored_value(tmp_path, "github", "GH_TOKEN")
+        == "ghp_secret_password_value"
+    )
+
+
+def test_save_rename_keeps_password_value_and_flag(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+    seed_password(client, "OLD_TOKEN", "ghp_secret_password_value")
+    resp = save_template_var_changes(
+        client,
+        # A wrong is_secret in the body must not turn the copied
+        # password into a plain (readable) variable.
+        {"NEW_TOKEN": {
+            "value": None, "is_secret": False, "rename_from": "OLD_TOKEN",
+        }},
+        ["OLD_TOKEN"],
+    )
+    assert resp.status_code == 200
+    listing = client.get("/api/admin/upstreams/github/template-vars")
+    assert "ghp_secret_password_value" not in listing.text
+    rows = listing.json()
+    assert [r["name"] for r in rows] == ["NEW_TOKEN"]
+    assert rows[0]["is_secret"] is True
+    assert (
+        read_stored_value(tmp_path, "github", "NEW_TOKEN")
+        == "ghp_secret_password_value"
+    )
+
+
+def test_save_rename_onto_existing_plain_variable_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Copying a password onto an existing plain row would make it
+    readable (the existing row's flag wins on replace)."""
+    client = make_test_client(tmp_path)
+    seed_password(client, "OLD_TOKEN", "ghp_secret_password_value")
+    client.put(
+        "/api/admin/upstreams/github/template-vars/PLAIN",
+        json={"value": "visible", "is_secret": False},
+    )
+    resp = save_template_var_changes(
+        client,
+        {"PLAIN": {"value": None, "rename_from": "OLD_TOKEN"}},
+        ["OLD_TOKEN"],
+    )
+    assert resp.status_code == 400
+    listing = client.get("/api/admin/upstreams/github/template-vars")
+    assert "ghp_secret_password_value" not in listing.text
+    # Nothing was applied: the source row is still there.
+    assert {r["name"] for r in listing.json()} == {"OLD_TOKEN", "PLAIN"}
+
+
+def test_save_keep_value_of_missing_variable_is_rejected(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+    resp = save_template_var_changes(
+        client, {"NEVER_SAVED": {"value": None}}, [],
+    )
+    assert resp.status_code == 400
+    assert client.get("/api/admin/upstreams/github/template-vars").json() == []
+
+
+def test_save_clear_password_stores_empty_value(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+    seed_password(client, "GH_TOKEN", "ghp_secret_password_value")
+    resp = save_template_var_changes(
+        client, {"GH_TOKEN": {"value": "", "is_secret": True}}, [],
+    )
+    assert resp.status_code == 200
+    row = client.get("/api/admin/upstreams/github/template-vars").json()[0]
+    assert row["has_value"] is False
+    assert read_stored_value(tmp_path, "github", "GH_TOKEN") == ""
+
+
+def seed_plain(client: TestClient, name: str, value: str) -> None:
+    resp = client.put(
+        f"/api/admin/upstreams/github/template-vars/{name}",
+        json={"value": value, "is_secret": False},
+    )
+    assert resp.status_code == 200
+
+
+def list_text(client: TestClient) -> str:
+    resp = client.get("/api/admin/upstreams/github/template-vars")
+    assert resp.status_code == 200
+    return resp.text
+
+
+PASSWORD = "ghp_secret_password_value"
+_EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def test_keep_onto_plain_row_listed_in_deletes_does_not_leak(
+    tmp_path: Path,
+) -> None:
+    """Moving password P onto plain X with X in ``deletes`` recreates X,
+    so P's flag holds. (Before, X was replaced in place and its plain
+    flag won: the password was listed in clear.)"""
+    client = make_test_client(tmp_path)
+    seed_password(client, "P", PASSWORD)
+    seed_plain(client, "X", "visible")
+    resp = save_template_var_changes(
+        client,
+        {"X": {"value": None, "is_secret": False, "rename_from": "P"}},
+        ["X"],
+    )
+    assert resp.status_code == 200
+    assert PASSWORD not in list_text(client)
+    by_name = {
+        r["name"]: r
+        for r in client.get("/api/admin/upstreams/github/template-vars").json()
+    }
+    assert by_name["X"]["is_secret"] is True
+    assert read_stored_value(tmp_path, "github", "X") == PASSWORD
+
+
+def test_swap_password_with_plain_row_does_not_leak(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+    seed_password(client, "P", PASSWORD)
+    seed_plain(client, "X", "visible")
+    resp = save_template_var_changes(
+        client,
+        {
+            "X": {"value": None, "rename_from": "P"},
+            "P": {"value": None, "rename_from": "X"},
+        },
+        ["X", "P"],
+    )
+    assert resp.status_code == 200
+    assert PASSWORD not in list_text(client)
+    # Each value moved with its own flag.
+    assert read_stored_value(tmp_path, "github", "X") == PASSWORD
+    assert read_stored_value(tmp_path, "github", "P") == "visible"
+
+
+def test_chain_rename_through_plain_row_does_not_leak(tmp_path: Path) -> None:
+    """A->B and B->C in one save, B an existing plain row: every value
+    is read before any write, so C gets B's old value."""
+    client = make_test_client(tmp_path)
+    seed_password(client, "A", PASSWORD)
+    seed_plain(client, "B", "visible")
+    resp = save_template_var_changes(
+        client,
+        {
+            "B": {"value": None, "rename_from": "A"},
+            "C": {"value": None, "rename_from": "B"},
+        },
+        ["A", "B"],
+    )
+    assert resp.status_code == 200
+    assert PASSWORD not in list_text(client)
+    assert read_stored_value(tmp_path, "github", "B") == PASSWORD
+    assert read_stored_value(tmp_path, "github", "C") == "visible"
+
+
+def test_readd_deleted_plain_name_as_password_is_stored_as_password(
+    tmp_path: Path,
+) -> None:
+    """Dashboard flow: Delete plain X, then Add X as a password. The
+    dashboard keeps X in ``deletes``, so X is recreated as a password."""
+    client = make_test_client(tmp_path)
+    seed_plain(client, "X", "visible")
+    resp = save_template_var_changes(
+        client,
+        {"X": {"value": "typed-new-password-123", "is_secret": True}},
+        ["X"],
+    )
+    assert resp.status_code == 200
+    assert "typed-new-password-123" not in list_text(client)
+    assert read_stored_value(tmp_path, "github", "X") == "typed-new-password-123"
+
+
+def test_delete_then_rename_onto_freed_name_saves(tmp_path: Path) -> None:
+    """Dashboard flow: Delete X, then rename password P to X with a blank
+    value. The dashboard sends X in ``deletes`` too, so X is recreated."""
+    client = make_test_client(tmp_path)
+    seed_password(client, "P", PASSWORD)
+    seed_password(client, "X", "old-x-password-value")
+    resp = save_template_var_changes(
+        client,
+        {"X": {"value": None, "is_secret": True, "rename_from": "P"}},
+        ["P", "X"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert [r["name"] for r in client.get(
+        "/api/admin/upstreams/github/template-vars",
+    ).json()] == ["X"]
+    assert read_stored_value(tmp_path, "github", "X") == PASSWORD
+
+
+def test_rename_onto_existing_row_not_deleted_is_rejected(tmp_path: Path) -> None:
+    client = make_test_client(tmp_path)
+    seed_password(client, "P", PASSWORD)
+    seed_password(client, "X", "old-x-password-value")
+    resp = save_template_var_changes(
+        client,
+        {"X": {"value": None, "rename_from": "P"}},
+        ["P"],
+    )
+    assert resp.status_code == 400
+    assert read_stored_value(tmp_path, "github", "P") == PASSWORD
+    assert read_stored_value(tmp_path, "github", "X") == "old-x-password-value"
+
+
+def test_keep_same_name_does_not_rewrite_the_row(tmp_path: Path) -> None:
+    """``updated_at`` drives the restart banner: a no-op keep must not
+    bump it, even when the name is also listed in ``deletes``."""
+    client = make_test_client(tmp_path)
+    seed_password(client, "A", PASSWORD)
+    before = client.get("/api/admin/upstreams/github/template-vars").json()[0]
+    for deletes in ([], ["A"]):
+        resp = save_template_var_changes(
+            client, {"A": {"value": None, "is_secret": True}}, deletes,
+        )
+        assert resp.status_code == 200
+    after = client.get("/api/admin/upstreams/github/template-vars").json()[0]
+    assert after["updated_at"] == before["updated_at"]
+    assert read_stored_value(tmp_path, "github", "A") == PASSWORD
+
+
+def test_save_without_value_key_is_rejected(tmp_path: Path) -> None:
+    """A forgotten or misspelled ``value`` must not mean "keep"."""
+    client = make_test_client(tmp_path)
+    seed_password(client, "GH_TOKEN", PASSWORD)
+    for spec in (
+        {"is_secret": True},
+        {"is_secret": True, "valeu": "rotated"},
+    ):
+        resp = save_template_var_changes(client, {"GH_TOKEN": spec}, [])
+        assert resp.status_code == 422, spec
+    assert read_stored_value(tmp_path, "github", "GH_TOKEN") == PASSWORD
+
+
+def test_summary_view_never_carries_a_password_value() -> None:
+    """The wire view drops a password value even from a summary that
+    was built by hand instead of through the repositories."""
+    hand_built = TemplateVarSummary(
+        name="X", is_secret=True, value="pw", has_value=True,
+        created_at=_EPOCH, updated_at=_EPOCH,
+    )
+    view = TemplateVarSummaryView.from_summary(hand_built)
+    assert view.value is None
+    assert view.has_value is True
+
+
+class FailingTemplateVarRepository(FileTemplateVarRepository):
+    """A store whose write fails for one name (disk full, Mongo blip)."""
+
+    def __init__(self, data_dir: Path, failing_name: str) -> None:
+        super().__init__(data_dir)
+        self.failing_name = failing_name
+
+    async def set(
+        self,
+        org_id: str,
+        upstream_id: str,
+        name: str,
+        value: str,
+        *,
+        is_secret: bool = True,
+    ) -> TemplateVarSummary:
+        if name == self.failing_name:
+            raise OSError(28, "No space left on device")
+        return await super().set(
+            org_id, upstream_id, name, value, is_secret=is_secret,
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_rename_write_keeps_the_source_password(
+    tmp_path: Path,
+) -> None:
+    """Writes run before deletes, so a failed write of the new name
+    leaves the old row, and the password the dashboard never held."""
+    repo = FailingTemplateVarRepository(tmp_path, failing_name="NEW_TOKEN")
+    await repo.set("default", "github", "OLD_TOKEN", PASSWORD)
+    changes = UpdateUpstreamTemplateVarChanges(
+        sets={"NEW_TOKEN": UpdateUpstreamTemplateVarSpec(
+            value=None, rename_from="OLD_TOKEN",
+        )},
+        deletes=["OLD_TOKEN"],
+    )
+    with pytest.raises(OSError):
+        await _apply_template_var_changes(
+            repo, "default", "github", changes,
+            {"NEW_TOKEN": (PASSWORD, True)},
+        )
+    assert await repo.get_value("default", "github", "OLD_TOKEN") == PASSWORD

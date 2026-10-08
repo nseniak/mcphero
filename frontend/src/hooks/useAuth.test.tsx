@@ -24,6 +24,7 @@ function makeUser(): UserInfo {
     is_superadmin: false,
     orgs: [],
     current_org: null,
+    invitations: [],
   };
 }
 

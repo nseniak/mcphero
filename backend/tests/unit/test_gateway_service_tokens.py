@@ -28,6 +28,7 @@ from mcpolis.adapters.auth.mcp_gateway_oauth_provider import ACCESS_TOKEN_TTL
 from mcpolis.adapters.repositories.file_service_token_repository import (
     FileServiceTokenRepository,
 )
+from mcpolis.domain.model.service_token import ServiceAccessToken
 from mcpolis.domain.services.service_token_service import ServiceTokenService
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
@@ -37,6 +38,7 @@ from tests.unit._loopback_mcp import (
     mcp_session_call,
     wait_for_health,
 )
+from tests.unit.factories import make_config_users_accepted
 
 # OS-assigned at stack boot (see ``_start_stack``). Fixed ports collide
 # under load — a fixed loopback connect that times out raised an uncaught
@@ -73,6 +75,7 @@ def _write_config(tmp_path: Path, upstream_port: int) -> tuple[Path, Path]:
         },
         "users": {
             "admin@example.com": {"role": "admin"},
+            "member@example.com": {"role": "none"},
         },
     }))
     return mcp_json, config
@@ -102,6 +105,7 @@ async def _start_stack(
     ))
 
     mcp_json_path, config_path = _write_config(tmp_path, _upstream_port)
+    make_config_users_accepted(tmp_path / "data", config_path.read_text())
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         host="127.0.0.1",
@@ -401,8 +405,10 @@ async def test_bearer_auth_backend_accepts_minted_service_token(
     ``BearerAuthBackend`` over the composite verifier and drive its
     ``authenticate`` with a minted ``svct_`` bearer (``expires_at=None``,
     i.e. non-expiring). It must return an ``AuthenticatedUser`` carrying
-    the ``svc:<label>`` identity and the service-token scopes — proving
-    the SDK's truthiness expiry check treats ``None`` as non-expiring.
+    the ``svc:<label>`` identity and the very ``ServiceAccessToken`` the
+    verifier minted — proving the SDK's truthiness expiry check treats
+    ``None`` as non-expiring, and that the SDK hands the token object
+    through untouched (the gateway's role/org readers rely on its type).
     """
     from mcp.server.auth.middleware.bearer_auth import (
         AuthenticatedUser,
@@ -439,7 +445,9 @@ async def test_bearer_auth_backend_accepts_minted_service_token(
     _creds, user = result
     assert isinstance(user, AuthenticatedUser)
     assert user.display_name == "svc:ci-bot"
-    assert "mcpolis:svc" in user.access_token.scopes
+    assert isinstance(user.access_token, ServiceAccessToken)
+    assert user.access_token.role_name == "reader"
+    assert user.access_token.org_id == "default"
 
 
 async def _initialize_status_with_auth(

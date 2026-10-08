@@ -11,11 +11,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from mcpolis.domain.model.policy import AuthMode
-from mcpolis.entrypoints.controllers.gateway_controller import current_org_id
-from mcpolis.entrypoints.routes.dashboard._deps import (
-    DashboardDeps,
+from mcpolis.domain.services.secret_scanner import hide_secrets_in_text
+from mcpolis.domain.services.upstream_admin_service import (
     resolve_upstream_readiness,
 )
+from mcpolis.entrypoints.controllers.gateway_controller import current_org_id
+from mcpolis.entrypoints.routes.dashboard._deps import DashboardDeps
 from mcpolis.entrypoints.routes.dashboard._models import (
     UserMcpInfo,
     UserToolSummary,
@@ -91,7 +92,9 @@ def create_upstream_user_router(deps: DashboardDeps) -> APIRouter:
                     transport=u.transport.value,
                     auth_mode=u.auth.mode.value,
                     ready=ready,
-                    url=u.http.url if u.http else None,
+                    # Every member reads this (My Tools shows the site's
+                    # icon): never a credential the URL carries.
+                    url=hide_secrets_in_text(u.http.url) if u.http else None,
                     user_connection_status=user_conn_status,
                     tool_count=len(upstream_tools),
                     tools=upstream_tools,

@@ -615,9 +615,10 @@ export function UpstreamDetailPage() {
       // replacement intent — the buffer flush turns into a replace
       // (the repository preserves ``is_secret`` on replace, so the
       // toggle is moot in that case).
+      // A name the user deleted earlier stays in ``nextDeletes``: the
+      // save then recreates that row with this ``isSecret`` (see
+      // PendingTemplateVarChanges).
       nextSets[envVarName] = { value, is_secret: isSecret };
-      const idx = nextDeletes.indexOf(envVarName);
-      if (idx !== -1) nextDeletes.splice(idx, 1);
     }
     if (Object.keys(newEnv).length > 0) inner.env = newEnv;
     if (Object.keys(newHeaders).length > 0) inner.headers = newHeaders;
@@ -664,6 +665,8 @@ export function UpstreamDetailPage() {
             transport={upstream.transport}
             authMode={upstream.auth_mode}
             starting={upstream.starting}
+            stopped={upstream.stopped}
+            slotOwner={upstream.slot_owner}
             reload={reload}
             onOptimisticReset={() => {
               // Synchronous, in-process reset so the operator sees

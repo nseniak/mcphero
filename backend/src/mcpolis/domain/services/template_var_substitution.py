@@ -47,6 +47,14 @@ def has_placeholder(value: str) -> bool:
     return False
 
 
+def strip_placeholders(value: str) -> str:
+    """``value`` without its unescaped ``${NAME}`` references: what was
+    typed in it literally."""
+    return _PLACEHOLDER_RE.sub(
+        lambda match: match.group(0) if match.group(1) == "\\" else "", value,
+    )
+
+
 def find_placeholders(value: str) -> list[str]:
     """All ``NAME`` tokens referenced inside ``value`` (deduped, ordered).
 

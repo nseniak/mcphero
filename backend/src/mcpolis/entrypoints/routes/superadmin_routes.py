@@ -19,7 +19,7 @@ top of the same router and the same ``require_superadmin`` dep.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, Literal
@@ -30,12 +30,23 @@ from pydantic import BaseModel
 
 from mcpolis.adapters.observability.analytics_client import get_analytics
 from mcpolis.adapters.repositories.connection_store import ConnectionStore
+from mcpolis.domain.model.email_allowlist import EmailAllowlist
 from mcpolis.domain.model.subscription import PlanName, Subscription
 from mcpolis.domain.ports import ADMIN_USER_ID
 from mcpolis.domain.ports.audit_repository import AuditRepository
 from mcpolis.domain.ports.organization_repository import OrganizationRepository
+from mcpolis.domain.services.audit_actions import (
+    OPERATOR_CLEAR_SIGN_IN,
+    OPERATOR_PLAN_CHANGE,
+    OPERATOR_SIGN_OUT_EVERYWHERE,
+    acting_as_operator,
+    record_action,
+)
 from mcpolis.domain.services.org_runtime import OrgRuntimeManager
 from mcpolis.domain.services.org_service import OrgService
+from mcpolis.domain.services.upstream_connection_service import (
+    sign_out_of_upstream,
+)
 from mcpolis.entrypoints.config import Settings
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
@@ -242,9 +253,9 @@ def create_superadmin_router(
     audit_repo: AuditRepository,
     connection_store: ConnectionStore,
     revoke_gateway_user: Callable[[str], int],
-    terminate_gateway_sessions: Callable[[str, str], int],
+    terminate_gateway_sessions: Callable[[str, str], Awaitable[int]],
     get_current_user: Callable[..., str],
-    superadmin_emails: set[str],
+    superadmin_emails: EmailAllowlist,
 ) -> APIRouter:
     """Build the ``/api/superadmin/*`` router.
 
@@ -262,6 +273,8 @@ def create_superadmin_router(
             raise HTTPException(
                 status_code=403, detail="Superadmin role required",
             )
+        # Every audit row this request writes is an operator's.
+        acting_as_operator.set(True)
         return email
 
     @router.get("/overview", response_model=OverviewResponse)
@@ -373,6 +386,13 @@ def create_superadmin_router(
         await org_repo.update_subscription(
             org_id, Subscription(plan=body.plan),
         )
+        if previous_plan != body.plan.value:
+            await record_action(
+                audit_repo, org_id,
+                action=OPERATOR_PLAN_CHANGE,
+                actor=email,
+                detail=f"{previous_plan} → {body.plan.value}",
+            )
         get_analytics().track_async(
             email,
             "superadmin_plan_changed",
@@ -522,12 +542,12 @@ def create_superadmin_router(
     ) -> AuditSearchResponse:
         """Cross-org audit search.
 
-        ``org_id`` filter is applied client-side after a cross-org
-        fetch so we don't need a separate scoped path; same code path
-        for "everything" and "this org only".
+        ``org_id`` goes into the query itself, so ``limit`` counts that
+        org's rows only and a page is never cut short.
         """
         actions = [action] if action else None
         entries = await audit_repo.search_cross_org(
+            org_id=org_id,
             user_id=user_id,
             mcp_id=upstream_id,
             tool=tool,
@@ -535,8 +555,6 @@ def create_superadmin_router(
             limit=limit,
             offset=offset,
         )
-        if org_id:
-            entries = [e for e in entries if e.get("org_id") == org_id]
         return AuditSearchResponse(entries=entries, count=len(entries))
 
     @router.get("/audit/aggregates", response_model=AuditAggregatesResponse)
@@ -558,6 +576,7 @@ def create_superadmin_router(
         """
         actions = [action] if action else None
         entries = await audit_repo.search_cross_org(
+            org_id=org_id,
             user_id=user_id,
             mcp_id=upstream_id,
             tool=tool,
@@ -565,8 +584,6 @@ def create_superadmin_router(
             limit=sample_size,
             offset=0,
         )
-        if org_id:
-            entries = [e for e in entries if e.get("org_id") == org_id]
 
         tools_count: dict[str, int] = {}
         orgs_count: dict[str, int] = {}
@@ -579,7 +596,7 @@ def create_superadmin_router(
             o = e.get("org_id")
             if isinstance(o, str) and o:
                 orgs_count[o] = orgs_count.get(o, 0) + 1
-            if e.get("policy_decision") == "deny":
+            if e.get("policy_decision") == "denied":
                 rule = e.get("policy_rule") or "<unspecified>"
                 if isinstance(rule, str):
                     deny_rules_count[rule] = deny_rules_count.get(rule, 0) + 1
@@ -738,7 +755,7 @@ def create_superadmin_router(
         org_ids = {m.org_id for m in memberships}
         terminated = 0
         for org_id in org_ids:
-            terminated += terminate_gateway_sessions(org_id, email)
+            terminated += await terminate_gateway_sessions(org_id, email)
         logger.info(
             "superadmin.sessions.revoked",
             actor=caller,
@@ -747,6 +764,15 @@ def create_superadmin_router(
             sessions_terminated=terminated,
             orgs=len(org_ids),
         )
+        # Rows only after the sign-out is complete everywhere. The
+        # customer sees them on their own Audit page.
+        for org_id in sorted(org_ids):
+            await record_action(
+                audit_repo, org_id,
+                action=OPERATOR_SIGN_OUT_EVERYWHERE,
+                actor=caller,
+                target_user_id=email,
+            )
         return SessionsRevokedResponse(
             email=email,
             gateway_tokens_revoked=gateway_revoked,
@@ -766,29 +792,53 @@ def create_superadmin_router(
     ) -> ReauthResponse:
         """Clear a stuck OAuth connection so the user re-authenticates.
 
-        Deletes the per-user OAuth token for ``(org, upstream, user)``;
-        the next request from that user surfaces "Authentication
-        needed" and goes through the OAuth flow. Other tokens for
-        the same user in other orgs/upstreams are untouched.
+        Signs the user out of ``(org, upstream)`` the way their own
+        sign-out does (``sign_out_of_upstream``): deletes the saved
+        sign-in, then closes their live session to the upstream, so the
+        next request from that user surfaces "Authentication needed"
+        and goes through the OAuth flow. Other sign-ins of the same user
+        in other orgs/upstreams are untouched.
         """
         org = await org_repo.get_organization(org_id)
         if org is None:
             raise HTTPException(status_code=404, detail="Organization not found")
-        # delete_user_token returns nothing — call it and trust it
-        # to be idempotent (it is in both backends).
-        await connection_store.delete_user_token(org_id, email, upstream_id)
+        # Only a sign-in that exists is cleared and recorded: a typo in
+        # the email or the MCP must not put "Cleared x's sign-in" on
+        # the customer's Audit page.
+        existing = await connection_store.get_user_token(
+            org_id, email, upstream_id,
+        )
+        cleared = existing is not None
+        if cleared:
+            runtime = await runtime_manager.get(org_id)
+            await sign_out_of_upstream(
+                org_id=org_id,
+                upstream_id=upstream_id,
+                user_id=email,
+                connection_store=connection_store,
+                client_manager=runtime.client_manager,
+            )
         logger.info(
             "superadmin.connection.reauth_triggered",
             actor=caller,
             target=email,
             org_id=org_id,
             upstream_id=upstream_id,
+            cleared=cleared,
         )
+        if cleared:
+            await record_action(
+                audit_repo, org_id,
+                action=OPERATOR_CLEAR_SIGN_IN,
+                actor=caller,
+                target_user_id=email,
+                upstream_id=upstream_id,
+            )
         return ReauthResponse(
             email=email,
             org_id=org_id,
             upstream_id=upstream_id,
-            cleared=True,
+            cleared=cleared,
         )
 
     @router.get("/system", response_model=SystemResponse)

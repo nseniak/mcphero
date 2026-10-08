@@ -40,6 +40,7 @@ from mcpolis.domain.ports.organization_repository import (
     Organization,
 )
 from mcpolis.domain.services.org_runtime import OrgRuntime, OrgRuntimeManager
+from mcpolis.domain.services.org_service import OrgService
 from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.tool_registry import ToolRegistry
 from tests.unit.factories import make_full_access_config
@@ -749,3 +750,209 @@ async def test_list_resource_templates_single_org_round_trips() -> None:
     assert decoded.is_template is True
     assert decoded.org_slug == "default"
     assert decoded.upstream_id == "notion"
+
+
+# ─── a read / prompt on an MCP disabled for the caller is audited ──────
+#
+# Tool calls refused this way have always written a ``denied`` row; reads
+# and prompts on the same disabled MCP wrote nothing.
+
+
+def make_runtime_with_slack_disabled(org_id: str) -> OrgRuntime:
+    """alice can use notion; slack exists in the org but is disabled for
+    her role. The router must never be asked to dispatch to slack."""
+    runtime = make_runtime_for_org(
+        org_id,
+        [("notion", ["test://hello"], ["greet"]),
+         ("slack", ["slack://general"], ["greet"])],
+    )
+    runtime.policy_engine.reload(make_full_access_config(
+        ["notion"], ["alice@test.com", "anonymous"],
+    ))
+    runtime.tool_router.audit_denied = AsyncMock()
+    runtime.tool_router.read_resource = AsyncMock()
+    runtime.tool_router.get_prompt = AsyncMock()
+    return runtime
+
+
+def make_acme_org_service() -> OrgService:
+    org_repo = InMemoryOrgRepo(
+        orgs=[make_org("acme-id", "acme", "Acme")],
+        memberships=[make_membership("acme-id", "alice@test.com")],
+    )
+    config_repo = MagicMock()
+    config_repo.load = AsyncMock(return_value=SettingsConfig(
+        roles={"default": RoleDefinition(is_default=True, settings=RoleSettings())},
+        users={"alice@test.com": UserDefinition(role="default")},
+    ))
+    return OrgService(org_repo=org_repo, config_repo=config_repo)  # type: ignore[arg-type]
+
+
+async def read_as_alice(server: Any, org_context: str, uri: str) -> str:
+    auth_token = auth_alice()
+    org_token = current_org_id.set(org_context)
+    try:
+        handler = server.request_handlers[mcp_types.ReadResourceRequest]
+        result = await handler(mcp_types.ReadResourceRequest(
+            method="resources/read",
+            params=mcp_types.ReadResourceRequestParams(uri=AnyUrl(uri)),
+        ))
+    finally:
+        current_org_id.reset(org_token)
+        reset_auth(auth_token)
+    content = cast(mcp_types.ReadResourceResult, result.root).contents[0]
+    assert isinstance(content, mcp_types.TextResourceContents)
+    return content.text
+
+
+async def prompt_as_alice(server: Any, org_context: str, name: str) -> str:
+    auth_token = auth_alice()
+    org_token = current_org_id.set(org_context)
+    try:
+        handler = server.request_handlers[mcp_types.GetPromptRequest]
+        result = await handler(mcp_types.GetPromptRequest(
+            method="prompts/get",
+            params=mcp_types.GetPromptRequestParams(
+                name=name, arguments={"name": "sk-not-for-the-log"},
+            ),
+        ))
+    finally:
+        current_org_id.reset(org_token)
+        reset_auth(auth_token)
+    msg = cast(mcp_types.GetPromptResult, result.root).messages[0]
+    assert isinstance(msg.content, mcp_types.TextContent)
+    return msg.content.text
+
+
+def assert_denied_row(runtime: OrgRuntime, org_id: str, tool: str) -> None:
+    audit_denied = cast(AsyncMock, runtime.tool_router.audit_denied)
+    audit_denied.assert_awaited_once()
+    call = audit_denied.await_args
+    assert call is not None
+    assert call.args == (org_id,)
+    assert call.kwargs["user_id"] == "alice@test.com"
+    assert call.kwargs["upstream_id"] == "slack"
+    assert call.kwargs["tool"] == tool
+    assert call.kwargs["policy_rule"] == "mcp_disabled"
+    assert "sk-not-for-the-log" not in repr(call)
+
+
+@pytest.mark.asyncio
+async def test_read_resource_single_org_on_a_disabled_mcp_is_audited() -> None:
+    runtime = make_runtime_with_slack_disabled(DEFAULT_ORG_ID)
+    rm = make_runtime_manager_with(
+        {DEFAULT_ORG_ID: runtime}, slugs={DEFAULT_ORG_ID: "default"},
+    )
+    server = create_mcp_server(rm)
+    uri = wrap_resource_uri(
+        org_slug="default", upstream_id="slack", original_uri="slack://general",
+    )
+
+    text = await read_as_alice(server, DEFAULT_ORG_ID, uri)
+
+    assert text.startswith("Access denied")
+    cast(AsyncMock, runtime.tool_router.read_resource).assert_not_awaited()
+    assert_denied_row(runtime, DEFAULT_ORG_ID, "resource:slack:slack://general")
+
+
+@pytest.mark.asyncio
+async def test_read_resource_multi_org_on_a_disabled_mcp_is_audited() -> None:
+    runtime = make_runtime_with_slack_disabled("acme-id")
+    rm = make_runtime_manager_with({"acme-id": runtime}, slugs={"acme-id": "acme"})
+    server = create_mcp_server(rm, org_service=make_acme_org_service())
+    uri = wrap_resource_uri(
+        org_slug="acme", upstream_id="slack", original_uri="slack://general",
+    )
+
+    text = await read_as_alice(server, MULTI_ORG_SENTINEL, uri)
+
+    assert text.startswith("Access denied")
+    cast(AsyncMock, runtime.tool_router.read_resource).assert_not_awaited()
+    assert_denied_row(runtime, "acme-id", "resource:slack:slack://general")
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_single_org_on_a_disabled_mcp_is_audited() -> None:
+    runtime = make_runtime_with_slack_disabled(DEFAULT_ORG_ID)
+    rm = make_runtime_manager_with(
+        {DEFAULT_ORG_ID: runtime}, slugs={DEFAULT_ORG_ID: "default"},
+    )
+    server = create_mcp_server(rm)
+
+    text = await prompt_as_alice(server, DEFAULT_ORG_ID, "slack__greet")
+
+    assert text.startswith("Access denied")
+    cast(AsyncMock, runtime.tool_router.get_prompt).assert_not_awaited()
+    assert_denied_row(runtime, DEFAULT_ORG_ID, "prompt:slack:greet")
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_multi_org_on_a_disabled_mcp_is_audited() -> None:
+    runtime = make_runtime_with_slack_disabled("acme-id")
+    rm = make_runtime_manager_with({"acme-id": runtime}, slugs={"acme-id": "acme"})
+    server = create_mcp_server(rm, org_service=make_acme_org_service())
+
+    text = await prompt_as_alice(server, MULTI_ORG_SENTINEL, "acme__slack__greet")
+
+    assert text.startswith("Access denied")
+    cast(AsyncMock, runtime.tool_router.get_prompt).assert_not_awaited()
+    assert_denied_row(runtime, "acme-id", "prompt:slack:greet")
+
+
+# ─── the answer never tells which MCPs an org has ─────────────────────
+#
+# An MCP the org doesn't have is refused with the same words as one
+# disabled for the caller, as tools/call already does. Answering
+# "Unknown upstream" instead let anyone on /mcp/{slug} list the org's
+# MCPs by trying names.
+
+
+async def missing_and_disabled_answers(
+    server: Any, org_context: str, slug: str,
+) -> list[tuple[str, str]]:
+    """``(answer about the MCP "nope" the org lacks, answer about the
+    disabled slack)``, for a read and for a prompt, both asked by alice."""
+    prefix = f"{slug}__" if org_context == MULTI_ORG_SENTINEL else ""
+    reads = [
+        await read_as_alice(server, org_context, wrap_resource_uri(
+            org_slug=slug, upstream_id=upstream_id, original_uri="a://b",
+        ))
+        for upstream_id in ("nope", "slack")
+    ]
+    prompts = [
+        await prompt_as_alice(server, org_context, f"{prefix}{upstream_id}__greet")
+        for upstream_id in ("nope", "slack")
+    ]
+    return [(reads[0], reads[1]), (prompts[0], prompts[1])]
+
+
+@pytest.mark.asyncio
+async def test_single_org_answer_about_a_missing_mcp_is_the_disabled_answer() -> None:
+    runtime = make_runtime_with_slack_disabled(DEFAULT_ORG_ID)
+    rm = make_runtime_manager_with(
+        {DEFAULT_ORG_ID: runtime}, slugs={DEFAULT_ORG_ID: "default"},
+    )
+    server = create_mcp_server(rm)
+
+    answers = await missing_and_disabled_answers(server, DEFAULT_ORG_ID, "default")
+
+    for missing, disabled in answers:
+        assert disabled == (
+            "Access denied: MCP 'slack' is disabled for user 'alice@test.com'."
+        )
+        assert missing == disabled.replace("slack", "nope")
+
+
+@pytest.mark.asyncio
+async def test_multi_org_answer_about_a_missing_mcp_is_the_disabled_answer() -> None:
+    runtime = make_runtime_with_slack_disabled("acme-id")
+    rm = make_runtime_manager_with({"acme-id": runtime}, slugs={"acme-id": "acme"})
+    server = create_mcp_server(rm, org_service=make_acme_org_service())
+
+    answers = await missing_and_disabled_answers(server, MULTI_ORG_SENTINEL, "acme")
+
+    for missing, disabled in answers:
+        assert disabled == (
+            "Access denied: MCP 'slack' is disabled for user 'alice@test.com'."
+        )
+        assert missing == disabled.replace("slack", "nope")

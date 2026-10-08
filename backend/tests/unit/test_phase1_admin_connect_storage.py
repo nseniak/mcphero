@@ -76,6 +76,7 @@ def make_valid_token() -> InternalOAuthToken:
 def make_client_manager() -> MagicMock:
     cm = MagicMock()
     cm.replace_user_session = AsyncMock()
+    cm.is_stopped = MagicMock(return_value=False)
     return cm
 
 

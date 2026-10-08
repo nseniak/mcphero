@@ -39,7 +39,6 @@ from mcpolis.domain.model.upstream import (
 from mcpolis.domain.ports import DEFAULT_ORG_ID, MULTI_ORG_SENTINEL
 from mcpolis.domain.ports.oauth_state_repository import (
     OAuthStateRepository,
-    OAuthStateSnapshot,
     StoredAccessToken,
     StoredRefreshToken,
 )
@@ -49,25 +48,13 @@ from mcpolis.domain.ports.organization_repository import (
 )
 from mcpolis.domain.services.org_runtime import OrgRuntime, OrgRuntimeManager
 from mcpolis.domain.services.policy_engine import PolicyEngine
+from tests.unit._gateway_oauth_store import InMemoryOAuthStateRepository
 from tests.unit.factories import make_full_access_config
 
 
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
-
-
-class InMemoryOAuthStateRepository(OAuthStateRepository):
-    """Single global snapshot — matches the new user-scoped contract."""
-
-    def __init__(self) -> None:
-        self._snapshot = OAuthStateSnapshot()
-
-    async def load(self) -> OAuthStateSnapshot:
-        return self._snapshot
-
-    async def save(self, snapshot: OAuthStateSnapshot) -> None:
-        self._snapshot = snapshot
 
 
 class InMemoryOrgRepo:
@@ -258,7 +245,7 @@ def test_stored_refresh_token_has_no_org_id_field() -> None:
 
 
 def test_oauth_state_repository_load_takes_no_org_id() -> None:
-    """The repository contract is now a single global snapshot.
+    """The repository contract is one global namespace.
 
     The previous per-org partitioning was a leftover from the slug-in-
     URL design. With a fixed cloud /mcp URL there is exactly one
@@ -273,13 +260,13 @@ def test_oauth_state_repository_load_takes_no_org_id() -> None:
         f"OAuthStateRepository.load must take no parameters; got {params}"
     )
 
-    sig_save = inspect.signature(OAuthStateRepository.save)
-    save_params = [
-        p.name for p in sig_save.parameters.values() if p.name != "self"
+    sig_apply = inspect.signature(OAuthStateRepository.apply)
+    apply_params = [
+        p.name for p in sig_apply.parameters.values() if p.name != "self"
     ]
-    assert save_params == ["snapshot"], (
-        f"OAuthStateRepository.save signature must be (snapshot); "
-        f"got {save_params}"
+    assert apply_params == ["changes"], (
+        f"OAuthStateRepository.apply signature must be (changes); "
+        f"got {apply_params}"
     )
 
 
@@ -363,6 +350,12 @@ async def test_oauth_callback_allows_user_with_any_org_membership() -> None:
         redirect_uris=[AnyUrl("http://localhost/cb")],
     )
     await provider.register_client(client)
+    # Pre-approve so the callback forwards the code directly — this test
+    # is about org-membership gating, not the consent gate (covered in
+    # test_gateway_oauth_consent.py).
+    await provider.record_client_approval(
+        "alice@test.com", "cid", "http://localhost/cb"
+    )
 
     from mcp.server.auth.provider import AuthorizationParams
 

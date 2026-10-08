@@ -294,8 +294,8 @@ source = '''
 # Catches what Layer 1 (the structlog processor) can't see: uvicorn
 # access lines, third-party stdout that bypasses structlog, and
 # Caddy headers. Top-level secret-shaped keys get masked to
-# `[REDACTED]`; the explicit Caddy header deletes live in
-# `reshape_caddy_access`.
+# `[REDACTED]`; Caddy's credential headers are removed from its nested
+# header maps (see the Caddy sections below).
 
 [[tests]]
 name = "redact_secrets: top-level password is masked"
@@ -385,10 +385,79 @@ source = '''
   assert_eq!(.org_id, "org-1")
 '''
 
-# ---- reshape_caddy_access: Cookie/Authorization/Set-Cookie are deleted ----
+# ---- redact_secrets: secrets in http_path ----
 
 [[tests]]
-name = "reshape_caddy_access: request.headers.Cookie is deleted"
+name = "redact_secrets: consent token in http_path query is masked"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+event = "http.access.200"
+http_path = "/mcp/oauth/consent?consent=SECRETTOKEN123&state=abc"
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.http_path, "/mcp/oauth/consent?consent=[REDACTED]&state=abc", "consent value masked, rest of path kept")
+'''
+
+[[tests]]
+name = "redact_secrets: oauth code in callback http_path is masked"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+event = "http.access.302"
+http_path = "/mcp/oauth/google/callback?state=xyz&code=4/abc-def_GHI"
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.http_path, "/mcp/oauth/google/callback?state=xyz&code=[REDACTED]", "authorization code masked, state kept")
+'''
+
+[[tests]]
+name = "redact_secrets: ordinary http_path is left unchanged"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+event = "http.access.200"
+http_path = "/api/orgs?page=2"
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.http_path, "/api/orgs?page=2", "non-secret query params untouched")
+'''
+
+# ---- redact_secrets: credential headers in Caddy's header maps ----
+#
+# Caddy writes "REDACTED" for the values of Cookie, Set-Cookie,
+# Authorization and Proxy-Authorization itself, but only while its
+# `log_credentials` option is off. The pipeline removes these four
+# headers on its own, from every header map Caddy writes: the request's
+# (access, error and reverse-proxy records), the response's (access
+# records) and the backend's response (the reverse proxy's debug
+# record). The full Caddy lines below have the shapes Caddy 2.11.2
+# writes with `log_credentials` on (captured, then host, addresses and
+# values replaced).
+
+[[tests]]
+name = "redact_secrets: Cookie, Authorization and Set-Cookie request headers of a Caddy access record are removed"
 
 [[tests.inputs]]
 insert_at = "reshape_caddy_access"
@@ -412,13 +481,402 @@ Authorization = ["Bearer xyz"]
 "User-Agent" = ["curl/8"]
 
 [[tests.outputs]]
-extract_from = "reshape_caddy_access"
+extract_from = "redact_secrets"
 [[tests.outputs.conditions]]
 type = "vrl"
 source = '''
   assert!(!exists(.request.headers.Cookie), "Cookie header deleted")
   assert!(!exists(.request.headers.Authorization), "Authorization header deleted")
   assert!(!exists(.request.headers."Set-Cookie"), "Set-Cookie header deleted")
+  assert_eq!(.request.headers."User-Agent", ["curl/8"], "other request headers kept")
   assert_eq!(.user_agent, "curl/8", "User-Agent still lifted to top-level")
   assert_eq!(.event, "caddy.access.200")
+'''
+
+[[tests]]
+name = "redact_secrets: Caddy error record (not reshaped) has its credential request headers removed"
+
+[[tests.inputs]]
+insert_at = "parse"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+container_id = "def456"
+stream = "stdout"
+message = '{"level":"error","ts":1791411787.0698211,"logger":"http.log.error","msg":"dial tcp 172.18.0.5:80: connect: connection refused","request":{"remote_ip":"203.0.113.42","remote_port":"61480","client_ip":"203.0.113.42","proto":"HTTP/1.1","method":"GET","host":"mcphero.io","uri":"/api/admin/users","headers":{"Accept":["*/*"],"Cookie":["mcpolis_session=RAWCOOKIESECRET1"],"Authorization":["Bearer RAWBEARERSECRET1"],"Proxy-Authorization":["Basic RAWPROXYSECRET1"],"User-Agent":["curl/8.7.1"]}},"duration":0.001224416,"status":502,"err_id":"iuwuxhjdk","err_trace":"reverseproxy.statusError (reverseproxy.go:1525)"}'
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.logger, "http.log.error", "error record is not reshaped")
+  assert!(!exists(.request.headers.Cookie), "Cookie header removed")
+  assert!(!exists(.request.headers.Authorization), "Authorization header removed")
+  assert!(!exists(.request.headers."Proxy-Authorization"), "Proxy-Authorization header removed")
+  assert_eq!(.request.headers.Accept, ["*/*"], "other request headers kept")
+  assert_eq!(.request.headers."User-Agent", ["curl/8.7.1"], "other request headers kept")
+  assert_eq!(.request.uri, "/api/admin/users", "rest of the request kept")
+  assert_eq!(.status, 502)
+  assert!(!contains(encode_json(.), "RAWCOOKIESECRET1"), "raw Cookie header reached the sink on an error record")
+  assert!(!contains(encode_json(.), "RAWBEARERSECRET1"), "raw Authorization header reached the sink on an error record")
+  assert!(!contains(encode_json(.), "RAWPROXYSECRET1"), "raw Proxy-Authorization header reached the sink on an error record")
+'''
+
+# The dashboard's sign-in callback answers with the session cookie.
+[[tests]]
+name = "redact_secrets: Set-Cookie response header of a Caddy access record is removed"
+
+[[tests.inputs]]
+insert_at = "parse"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+container_id = "def456"
+stream = "stdout"
+message = '{"level":"info","ts":1791411787.0784714,"logger":"http.log.access","msg":"handled request","request":{"remote_ip":"203.0.113.42","remote_port":"61210","client_ip":"203.0.113.42","proto":"HTTP/1.1","method":"GET","host":"mcphero.io","uri":"/api/auth/callback?state=s1&code=GOOGLECODE123","headers":{"User-Agent":["Mozilla/5.0"],"Accept":["*/*"],"Cookie":["mcpolis_session=RAWCOOKIESECRET2"]}},"bytes_read":0,"user_id":"","duration":0.000635167,"size":0,"status":302,"resp_headers":{"Content-Length":["0"],"Via":["1.1 Caddy"],"Location":["/app"],"Server":["Caddy"],"Set-Cookie":["mcpolis_session=SESSIONSECRET123; HttpOnly; Secure"],"Date":["Wed, 07 Oct 2026 22:23:07 GMT"]}}'
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.event, "caddy.access.302", "access record reshaped")
+  assert!(!exists(.resp_headers."Set-Cookie"), "Set-Cookie response header removed")
+  assert!(!exists(.request.headers.Cookie), "Cookie request header removed")
+  assert_eq!(.resp_headers.Location, ["/app"], "other response headers kept")
+  assert_eq!(.resp_headers.Server, ["Caddy"], "other response headers kept")
+  assert_eq!(.user_agent, "Mozilla/5.0", "User-Agent still lifted to top-level")
+  assert_eq!(.http_path, "/api/auth/callback?state=s1&code=[REDACTED]", "Google code masked, state kept")
+  assert!(!contains(encode_json(.), "SESSIONSECRET123"), "session cookie value still present in resp_headers")
+  assert!(!contains(encode_json(.), "RAWCOOKIESECRET2"), "raw Cookie header reached the sink on an access record")
+  assert!(!contains(encode_json(.), "GOOGLECODE123"), "Google code still in the record")
+'''
+
+# Caddy writes this record only at debug level. Its top-level `headers`
+# map holds the backend's response headers: the session cookie and the
+# redirect carrying the gateway code.
+[[tests]]
+name = "redact_secrets: Caddy reverse-proxy debug record has its credential headers removed and its Location masked"
+
+[[tests.inputs]]
+insert_at = "parse"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+container_id = "def456"
+stream = "stdout"
+message = '{"level":"debug","ts":1791411787.0783987,"logger":"http.handlers.reverse_proxy","msg":"upstream roundtrip","upstream":"mcpolis-nginx-1:80","duration":0.000457166,"request":{"remote_ip":"203.0.113.42","remote_port":"61210","client_ip":"203.0.113.42","proto":"HTTP/1.1","method":"POST","host":"mcp.mcphero.io","uri":"/mcp/oauth/consent","headers":{"Authorization":["Bearer RAWBEARERSECRET3"],"X-Forwarded-For":["203.0.113.42"],"X-Forwarded-Proto":["https"],"X-Forwarded-Host":["mcp.mcphero.io"],"Via":["1.1 Caddy"],"User-Agent":["Mozilla/5.0"],"Accept":["*/*"],"Cookie":["mcpolis_session=RAWCOOKIESECRET3"]}},"headers":{"Content-Length":["0"],"Location":["https://claude.ai/api/mcp/auth_callback?code=GATEWAYCODE3&state=abc"],"Server":["nginx"],"Set-Cookie":["mcpolis_session=RESPCOOKIESECRET3; HttpOnly; Secure"],"Date":["Wed, 07 Oct 2026 22:23:07 GMT"]},"status":302}'
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.logger, "http.handlers.reverse_proxy", "debug record is not reshaped")
+  assert!(!exists(.headers."Set-Cookie"), "Set-Cookie removed from the backend's response headers")
+  assert_eq!(.headers.Location, ["https://claude.ai/api/mcp/auth_callback?code=[REDACTED]&state=abc"], "gateway code masked, rest of the redirect kept")
+  assert_eq!(.headers.Server, ["nginx"], "other response headers kept")
+  assert!(!exists(.request.headers.Cookie), "Cookie removed from the proxied request")
+  assert!(!exists(.request.headers.Authorization), "Authorization removed from the proxied request")
+  assert_eq!(.request.headers."X-Forwarded-For", ["203.0.113.42"], "other request headers kept")
+  assert!(!contains(encode_json(.), "RESPCOOKIESECRET3"), "session cookie value reached the sink")
+  assert!(!contains(encode_json(.), "RAWCOOKIESECRET3"), "raw Cookie header reached the sink")
+  assert!(!contains(encode_json(.), "RAWBEARERSECRET3"), "raw Authorization header reached the sink")
+  assert!(!contains(encode_json(.), "GATEWAYCODE3"), "gateway code reached the sink")
+'''
+
+[[tests]]
+name = "redact_secrets: credential headers are removed whatever their letter case"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+service = "caddy"
+logger = "http.log.error"
+[tests.inputs.log_fields.request.headers]
+cookie = ["mcpolis_session=LOWERCOOKIESECRET"]
+AUTHORIZATION = ["Bearer UPPERBEARERSECRET"]
+"proxy-authorization" = ["Basic LOWERPROXYSECRET"]
+"user-agent" = ["curl/8"]
+[tests.inputs.log_fields.resp_headers]
+"set-cookie" = ["mcpolis_session=LOWERSETCOOKIESECRET"]
+"content-type" = ["text/html"]
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.request.headers, {"user-agent": ["curl/8"]}, "only the non-credential request header kept")
+  assert_eq!(.resp_headers, {"content-type": ["text/html"]}, "only the non-credential response header kept")
+  assert!(!contains(encode_json(.), "SECRET"), "a credential reached the sink")
+'''
+
+# When this transform's program fails, Vector sends the ORIGINAL record,
+# unmasked, to the sink. Header fields that are not maps must not make
+# it fail.
+[[tests]]
+name = "redact_secrets: header fields that are not maps do not switch masking off"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+event = "demo"
+password = "hunter2"
+request = "GET /mcp/oauth/consent?consent=STRINGTOKEN123"
+resp_headers = ["Set-Cookie", "Location"]
+headers = 12345
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.password, "[REDACTED]", "masking still applied")
+  assert_eq!(.request, "GET /mcp/oauth/consent?consent=[REDACTED]", "a string request still has its URL masked")
+  assert_eq!(.resp_headers, ["Set-Cookie", "Location"], "a list left as is")
+  assert_eq!(.headers, 12345, "a number left as is")
+'''
+
+# ---- redact_secrets: secrets in the URLs of a Caddy record ----
+#
+# A Caddy record keeps the raw request target in `request.uri`, and its
+# headers as arrays: `Referer` on the request, `Location` on a redirect.
+# The consent token and OAuth codes must be masked in all of them before
+# the sink, for access records (which pass through the Caddy reshape)
+# and for error records (which don't).
+
+[[tests]]
+name = "redact_secrets: consent token in a Caddy request.uri is masked"
+
+[[tests.inputs]]
+insert_at = "reshape_caddy_access"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+service = "caddy"
+logger = "http.log.access"
+status = 200
+msg = "handled request"
+level = "info"
+[tests.inputs.log_fields.request]
+method = "GET"
+uri = "/mcp/oauth/consent?consent=SECRETTOKEN123&state=abc"
+host = "mcp.mcphero.io"
+remote_ip = "203.0.113.42"
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.http_path, "/mcp/oauth/consent?consent=[REDACTED]&state=abc", "http_path masked")
+  assert_eq!(.request.uri, "/mcp/oauth/consent?consent=[REDACTED]&state=abc", "request.uri masked in place, rest of the target kept")
+  assert!(!contains(encode_json(.), "SECRETTOKEN123"), "consent token still in the record")
+'''
+
+[[tests]]
+name = "redact_secrets: Google callback code in a Caddy request.uri and the consent token in its Location are masked"
+
+[[tests.inputs]]
+insert_at = "reshape_caddy_access"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+service = "caddy"
+logger = "http.log.access"
+status = 302
+msg = "handled request"
+level = "info"
+[tests.inputs.log_fields.request]
+method = "GET"
+uri = "/mcp/oauth/google/callback?state=xyz&code=4/SECRETCODE_GHI"
+host = "mcp.mcphero.io"
+remote_ip = "203.0.113.42"
+[tests.inputs.log_fields.resp_headers]
+Location = ["https://mcp.mcphero.io/mcp/oauth/consent?consent=PARKEDTOKEN123"]
+Server = ["Caddy"]
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.request.uri, "/mcp/oauth/google/callback?state=xyz&code=[REDACTED]", "Google code masked, state kept")
+  assert_eq!(.resp_headers.Location, ["https://mcp.mcphero.io/mcp/oauth/consent?consent=[REDACTED]"], "consent token masked in the redirect")
+  assert!(!contains(encode_json(.), "SECRETCODE"), "authorization code still in the record")
+  assert!(!contains(encode_json(.), "PARKEDTOKEN123"), "consent token still in the record")
+'''
+
+[[tests]]
+name = "redact_secrets: gateway code in a Caddy Location response header is masked"
+
+[[tests.inputs]]
+insert_at = "reshape_caddy_access"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+service = "caddy"
+logger = "http.log.access"
+status = 302
+msg = "handled request"
+level = "info"
+[tests.inputs.log_fields.request]
+method = "POST"
+uri = "/mcp/oauth/consent"
+host = "mcp.mcphero.io"
+remote_ip = "203.0.113.42"
+[tests.inputs.log_fields.resp_headers]
+Location = ["https://claude.ai/api/mcp/auth_callback?code=GATEWAYCODE123&state=abc"]
+Server = ["Caddy"]
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.resp_headers.Location, ["https://claude.ai/api/mcp/auth_callback?code=[REDACTED]&state=abc"], "code masked, rest of the redirect kept")
+  assert_eq!(.resp_headers.Server, ["Caddy"], "other response headers untouched")
+  assert!(!contains(encode_json(.), "GATEWAYCODE123"), "gateway code still in the record")
+'''
+
+# The token match is unanchored on purpose: it also catches *_token params.
+[[tests]]
+name = "redact_secrets: refresh_token and id_token in a Caddy Location are masked"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+service = "caddy"
+[tests.inputs.log_fields.resp_headers]
+Location = ["https://client.example/cb?refresh_token=RT_SECRET_123&x=1", "https://client.example/cb?id_token=IDT_SECRET_123&x=1"]
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.resp_headers.Location, ["https://client.example/cb?refresh_token=[REDACTED]&x=1", "https://client.example/cb?id_token=[REDACTED]&x=1"], "both token values masked, rest of the URLs kept")
+'''
+
+[[tests]]
+name = "redact_secrets: consent token in a Caddy Referer request header is masked"
+
+[[tests.inputs]]
+insert_at = "reshape_caddy_access"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+service = "caddy"
+logger = "http.log.access"
+status = 302
+msg = "handled request"
+level = "info"
+[tests.inputs.log_fields.request]
+method = "POST"
+uri = "/mcp/oauth/consent"
+host = "mcp.mcphero.io"
+remote_ip = "203.0.113.42"
+[tests.inputs.log_fields.request.headers]
+Referer = ["https://mcp.mcphero.io/mcp/oauth/consent?consent=REFERERTOKEN123"]
+"User-Agent" = ["Mozilla/5.0"]
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.request.headers.Referer, ["https://mcp.mcphero.io/mcp/oauth/consent?consent=[REDACTED]"], "consent token masked in Referer")
+  assert_eq!(.request.headers."User-Agent", ["Mozilla/5.0"], "other request headers untouched")
+  assert_eq!(.user_agent, "Mozilla/5.0", "User-Agent still lifted to top-level")
+  assert!(!contains(encode_json(.), "REFERERTOKEN123"), "consent token still in the record")
+'''
+
+# A real Caddy 2.11 error line (a 502 while the backend is down). Caddy
+# writes these even with access logging off, and they skip the reshape.
+[[tests]]
+name = "redact_secrets: Caddy error record (not reshaped) has its request.uri masked"
+
+[[tests.inputs]]
+insert_at = "parse"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+container_id = "def456"
+stream = "stdout"
+message = '{"level":"error","ts":1791384474.5757833,"logger":"http.log.error","msg":"dial tcp 172.18.0.5:80: connect: connection refused","request":{"remote_ip":"203.0.113.42","remote_port":"39690","client_ip":"203.0.113.42","proto":"HTTP/2.0","method":"GET","host":"mcp.mcphero.io","uri":"/mcp/oauth/consent?consent=ERRTOKEN123","headers":{"Cookie":["REDACTED"],"User-Agent":["Mozilla/5.0"],"Referer":["https://accounts.google.com/"]}},"duration":0.000306125,"status":502,"err_id":"qvn3rc4kf","err_trace":"reverseproxy.statusError (reverseproxy.go:1525)"}'
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.service, "caddy")
+  assert_eq!(.logger, "http.log.error", "error record is not reshaped")
+  assert!(!exists(.http_path), "no reshape output on an error record")
+  assert_eq!(.request.uri, "/mcp/oauth/consent?consent=[REDACTED]", "consent token masked without the reshape")
+  assert_eq!(.request.headers.Referer, ["https://accounts.google.com/"], "secret-free Referer untouched")
+  assert!(!contains(encode_json(.), "ERRTOKEN123"), "consent token still in the record")
+'''
+
+[[tests]]
+name = "redact_secrets: ordinary Caddy URLs are left unchanged"
+
+[[tests.inputs]]
+insert_at = "reshape_caddy_access"
+type = "log"
+[tests.inputs.log_fields]
+container_name = "caddy"
+service = "caddy"
+logger = "http.log.access"
+status = 302
+msg = "handled request"
+level = "info"
+[tests.inputs.log_fields.request]
+method = "GET"
+uri = "/mcp/authorize?response_type=code&client_id=abc&code_challenge=XYZ&code_challenge_method=S256&state=s1"
+host = "mcp.mcphero.io"
+remote_ip = "203.0.113.42"
+[tests.inputs.log_fields.request.headers]
+Referer = ["https://claude.ai/"]
+[tests.inputs.log_fields.resp_headers]
+Location = ["https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&response_type=code&state=s2"]
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.request.uri, "/mcp/authorize?response_type=code&client_id=abc&code_challenge=XYZ&code_challenge_method=S256&state=s1", "code_challenge and response_type=code untouched")
+  assert_eq!(.http_path, .request.uri, "http_path untouched too")
+  assert_eq!(.request.headers.Referer, ["https://claude.ai/"])
+  assert_eq!(.resp_headers.Location, ["https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&response_type=code&state=s2"])
+'''
+
+# When this transform's program fails, Vector sends the ORIGINAL record,
+# unmasked, to the sink. A non-string `http_path` used to make it fail.
+[[tests]]
+name = "redact_secrets: a non-string http_path does not switch masking off"
+
+[[tests.inputs]]
+insert_at = "redact_secrets"
+type = "log"
+[tests.inputs.log_fields]
+event = "demo"
+password = "hunter2"
+http_path = 12345
+service = "mcpolis-backend"
+
+[[tests.outputs]]
+extract_from = "redact_secrets"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+  assert_eq!(.password, "[REDACTED]", "masking still applied")
+  assert_eq!(.http_path, 12345, "non-string http_path left as is")
 '''

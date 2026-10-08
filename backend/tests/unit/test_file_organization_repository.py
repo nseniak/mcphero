@@ -122,3 +122,24 @@ async def test_corrupt_memberships_file_starts_fresh(
     repo2 = FileOrganizationRepository(tmp_path)
     rows = await repo2.list_memberships(DEFAULT_ORG_ID)
     assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_rename_role_moves_memberships_of_that_role_only(
+    tmp_path: Path,
+) -> None:
+    """A membership keeps its own copy of the role name. A role rename
+    must update that copy, or the superadmin Users list shows the old
+    name."""
+    repo = make_repo(tmp_path)
+    await repo.add_membership(DEFAULT_ORG_ID, "alice@x.com", "reader")
+    await repo.add_membership(DEFAULT_ORG_ID, "bob@x.com", "admin")
+
+    assert await repo.rename_role(DEFAULT_ORG_ID, "reader", "auditor") == 1
+
+    roles = {
+        m.email: m.role
+        for m in await make_repo(tmp_path).list_memberships(DEFAULT_ORG_ID)
+    }
+    assert roles == {"alice@x.com": "auditor", "bob@x.com": "admin"}
+    assert await repo.rename_role(DEFAULT_ORG_ID, "ghost", "other") == 0

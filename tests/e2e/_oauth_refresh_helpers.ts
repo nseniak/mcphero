@@ -21,6 +21,7 @@ import {
   makeMcpClient,
   mintMcpToken,
   OAUTH_TEST_MCP_URL,
+  resetOAuthUpstream,
   BACKEND_URL,
 } from "./helpers";
 
@@ -165,10 +166,7 @@ export async function resetArmAndConnect(
   request: APIRequestContext,
 ): Promise<void> {
   await request.post(`${OAUTH_TEST_MCP_URL}/test/reset`);
-  await apiLoginAs(request, ADMIN);
-  await request.post(
-    `${BACKEND_URL}/api/admin/upstreams/${UPSTREAM}/disconnect`,
-  );
+  await resetOAuthUpstream(request, UPSTREAM);
   const ttlResp = await request.post(
     `${OAUTH_TEST_MCP_URL}/test/set-token-ttl`,
     { form: { seconds: String(TOKEN_TTL_SECONDS) } },

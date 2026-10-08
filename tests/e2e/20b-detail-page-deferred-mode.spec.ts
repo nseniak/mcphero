@@ -51,7 +51,7 @@ test.describe("Per-MCP secrets — detail page (deferred mode)", () => {
     // Optimistic display: the row is visible while still in the
     // deferred buffer (no PUT issued yet).
     await expect(page.getByText("BOUND_TOKEN")).toBeVisible();
-    await expect(page.getByText(/••••xyz4/)).toBeVisible();
+    await expect(page.getByText("•••• set")).toBeVisible();
     // Sanity: the server doesn't have it yet.
     const beforeServer = await page.evaluate(async (upstreamId: string) => {
       const r = await fetch(`/api/admin/upstreams/${upstreamId}/template-vars`);
@@ -178,10 +178,9 @@ test.describe("Per-MCP secrets — detail page (deferred mode)", () => {
         `${s.name}=${s.value ?? "•"}`,
       ).sort();
     }).toEqual([
-      // Both FRESH_ADD (password) and SEED_KEEP (plain) carry their
-      // plaintext in the API response now — the SPA obfuscates
-      // password rows by default with the eye toggle.
-      "FRESH_ADD=fresh-add-1234567890",
+      // FRESH_ADD is a password: write-only, never in the response.
+      // SEED_KEEP is plain and carries its value.
+      "FRESH_ADD=•",
       "SEED_KEEP=seed-keep-rotated-1234567890",
     ]);
   });

@@ -16,6 +16,10 @@ Contract (``EmailSender`` port): raise on a failed send. The §5.2
 notifier only calls ``mark_notified`` after a successful send, so a
 raised exception here means the admin gets retried on the next hourly
 sweep rather than being silently marked done.
+
+Every SMTP step is bounded by ``timeout_seconds``: aiosmtplib's own
+default is 60 s per step, so one silent mail server held a send for a
+full minute (measured 2026-10-07).
 """
 from __future__ import annotations
 
@@ -34,6 +38,8 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 # records the message + connection kwargs without touching a network.
 SendFn = Callable[..., Awaitable[object]]
 
+SMTP_TIMEOUT_SECONDS = 15.0
+
 
 @dataclass
 class SmtpEmailSender:
@@ -43,6 +49,7 @@ class SmtpEmailSender:
     password: str
     from_addr: str
     from_name: str = "MCP Hero"
+    timeout_seconds: float = SMTP_TIMEOUT_SECONDS
     send_fn: SendFn = aiosmtplib.send
 
     async def send_email(
@@ -72,6 +79,7 @@ class SmtpEmailSender:
             password=self.password,
             use_tls=use_tls,
             start_tls=not use_tls,
+            timeout=self.timeout_seconds,
         )
         logger.info(
             "email.smtp.sent",

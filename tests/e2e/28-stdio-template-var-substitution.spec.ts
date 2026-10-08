@@ -155,6 +155,86 @@ test.describe("Stdio template-var substitution + Sandbox files — runtime", () 
     }
   });
 
+  test("A renamed password keeps its saved value at the spawned process", async ({
+    request,
+  }) => {
+    // The dashboard never holds a saved password, so a rename sends
+    // ``value: null`` + ``rename_from`` and the backend moves the value
+    // itself. The API can't show the moved value (write-only), so only
+    // the running MCP can prove it arrived intact.
+    const api = await adminApi(request);
+    const upstreamId = uniqueId("subst-rename");
+    const expected = `e2e-renamed-${Date.now().toString(36)}`;
+
+    const createUpstream = await api.post(
+      `${BACKEND_URL}/api/admin/upstreams`,
+      {
+        data: {
+          id: upstreamId,
+          display_name: "subst-rename-stdio",
+          command: "uvx",
+          args: ["--from", MCP_PKG, "python", "-c", INLINE_MCP_SCRIPT],
+          env: { E2E_RENAMED: "${NEW_TOKEN}" },
+          auth_mode: "service_account",
+        },
+      },
+    );
+    expect(createUpstream.status()).toBe(201);
+
+    const setVar = await api.put(
+      `${BACKEND_URL}/api/admin/upstreams/${upstreamId}/template-vars/OLD_TOKEN`,
+      { data: { value: expected, is_secret: true } },
+    );
+    expect(setVar.status()).toBe(200);
+
+    const rename = await api.put(
+      `${BACKEND_URL}/api/admin/upstreams/${upstreamId}`,
+      {
+        data: {
+          template_var_changes: {
+            sets: {
+              NEW_TOKEN: {
+                value: null, is_secret: true, rename_from: "OLD_TOKEN",
+              },
+            },
+            deletes: ["OLD_TOKEN"],
+          },
+        },
+      },
+    );
+    expect(rename.status()).toBe(200);
+    const list = await api.get(
+      `${BACKEND_URL}/api/admin/upstreams/${upstreamId}/template-vars`,
+    );
+    const listText = await list.text();
+    expect(listText).not.toContain(expected);
+    expect(
+      (JSON.parse(listText) as { name: string }[]).map((v) => v.name),
+    ).toEqual(["NEW_TOKEN"]);
+
+    const reconnect = await api.post(
+      `${BACKEND_URL}/api/admin/upstreams/${upstreamId}/reconnect`,
+    );
+    expect(reconnect.status()).toBe(200);
+    await pollReady(api, upstreamId);
+
+    const token = await mintMcpToken(request, ADMIN, ORG);
+    let client: Client | null = null;
+    try {
+      client = await makeMcpClient(token, ORG, "mcp");
+      const resp = await client.callTool({
+        name: `${ORG}__${upstreamId}__read_env`,
+        arguments: { name: "E2E_RENAMED" },
+      });
+      expect(JSON.stringify(resp.content)).toContain(expected);
+    } finally {
+      if (client) await client.close().catch(() => {});
+      await api
+        .delete(`${BACKEND_URL}/api/admin/upstreams/${upstreamId}`)
+        .catch(() => undefined);
+    }
+  });
+
   test("Uploaded Sandbox file lands at target_path; MCP reads its contents", async ({
     request,
   }) => {

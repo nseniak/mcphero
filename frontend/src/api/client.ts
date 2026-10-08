@@ -105,7 +105,11 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
           message = String(json.detail);
         }
       } else if (json.error === "rate_limited") {
-        message = `Too many requests. Please wait ${json.retry_after ?? "a few"} seconds.`;
+        // The backend's sentence names the limit that was hit (sign-in
+        // vs. dashboard) and the wait; fall back if it's ever missing.
+        message = typeof json.message === "string"
+          ? json.message
+          : `Too many requests. Please wait ${json.retry_after ?? "a few"} seconds.`;
       } else if (
         resp.status === 402 && json.error === "plan_limit_exceeded"
       ) {

@@ -29,7 +29,10 @@ from typing import Any
 import structlog
 from pydantic import ValidationError
 
-from mcpolis.adapters.repositories.mongo_client import OrgScopedCollection
+from mcpolis.adapters.repositories.mongo_client import (
+    OrgScopedCollection,
+    get_or_create_sandbox_instance_id,
+)
 from mcpolis.domain.model.upstream import (
     ServerInfo,
     UpstreamSelfDescription,
@@ -46,6 +49,9 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 class MongoSandboxPersistenceRepository(SandboxPersistenceRepository):
     def __init__(self, coll: OrgScopedCollection) -> None:
         self._coll = coll
+
+    async def get_or_create_instance_id(self) -> str:
+        return await get_or_create_sandbox_instance_id(self._coll.database)
 
     async def upsert(self, ref: SandboxPersistedRef) -> None:
         await self._coll.replace_one(

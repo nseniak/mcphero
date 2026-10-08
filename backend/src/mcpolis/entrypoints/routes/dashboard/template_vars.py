@@ -3,8 +3,8 @@
 Two flavours of env var live here:
 
 - ``is_secret=True`` (the default): plaintext is write-only. Accepted
-  on PUT, never returned by GET / list. The list response carries
-  ``last_four`` for display.
+  on PUT, never returned by GET / list / PUT. The response carries
+  only ``has_value`` (set / empty).
 - ``is_secret=False``: value is returned in clear by GET / list so
   the UI can render it verbatim. The toggle is a **create-time
   decision** — replacing the value of an existing row preserves the
@@ -48,17 +48,7 @@ def create_template_vars_router(deps: DashboardDeps) -> APIRouter:
         summaries = await deps.template_var_repo.list_summaries(
             org_id, upstream_id,
         )
-        return [
-            TemplateVarSummaryView(
-                name=s.name,
-                is_secret=s.is_secret,
-                value=s.value,
-                last_four=s.last_four,
-                created_at=s.created_at,
-                updated_at=s.updated_at,
-            )
-            for s in summaries
-        ]
+        return [TemplateVarSummaryView.from_summary(s) for s in summaries]
 
     @router.put(
         "/upstreams/{upstream_id}/template-vars/{name}",
@@ -98,14 +88,7 @@ def create_template_vars_router(deps: DashboardDeps) -> APIRouter:
             org_id, upstream_id, name, body.value,
             is_secret=body.is_secret,
         )
-        return TemplateVarSummaryView(
-            name=summary.name,
-            is_secret=summary.is_secret,
-            value=summary.value,
-            last_four=summary.last_four,
-            created_at=summary.created_at,
-            updated_at=summary.updated_at,
-        )
+        return TemplateVarSummaryView.from_summary(summary)
 
     @router.delete("/upstreams/{upstream_id}/template-vars/{name}")
     async def delete_template_var(upstream_id: str, name: str) -> dict[str, str]:

@@ -52,6 +52,7 @@ from mcpolis.domain.model.upstream import (
     UpstreamDefinition,
     UpstreamSelfDescription,
 )
+from mcpolis.domain.services.cancel_shield import finish_despite_cancels
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
@@ -62,8 +63,12 @@ DEFAULT_CLOSE_TIMEOUT = 10.0
 
 # How long a connect whose caller gave up may take to let go of its
 # transport. A sandbox that is still being created finishes that first
-# (a few seconds), then the session's own cleanup kills it.
-ABANDON_TIMEOUT = 30.0
+# (a few seconds), then the session's own cleanup kills it (or, at a
+# shutdown, keeps it for the next boot). The shutdown waits at least this
+# long for the connects it aborts (``ShutdownBudget.background_jobs``),
+# so the sandbox such a connect keeps is recorded before the stores
+# close: raising this lengthens the worst-case shutdown.
+ABANDON_TIMEOUT = 20.0
 
 T = TypeVar("T")
 
@@ -279,13 +284,14 @@ class ConnectionTaskBase(ABC):
         again meanwhile (a shutdown, a Stop right after the caller hung
         up). Stopping early would let whoever waits for this connect to
         wind down go on while its transport is still held. Bounded by
-        ``ABANDON_TIMEOUT``."""
-        abandoning = asyncio.ensure_future(self._abandon())
-        while not abandoning.done():
-            try:
-                await asyncio.shield(abandoning)
-            except asyncio.CancelledError:
-                continue
+        ``ABANDON_TIMEOUT``.
+
+        ``start`` passes on the cancel that made it give up, so the later
+        ones are dropped here. Only this call holds the task, so a
+        shutdown that refuses new jobs still lets it run."""
+        await finish_despite_cancels(
+            self._abandon(), held_by=None, pass_cancel_on=False,
+        )
 
     async def _abandon(self) -> None:
         task = self._task

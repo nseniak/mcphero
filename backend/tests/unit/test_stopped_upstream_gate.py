@@ -3,13 +3,12 @@
 Stop marks the upstream DISABLED. Anything else that would open its
 shared session again (a tool call's lazy attach, a heal, a delayed tool
 refresh) is refused, so a sandbox cannot start behind the admin's back.
-Only for servers without per-user sign-in (service_account).
+Servers with sign-in are covered in ``test_stop_closes_every_session.py``.
 
 Driven by ``FakeSandboxService``: a real MCP server over memory streams,
 so ``session_open_count`` counts the sandboxes actually opened.
 """
 import asyncio
-from pathlib import Path
 
 import pytest
 import structlog
@@ -167,16 +166,19 @@ async def test_a_tool_call_still_retries_a_failed_mcp_server() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_stop_gate_leaves_sign_in_servers_alone(tmp_path: Path) -> None:
-    """Servers with per-user sign-in are exempt: their tool calls run on
-    each user's own session, and after an admin signs in again the
-    upstream can still read DISABLED until the next restart."""
+async def test_the_stop_gate_holds_for_sign_in_servers_until_start() -> None:
+    """A server with sign-in is refused too while stopped (its shared
+    discovery session included), and the admin's Start lets it open."""
     server, server_task, url = await start_upstream(ConnectionGate())
     upstream = make_upstream(url)  # per_user_oauth
     mgr = UpstreamClientManager([upstream])
     try:
         await mgr.transition_to_disabled(upstream.id)
 
+        with pytest.raises(UpstreamStopped):
+            await mgr.connect_shared(upstream)
+
+        mgr.transition_out_of_disabled(upstream.id)
         await asyncio.wait_for(mgr.connect_shared(upstream), timeout=10)
 
         state = mgr.get_state(upstream.id)

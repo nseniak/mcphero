@@ -90,19 +90,34 @@ async def test_file_mode_create_org_raises(tmp_path: object) -> None:
 
 
 @pytest.mark.asyncio
-async def test_file_mode_list_user_orgs_returns_default(
+async def test_file_mode_an_invited_user_is_a_member_only_once_they_accept(
     tmp_path: object,
 ) -> None:
+    """Being in the default org's config is only an invitation: the org
+    is listed among the person's invitations, not their orgs, until their
+    membership row exists (they accepted it)."""
     svc = make_org_service_file(tmp_path)
-    # The user must exist in config to get the default org.
     from mcpolis.domain.model.settings import UserDefinition
 
-    await svc._config_repo.set_user(
+    await svc._config_repo.set_user(  # pyright: ignore[reportPrivateUsage]
         DEFAULT_ORG_ID, "alice@x.com", UserDefinition(role="admin"),
     )
+
+    assert await svc.list_user_orgs("alice@x.com") == []
+    assert await svc.get_user_role(DEFAULT_ORG_ID, "alice@x.com") is None
+    assert not await svc.is_admin(DEFAULT_ORG_ID, "alice@x.com")
+    invitations = await svc.list_invitations("alice@x.com")
+    assert [(i.org.slug, i.role) for i in invitations] == [("default", "admin")]
+
+    await svc._org_repo.add_membership(  # pyright: ignore[reportPrivateUsage]
+        DEFAULT_ORG_ID, "alice@x.com", "admin",
+    )
+
     orgs = await svc.list_user_orgs("alice@x.com")
-    assert len(orgs) == 1
-    assert orgs[0].slug == "default"
+    assert [o.slug for o in orgs] == ["default"]
+    assert await svc.get_user_role(DEFAULT_ORG_ID, "alice@x.com") == "admin"
+    assert await svc.is_admin(DEFAULT_ORG_ID, "alice@x.com")
+    assert await svc.list_invitations("alice@x.com") == []
 
 
 @pytest.mark.asyncio

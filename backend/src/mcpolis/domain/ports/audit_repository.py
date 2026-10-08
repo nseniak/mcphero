@@ -22,6 +22,7 @@ class AuditRepository(Protocol):
 
     async def search_cross_org(
         self,
+        org_id: str | None = None,
         user_id: str | None = None,
         mcp_id: str | None = None,
         tool: str | None = None,
@@ -34,6 +35,9 @@ class AuditRepository(Protocol):
         Implementations bypass the per-org scoping that ``search``
         enforces. Callers MUST gate this behind a superadmin check —
         unscoped access to audit data is an operator privilege.
+
+        ``org_id`` narrows the search to one org INSIDE the query, so
+        ``limit`` counts that org's rows only.
 
         Each returned entry carries an ``org_id`` field so the caller
         can route or display it.

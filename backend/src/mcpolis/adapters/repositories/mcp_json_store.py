@@ -17,6 +17,8 @@ from typing import Any
 
 import structlog
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
+
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 
@@ -47,10 +49,9 @@ class McpJsonStore:
 
     def _write(self, servers: dict[str, dict[str, Any]]) -> None:
         """Write mcpServers dict to the JSON file atomically."""
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"mcpServers": servers}, indent=2))
-        tmp.replace(self._path)
+        write_text_atomic(
+            self._path, json.dumps({"mcpServers": servers}, indent=2),
+        )
 
     def read_all_sync(self, org_id: str) -> dict[str, dict[str, Any]]:
         """Synchronous read for startup."""

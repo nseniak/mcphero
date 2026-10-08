@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from mcpolis.domain.model.settings import (
     McpAccessConfig,
     RoleDefinition,
@@ -10,7 +12,9 @@ from mcpolis.domain.model.settings import (
 )
 
 from mcpolis.domain.services.settings_resolver import (
+    LastAdminError,
     admin_emails,
+    assert_keeps_an_admin,
     resolve_settings,
     would_remove_last_admin,
 )
@@ -273,3 +277,33 @@ def test_eligible_none_counts_everyone() -> None:
         "tpyo@test.com": "admin",
     })
     assert would_remove_last_admin(config, "boss@test.com") is False
+
+
+def test_store_check_refuses_removing_the_last_admin_nobody_signed_in_as() -> None:
+    # No admin has signed in, so the signed-in count is already zero
+    # and cannot object. The store must still refuse to remove the last
+    # listed admin, as it did before it was given the signed-in set.
+    config = make_org_config({
+        "boss@test.com": "admin",
+        "dev@test.com": "developer",
+    })
+    with pytest.raises(LastAdminError):
+        assert_keeps_an_admin(config, "boss@test.com", eligible={"dev@test.com"})
+
+
+def test_store_check_refuses_removing_the_last_signed_in_admin() -> None:
+    config = make_org_config({
+        "boss@test.com": "admin",
+        "tpyo@test.com": "admin",
+    })
+    with pytest.raises(LastAdminError):
+        assert_keeps_an_admin(config, "boss@test.com", eligible={"boss@test.com"})
+
+
+def test_store_check_allows_cleaning_up_an_invited_admin() -> None:
+    config = make_org_config({
+        "boss@test.com": "admin",
+        "tpyo@test.com": "admin",
+    })
+    assert_keeps_an_admin(config, "tpyo@test.com", eligible={"boss@test.com"})
+

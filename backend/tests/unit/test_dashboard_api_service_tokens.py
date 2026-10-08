@@ -15,15 +15,21 @@ appear in the Team user list.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from mcpolis.adapters.repositories.file_organization_repository import (
+    FileOrganizationRepository,
+)
+from mcpolis.domain.ports import DEFAULT_ORG_ID
 from mcpolis.entrypoints.app import create_app
 from mcpolis.entrypoints.config import Settings
 from tests.unit._dev_stub_login import login_as
+from tests.unit.factories import make_config_users_accepted
 
 MCP_JSON = json.dumps({
     "mcpServers": {
@@ -64,6 +70,7 @@ def make_test_client(
     mcp_json.write_text(MCP_JSON)
     config = tmp_path / "config.json"
     config.write_text(CONFIG_JSON)
+    make_config_users_accepted(tmp_path / "data", CONFIG_JSON)
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         mcp_json_path=mcp_json,
@@ -267,3 +274,51 @@ def test_role_referenced_by_token_is_not_deletable(tmp_path: Path) -> None:
     # Revoking the token unblocks deletion.
     assert client.delete("/api/admin/service-tokens/bot").status_code == 200
     assert client.delete("/api/admin/roles/spare").status_code == 200
+
+
+def test_renaming_a_role_renames_it_on_its_tokens(tmp_path: Path) -> None:
+    """A token holds its role by name. Renaming the role must carry the
+    token along, or the token silently resolves to an unknown role and
+    gets zero tools (the policy engine fails closed)."""
+    client = make_test_client(tmp_path)
+    mint(client, label="bot", role="spare")
+    mint(client, label="other-bot", role="user")
+
+    resp = client.put(
+        "/api/admin/roles/spare/rename", json={"new_name": "renamed"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    tokens = {
+        t["label"]: t["role"]
+        for t in client.get("/api/admin/service-tokens").json()
+    }
+    assert tokens == {"bot": "renamed", "other-bot": "user"}
+    roles = {r["name"]: r for r in client.get("/api/admin/roles").json()}
+    assert roles["renamed"]["service_token_count"] == 1
+    # The renamed role is now held by a token, so it is guarded too.
+    assert client.delete("/api/admin/roles/renamed").status_code == 400
+
+
+def test_renaming_a_role_renames_it_on_memberships(tmp_path: Path) -> None:
+    """The membership row keeps its own copy of the role name (the
+    superadmin Users list reads it). A rename must update the copy."""
+    asyncio.run(
+        FileOrganizationRepository(tmp_path / "data").add_membership(
+            DEFAULT_ORG_ID, "member@example.com", "user",
+        ),
+    )
+    client = make_test_client(tmp_path)
+    assert client.put(
+        "/api/admin/users/member@example.com/role", json={"role": "spare"},
+    ).status_code == 200
+    assert client.put(
+        "/api/admin/roles/spare/rename", json={"new_name": "renamed"},
+    ).status_code == 200
+
+    rows = asyncio.run(
+        FileOrganizationRepository(tmp_path / "data").list_memberships(
+            DEFAULT_ORG_ID,
+        ),
+    )
+    assert {m.email: m.role for m in rows}["member@example.com"] == "renamed"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,6 +9,9 @@ import pytest
 import structlog
 
 from mcpolis.adapters.gateway_session_registry import GatewaySessionRegistry
+from mcpolis.adapters.repositories.file_service_token_repository import (
+    FileServiceTokenRepository,
+)
 from mcpolis.adapters.upstream_clients.client_manager import UpstreamStopped
 from mcpolis.domain.model.settings import (
     RoleDefinition,
@@ -15,9 +19,11 @@ from mcpolis.domain.model.settings import (
     SettingsConfig,
     UserDefinition,
 )
+from mcpolis.domain.model.service_token import service_identity
 from mcpolis.domain.services.policy_engine import PolicyEngine
 from mcpolis.domain.services.policy_notifier import PolicyNotifier
-from mcpolis.domain.ports import DEFAULT_ORG_ID
+from mcpolis.domain.services.service_token_service import ServiceTokenService
+from mcpolis.domain.ports import DEFAULT_ORG_ID, MULTI_ORG_SENTINEL
 from tests.unit.factories import make_runtime_manager, make_upstream_definition
 from tests.unit.stall_client_manager_fake import (
     StallClientManagerFake,
@@ -39,6 +45,7 @@ def make_mock_transport() -> MagicMock:
     transport = MagicMock()
     transport._write_stream = MagicMock()
     transport._write_stream.send_nowait = MagicMock()
+    transport.terminate = AsyncMock()
     return transport
 
 
@@ -46,9 +53,12 @@ def make_notifier(
     users: dict[str, UserDefinition] | None = None,
     roles: dict[str, RoleDefinition] | None = None,
     debounce_seconds: float = 0.05,
+    members: list[str] | None = None,
 ) -> tuple[PolicyNotifier, GatewaySessionRegistry, MagicMock]:
+    """``members``: the addresses that accepted their invitation, as they
+    signed in (None: membership not tracked, every user counts)."""
     config = make_config(users=users, roles=roles)
-    policy_engine = PolicyEngine(config)
+    policy_engine = PolicyEngine(config, members)
     registry = GatewaySessionRegistry()
     session_manager = MagicMock()
     session_manager._server_instances = {}
@@ -182,13 +192,18 @@ async def test_no_sessions_does_not_error() -> None:
 
 def make_notifier_with_tool_registry(
     debounce_seconds: float = 0.05,
+    users: dict[str, UserDefinition] | None = None,
+    members: list[str] | None = None,
 ) -> tuple[PolicyNotifier, GatewaySessionRegistry, MagicMock, MagicMock]:
     """Build a notifier whose runtime exposes a mocked ToolRegistry.
+    ``users`` defaults to alice; ``members`` as in ``make_notifier``.
 
     Returns (notifier, registry, session_manager, tool_registry).
     """
-    config = make_config(users={"alice@test.com": UserDefinition(role="viewer")})
-    policy_engine = PolicyEngine(config)
+    config = make_config(
+        users=users or {"alice@test.com": UserDefinition(role="viewer")},
+    )
+    policy_engine = PolicyEngine(config, members)
     registry = GatewaySessionRegistry()
     session_manager = MagicMock()
     session_manager._server_instances = {}
@@ -399,6 +414,40 @@ async def test_notify_upstream_tools_skips_non_member_cloud_session() -> None:
     carol_cloud._write_stream.send_nowait.assert_not_called()
 
 
+# Invited as ``Alice@Test.com``, alice joined, and signs in, as
+# ``alice@test.com``: her sessions are registered under that spelling.
+
+
+async def test_notify_role_changed_reaches_a_member_who_joined_under_another_spelling() -> None:
+    notifier, registry, sm = make_notifier(
+        users={"Alice@Test.com": UserDefinition(role="viewer")},
+        members=["alice@test.com"],
+    )
+    transport = make_mock_transport()
+    sm._server_instances["s1"] = transport
+    registry.register("s1", DEFAULT_ORG_ID, "alice@test.com")
+
+    notifier.notify_role_changed(DEFAULT_ORG_ID, "viewer")
+    await asyncio.sleep(0.1)
+
+    transport._write_stream.send_nowait.assert_called_once()
+
+
+async def test_notify_upstream_tools_reaches_a_member_who_joined_under_another_spelling() -> None:
+    notifier, registry, sm, _tool_registry = make_notifier_with_tool_registry(
+        users={"Alice@Test.com": UserDefinition(role="viewer")},
+        members=["alice@test.com"],
+    )
+    cloud_t = make_mock_transport()
+    sm._server_instances["s-cloud"] = cloud_t
+    registry.register("s-cloud", MULTI_ORG_SENTINEL, "alice@test.com")
+
+    notifier.notify_upstream_tools_changed(DEFAULT_ORG_ID, "github")
+    await asyncio.sleep(0.2)
+
+    cloud_t._write_stream.send_nowait.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_terminate_user_sessions_reaches_multi_org_cloud_session() -> None:
     """Removing a user from an org has to tear down every gateway
@@ -416,13 +465,43 @@ async def test_terminate_user_sessions_reaches_multi_org_cloud_session() -> None
     registry.register("s-cloud", MULTI_ORG_SENTINEL, "alice@test.com")
     registry.register("s-admin", DEFAULT_ORG_ID, "alice@test.com")
 
-    removed = notifier.terminate_user_sessions(
+    removed = await notifier.terminate_user_sessions(
         DEFAULT_ORG_ID, "alice@test.com",
     )
     # Both — admin-mounted AND cloud-mounted — should be popped.
     assert removed == 2
     assert "s-cloud" not in sm._server_instances
     assert "s-admin" not in sm._server_instances
+
+
+@pytest.mark.asyncio
+async def test_terminate_user_sessions_closes_each_session() -> None:
+    """Forgetting a session id is not enough: its open event stream and
+    its server task keep running until the client hangs up, so a
+    removed or revoked member keeps receiving the org's notifications.
+    Each removed session must be closed, and other users' sessions
+    left alone."""
+    notifier, registry, sm = make_notifier(
+        users={
+            "alice@test.com": UserDefinition(role="viewer"),
+            "bob@test.com": UserDefinition(role="viewer"),
+        },
+    )
+    alice = make_mock_transport()
+    bob = make_mock_transport()
+    sm._server_instances["s-alice"] = alice
+    sm._server_instances["s-bob"] = bob
+    registry.register("s-alice", DEFAULT_ORG_ID, "alice@test.com")
+    registry.register("s-bob", DEFAULT_ORG_ID, "bob@test.com")
+
+    removed = await notifier.terminate_user_sessions(
+        DEFAULT_ORG_ID, "alice@test.com",
+    )
+
+    assert removed == 1
+    alice.terminate.assert_awaited_once()
+    bob.terminate.assert_not_awaited()
+    assert "s-bob" in sm._server_instances
 
 
 def make_recovery_notifier(
@@ -505,3 +584,58 @@ async def test_a_refresh_on_a_server_stopped_meanwhile_is_skipped_quietly() -> N
     events = [e["event"] for e in logs]
     assert "tool.registry.refresh_after_change.failed" not in events
     assert "tool.registry.refresh_after_change.upstream_stopped" in events
+
+
+# --- role notices reach service-token sessions too ---
+
+
+def make_notifier_with_tokens(
+    tmp_path: Path,
+) -> tuple[PolicyNotifier, GatewaySessionRegistry, MagicMock, ServiceTokenService]:
+    config = make_config(
+        users={"alice@test.com": UserDefinition(role="viewer")},
+        roles={
+            "viewer": RoleDefinition(settings=RoleSettings()),
+            "admin": RoleDefinition(is_admin=True, settings=RoleSettings()),
+        },
+    )
+    registry = GatewaySessionRegistry()
+    session_manager = MagicMock()
+    session_manager._server_instances = {}
+    tokens = ServiceTokenService(repo=FileServiceTokenRepository(tmp_path))
+    notifier = PolicyNotifier(
+        session_manager, registry, make_runtime_manager(PolicyEngine(config)),
+        service_token_service=tokens,
+        debounce_seconds=0.05,
+    )
+    return notifier, registry, session_manager, tokens
+
+
+@pytest.mark.asyncio
+async def test_notify_role_changed_reaches_service_token_sessions(
+    tmp_path: Path,
+) -> None:
+    """A service token holds its role by name, with no users entry. A
+    change to that role must still tell the token's open sessions to
+    re-list their tools."""
+    notifier, registry, sm, tokens = make_notifier_with_tokens(tmp_path)
+    await tokens.mint(
+        org_id=DEFAULT_ORG_ID, label="viewer-bot", role_name="viewer",
+        created_by="admin@test.com",
+    )
+    await tokens.mint(
+        org_id=DEFAULT_ORG_ID, label="admin-bot", role_name="admin",
+        created_by="admin@test.com",
+    )
+    transports = {sid: make_mock_transport() for sid in ("s1", "s2", "s3")}
+    sm._server_instances.update(transports)
+    registry.register("s1", DEFAULT_ORG_ID, "alice@test.com")
+    registry.register("s2", DEFAULT_ORG_ID, service_identity("viewer-bot"))
+    registry.register("s3", DEFAULT_ORG_ID, service_identity("admin-bot"))
+
+    notifier.notify_role_changed(DEFAULT_ORG_ID, "viewer")
+    await asyncio.sleep(0.2)
+
+    transports["s1"]._write_stream.send_nowait.assert_called_once()
+    transports["s2"]._write_stream.send_nowait.assert_called_once()
+    transports["s3"]._write_stream.send_nowait.assert_not_called()

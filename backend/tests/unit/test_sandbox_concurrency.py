@@ -2,8 +2,8 @@
 
 These pin the race-safety of ``E2BSandboxService``'s process-local
 bookkeeping (``_live_sandboxes`` / ``_session_owners`` /
-``_preserve_on_close``) and the boot reconciler against an in-flight
-``session()`` create.
+``_preserve_on_close``) and the cleanup of an in-flight ``session()``
+create that a cancel interrupts.
 
 Determinism is paramount: NO real sleeps for synchronisation. Where a
 test needs two coroutines to interleave at a precise point, it injects
@@ -18,13 +18,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 
+import anyio
 import pytest
 
 from mcpolis.adapters.repositories.inmemory_sandbox_persistence_repository import (
     InMemorySandboxPersistenceRepository,
 )
-from mcpolis.adapters.sandbox_e2b import E2BSandboxReconciler, E2BSandboxService
-from mcpolis.adapters.sandbox_e2b.client import E2BSandboxHandle
+from mcpolis.adapters.sandbox_e2b import E2BSandboxService
+from mcpolis.adapters.sandbox_e2b.client import E2BSandboxHandle, E2BSDKError
 from tests.unit.factories import make_upstream_definition
 from tests.unit.sandbox_e2b_mock import MockE2BClient, make_mock_e2b_client
 from tests.unit.test_e2b_sandbox_service import (
@@ -226,7 +227,14 @@ async def test_parallel_preserve_teardown_keeps_all_refs() -> None:
     assert service._preserve_on_close == {}  # type: ignore[reportPrivateUsage]
 
 
-# ---------- SBX-CONC-4 [BUG?]: reconciler racing an in-flight create ----------
+# ---------- SBX-CONC-4: a create in flight ----------
+#
+# The reconcile used to spare the sandbox of a create in flight, through
+# a "creating" record written before each create. The reconcile runs
+# only at boot, before any create, so that record only ever protected
+# the sandbox of a start a crash had cut short (see
+# ``test_sandbox_lifecycle_across_boots.py``). What a create in flight
+# still owes is its own cleanup when it fails, which no cancel may cut.
 
 
 def make_choked_create(
@@ -240,8 +248,7 @@ def make_choked_create(
     exists provider-side (and the reconciler's ``list_sandboxes`` can
     see it) the instant ``create`` is issued — but the service hasn't
     yet returned from ``create`` to run ``_persist_live_ref``. ``arrived``
-    fires once the sandbox is provider-visible so the test can run the
-    reconcile in exactly that gap.
+    fires once the sandbox is provider-visible.
     """
     real_create = mock.create_sandbox
 
@@ -258,117 +265,116 @@ def make_choked_create(
     return choked_create
 
 
+async def open_and_close(
+    service: E2BSandboxService, upstream_id: str,
+) -> None:
+    """Open a session of ``upstream_id`` for org ``acme``, close it."""
+    async with service.session(
+        session_id=f"session-{upstream_id}",
+        org_id="acme",
+        upstream=make_upstream_definition(id=upstream_id, command="npx"),
+        resources=make_default_resources(),
+        denylist=(),
+    ):
+        pass
+
+
 @pytest.mark.asyncio
-async def test_reconciler_does_not_kill_in_flight_create() -> None:
-    """INTENDED contract: a sandbox that ``session()`` has created but
-    not yet persisted a live ref for must NOT be killed by a reconcile
-    that races into that window.
-
-    Setup: choke ``create_sandbox`` so the sandbox is provider-visible
-    (in ``list_sandboxes``) but the service is suspended before
-    ``_persist_live_ref`` runs. Fire the reconcile in that gap. The
-    in-flight sandbox is tagged with our instance and is ``running`` and
-    is not yet in persistence — the reconciler's current heuristic
-    classifies that as an orphan and kills it. The intended behaviour is
-    to leave an actively-creating sandbox alone, so this is RED until
-    the create/persist/reconcile race is closed.
-    """
-    instance = "instance-A"
+async def test_a_failed_start_cancelled_during_its_kill_still_kills_the_sandbox() -> None:
+    """The MCP command fails to start in a fresh sandbox, and a cancel (a
+    Stop, a shutdown) lands while that sandbox is being killed. Nothing
+    else knows the sandbox, so the kill must go through anyway, and the
+    cancel must still end the start. (Review of the follow-up fixes,
+    F4: the kill used to be cut short and the sandbox left running.)"""
     persistence = InMemorySandboxPersistenceRepository()
-    mock = make_mock_e2b_client()
-    service = E2BSandboxService(
-        mock,
-        mcpolis_instance=instance,
-        on_timeout_seconds=60,
-        persistence=persistence,
-        volumes_enabled=False,
-        reuse_sandboxes_on_restart=True,
-    )
-    reconciler = E2BSandboxReconciler(
-        mock, persistence, mcpolis_instance=instance,
-    )
+    service, client = make_reuse_e2b_service(persistence=persistence)
+    client.run_command_raises = E2BSDKError("E2BSDKError", "failed to start")
+    client.kill_gate = asyncio.Event()
 
+    opening = asyncio.create_task(open_and_close(service, "ups-failed"))
+    await asyncio.wait_for(client.kill_started.wait(), timeout=5)
+    opening.cancel()  # lands while E2B is still answering the kill
+    client.kill_gate.set()
+    outcome = await asyncio.gather(opening, return_exceptions=True)
+
+    assert isinstance(outcome[0], asyncio.CancelledError), outcome
+    assert [k.sandbox_id for k in client.kills] == ["sbx-0"], (
+        "the cancel cut the kill of a sandbox nothing else knows about"
+    )
+    assert await persistence.get(org_id="acme", upstream_id="ups-failed") is None
+
+
+@pytest.mark.asyncio
+async def test_a_start_cancelled_by_an_anyio_scope_still_kills_its_sandbox() -> None:
+    """Same, with the cancel coming from an anyio cancel scope while the
+    MCP command is starting. Such a scope delivers its cancel again at
+    every await, so the cleanup must hold it off until the kill is done,
+    then let it end the start."""
+    persistence = InMemorySandboxPersistenceRepository()
+    service, client = make_reuse_e2b_service(persistence=persistence)
+    client.run_command_gate = asyncio.Event()  # the command never starts
+    client.kill_gate = asyncio.Event()
+    scopes: list[anyio.CancelScope] = []
+
+    async def open_in_scope() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await open_and_close(service, "ups-anyio")
+
+    opening = asyncio.create_task(open_in_scope())
+    await asyncio.wait_for(client.run_command_started.wait(), timeout=5)
+    scopes[0].cancel()
+    await asyncio.wait_for(client.kill_started.wait(), timeout=5)
+    client.kill_gate.set()
+    await asyncio.wait_for(opening, timeout=5)
+
+    assert scopes[0].cancelled_caught, "the scope's cancel must end the start"
+    assert [k.sandbox_id for k in client.kills] == ["sbx-0"], (
+        "the scope's repeated cancel cut the kill of a stranded sandbox"
+    )
+    assert await persistence.get(org_id="acme", upstream_id="ups-anyio") is None
+
+
+@pytest.mark.asyncio
+async def test_session_opened_after_the_shutdown_mark_is_not_killed() -> None:
+    """The shutdown cleanup marks live sessions, then closes runtimes org
+    by org. A connect still in flight (boot reattach, wake) can register
+    its sandbox after the mark; when ``stop_all`` cancels it, it must be
+    preserved like the others, not killed with its ref deleted (which the
+    old SIGKILL-on-deploy never did)."""
+    persistence = InMemorySandboxPersistenceRepository()
+    service, mock = make_reuse_e2b_service(persistence=persistence)
     gate = asyncio.Event()
     arrived = asyncio.Event()
     mock.create_sandbox = make_choked_create(  # type: ignore[method-assign]
         mock, gate=gate, arrived=arrived,
     )
+    opened = asyncio.Event()
+    upstream = make_upstream_definition(id="ups-late", command="npx")
 
-    upstream = make_upstream_definition(id="ups-inflight", command="npx")
-
-    async def open_session() -> None:
+    async def connect_in_flight() -> None:
         async with service.session(
-            session_id="inflight",
+            session_id="late",
             org_id="acme",
             upstream=upstream,
             resources=make_default_resources(),
             denylist=(),
         ):
-            # Preserve so the (eventual) clean exit doesn't itself kill
-            # the sandbox — we're isolating the reconciler's behaviour.
-            service.mark_session_preserve_on_close("inflight")
+            opened.set()
+            await asyncio.Event().wait()  # held until stop_all cancels it
 
-    session_task = asyncio.create_task(open_session())
-    # Wait until the sandbox is provider-visible but the service is
-    # still suspended inside the choked create (pre-persist).
+    flight = asyncio.create_task(connect_in_flight())
     await arrived.wait()
 
-    # Race the reconcile into the in-flight window.
-    report = await reconciler.reconcile()
+    # The shutdown mark sees nothing live yet.
+    assert service.mark_all_active_sessions_preserve_on_close() == 0
 
-    # Release the create so the session can finish cleanly.
+    # The connect lands during the runtime shutdown, then is cancelled.
     gate.set()
-    await session_task
+    await opened.wait()
+    flight.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await flight
 
-    # INTENDED: the in-flight sandbox is left alone.
-    assert report.killed_orphan_sandboxes == 0, (
-        "reconciler killed an in-flight (creating, not-yet-persisted) "
-        f"sandbox; kills={mock.kills}"
-    )
-    assert mock.kills == []
-
-
-@pytest.mark.asyncio
-async def test_a_failed_create_whose_kill_is_cut_short_still_clears_its_marker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The MCP command fails to start in a freshly created sandbox, and a
-    shutdown cancels the cleanup while it kills that sandbox. The
-    "creating" marker must still be cleared: left behind, it hides the
-    sandbox from the boot reconcile. (Review of the follow-up fixes, F4.)"""
-    from tests.unit.sandbox_e2b_mock import MockE2BSandboxHandle
-    from mcpolis.adapters.sandbox_e2b import E2BSDKError
-
-    persistence = InMemorySandboxPersistenceRepository()
-    service, _ = make_reuse_e2b_service(persistence=persistence)
-    upstream = make_upstream_definition(id="ups-failed", command="npx")
-    killing = asyncio.Event()
-
-    async def refuse_to_start(_self: object, *_a: object, **_k: object) -> object:
-        raise E2BSDKError("E2BSDKError", "command failed to start")
-
-    async def slow_kill(_self: object) -> None:
-        killing.set()
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(MockE2BSandboxHandle, "run_command", refuse_to_start)
-    monkeypatch.setattr(MockE2BSandboxHandle, "kill", slow_kill)
-
-    async def open_session() -> None:
-        async with service.session(
-            session_id="failed",
-            org_id="acme",
-            upstream=upstream,
-            resources=make_default_resources(),
-            denylist=(),
-        ):
-            pass
-
-    opening = asyncio.create_task(open_session())
-    await asyncio.wait_for(killing.wait(), timeout=5)
-    opening.cancel()  # the shutdown cuts the kill short
-    await asyncio.gather(opening, return_exceptions=True)
-
-    assert await persistence.get(org_id="acme", upstream_id="ups-failed") is None, (
-        "a failed create left its creating marker behind"
-    )
+    assert mock.kills == [], f"a sandbox opened during shutdown was killed: {mock.kills}"
+    assert await persistence.get(org_id="acme", upstream_id="ups-late") is not None

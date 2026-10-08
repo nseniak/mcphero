@@ -24,9 +24,9 @@ export default defineConfig({
   // the connection. These are infra blips, not behavior failures, so a
   // retry reclassifies them as "flaky" in the report instead of failing the
   // whole gate. A genuinely broken spec still fails every try. Defaults to
-  // 1; ``make test-all`` raises it (E2E_RETRIES=2) so a *double* blip —
-  // both attempts starved at once, the lone hard-fail mode seen under the
-  // heaviest cross-suite load — still recovers.
+  // 1; ``make test-all`` raises it (E2E_RETRIES=3) so a *triple* blip —
+  // every attempt but the last starved at once, the lone hard-fail mode
+  // seen under the heaviest cross-suite load — still recovers.
   retries,
   // ``oauth_test_mcp_server.py`` keeps token / TTL / queued-email
   // state in module globals; specs reset that state in ``beforeEach``

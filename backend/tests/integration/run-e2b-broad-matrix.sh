@@ -33,9 +33,11 @@
 #   (default 4) with ``--dist loadfile`` so each split file lands on a
 #   distinct worker.
 #
-# Outputs:
-#   /tmp/mcpolis-e2b-broad-matrix-junit.xml
-#   /tmp/mcpolis-e2b-broad-matrix-report.json
+# Outputs, in this run's own folder (tests/run_folder.py), printed at the
+# start and the end; /tmp/mcpolis-test-runs/latest-e2b-broad-matrix points
+# at the newest:
+#   e2b-broad-matrix-junit.xml
+#   e2b-broad-matrix-report.json
 #
 # Secrets (the E2B API key) load from .env.test via
 # tests/integration/conftest.py, identical to run-integration-tests.sh.
@@ -77,11 +79,20 @@ done
 
 # shellcheck disable=SC1091
 source "${BACKEND_ROOT}/../run-in-env.sh"
+# This run's own results folder, so a concurrent run can't overwrite its
+# reports. Resolved before the cd, so a relative MCPOLIS_TEST_OUT_DIR means
+# the caller's directory.
+RUN_DIR="$(python "${BACKEND_ROOT}/../tests/run_folder.py" e2b-broad-matrix)"
+# Exported so pytest prints it again at the very end
+# (backend/tests/conftest.py): this script ``exec``s pytest, so that
+# signals sent to the runner reach pytest itself.
+export MCPOLIS_TEST_OUT_DIR="$RUN_DIR"
 cd "${BACKEND_ROOT}"
 
-JUNIT_OUT="/tmp/mcpolis-e2b-broad-matrix-junit.xml"
-JSON_OUT="/tmp/mcpolis-e2b-broad-matrix-report.json"
+JUNIT_OUT="$RUN_DIR/e2b-broad-matrix-junit.xml"
+JSON_OUT="$RUN_DIR/e2b-broad-matrix-report.json"
 rm -f "$JUNIT_OUT" "$JSON_OUT"
+echo "Results folder: $RUN_DIR"
 
 PARALLEL_ARGS=()
 if [ "$JOBS" != "1" ]; then

@@ -34,6 +34,7 @@ import sentry_sdk
 import structlog
 from structlog.contextvars import get_contextvars
 from sentry_sdk.integrations.logging import ignore_logger
+from sentry_sdk.transport import Transport
 from sentry_sdk.types import Event, Hint
 
 from mcpolis.domain.ports import DEFAULT_ORG_ID, MULTI_ORG_SENTINEL
@@ -165,8 +166,15 @@ def _make_traces_sampler(
     return _traces_sampler
 
 
-def init_sentry(settings: Settings) -> bool:
-    """Initialize Sentry if a DSN is configured. Returns True if enabled."""
+def init_sentry(settings: Settings, transport: Transport | None = None) -> bool:
+    """Initialize Sentry if a DSN is configured. Returns True if enabled.
+
+    Events carry no frame locals and no request bodies: a password
+    Variable is write-only, yet a failing save or connect holds its
+    value in a local (and a request body may hold one typed in), and
+    Sentry's own scrubber only drops a few well-known key names.
+    ``transport`` replaces the network transport (tests).
+    """
     # Before the DSN check: harmless when Sentry is off, and it keeps the
     # rule in force however Sentry ends up enabled.
     for name in _NO_SENTRY_LOGGERS:
@@ -181,6 +189,9 @@ def init_sentry(settings: Settings) -> bool:
             settings.sentry_traces_sample_rate, _UNTRACED_PATHS
         ),
         send_default_pii=False,
+        include_local_variables=False,
+        max_request_body_size="never",
+        transport=transport,
         before_send=_make_before_send(_org_sentinels(settings.mode)),
     )
     logger.info(

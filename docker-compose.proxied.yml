@@ -31,6 +31,16 @@ services:
       - default
       - web
 
+  # Two proxies now append to X-Forwarded-For: the external one, then
+  # the bundled nginx. The backend takes the client IP (for per-IP
+  # sign-in rate limits) from the entry the external proxy wrote, and
+  # ignores anything further left, which the client could have forged.
+  # Override in the env file if your chain has more proxies (a CDN in
+  # front of the external proxy, for example).
+  backend:
+    environment:
+      MCPOLIS_TRUSTED_PROXY_HOPS: ${MCPOLIS_TRUSTED_PROXY_HOPS:-2}
+
   # Cloud-only: turn on Mongo authentication. The base compose runs a
   # plain `mongod` (no auth) for dev/native/test; we enable --auth only
   # here so dev and the --noauth mongo-test service stay password-free.

@@ -19,6 +19,7 @@ from mcpolis.adapters.repositories.file_oauth_state_repository import (
 )
 from mcpolis.domain.model.settings import SettingsConfig
 from mcpolis.domain.ports.oauth_state_repository import (
+    OAuthStateChanges,
     StoredAccessToken,
     StoredRefreshToken,
 )
@@ -100,45 +101,67 @@ async def test_tokens_survive_restart(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_expired_access_tokens_not_loaded(tmp_path: Path) -> None:
-    provider = await make_provider(tmp_path)
-    await provider._ensure_loaded()
-    provider._access_tokens["old"] = StoredAccessToken(
-        token="old",
-        client_id="test-client",
-        user_email="alice@test.com",
-        scopes=[],
-        expires_at=int(time.time()) - 100,
-    )
-    await provider._save_state()  # pyright: ignore[reportPrivateUsage]
+    await FileOAuthStateRepository(tmp_path).apply(OAuthStateChanges(
+        access_tokens={"old": StoredAccessToken(
+            token="old",
+            client_id="test-client",
+            user_email="alice@test.com",
+            scopes=[],
+            expires_at=int(time.time()) - 100,
+        )},
+    ))
 
-    # "Restart" — expired token should not be loaded
+    # "Restart" — the expired token is not loaded, and is deleted.
     provider2 = await make_provider(tmp_path)
     assert await provider2.load_access_token("old") is None
+    await provider2.flush()
+    stored = await FileOAuthStateRepository(tmp_path).load()
+    assert "old" not in stored.access_tokens
 
 
 @pytest.mark.asyncio
-async def test_expired_refresh_tokens_not_loaded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        "mcpolis.adapters.repositories.file_oauth_state_repository.REFRESH_TOKEN_TTL",
-        86400 * 30,
-    )
-    provider = await make_provider(tmp_path)
-    await provider._ensure_loaded()
-    provider._refresh_tokens["old"] = StoredRefreshToken(
-        token="old",
-        client_id="test-client",
-        user_email="alice@test.com",
-        scopes=[],
-        created_at=time.time() - (86400 * 31),  # 31 days ago
-    )
-    await provider._save_state()  # pyright: ignore[reportPrivateUsage]
+async def test_expired_refresh_tokens_not_loaded(tmp_path: Path) -> None:
+    await FileOAuthStateRepository(tmp_path).apply(OAuthStateChanges(
+        refresh_tokens={"old": StoredRefreshToken(
+            token="old",
+            client_id="test-client",
+            user_email="alice@test.com",
+            scopes=[],
+            created_at=time.time() - (86400 * 31),  # 31 days ago
+        )},
+    ))
 
-    # "Restart" — expired refresh token should not be loaded
+    # "Restart" — the expired refresh token is not loaded, and is deleted.
     provider2 = await make_provider(tmp_path)
     await provider2._ensure_loaded()
     assert "old" not in provider2._refresh_tokens
+    await provider2.flush()
+    stored = await FileOAuthStateRepository(tmp_path).load()
+    assert "old" not in stored.refresh_tokens
+
+
+@pytest.mark.asyncio
+async def test_client_approvals_survive_restart(tmp_path: Path) -> None:
+    """A remembered consent must persist, so a real client that was
+    approved before a backend restart is not re-prompted afterward."""
+    provider = await make_provider(tmp_path)
+    await provider.record_client_approval(
+        "alice@test.com", "test-client", "https://app.example.com/cb"
+    )
+
+    # "Restart" — the approval should still be remembered.
+    provider2 = await make_provider(tmp_path)
+    assert await provider2.is_client_approved(
+        "alice@test.com", "test-client", "https://app.example.com/cb"
+    )
+    # And it stays scoped — a different user is not approved.
+    assert not await provider2.is_client_approved(
+        "bob@test.com", "test-client", "https://app.example.com/cb"
+    )
+    # ...nor a different host for the same user+client.
+    assert not await provider2.is_client_approved(
+        "alice@test.com", "test-client", "https://evil.example/cb"
+    )
 
 
 @pytest.mark.asyncio

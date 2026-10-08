@@ -9,6 +9,7 @@ from typing import Any
 
 import structlog
 
+from mcpolis.adapters.repositories.atomic_file import write_text_atomic
 from mcpolis.adapters.repositories.connection_store import (
     ConnectionStore,
     OAuthToken,
@@ -22,11 +23,13 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 def _serialize_token(
     token: OAuthToken, authorized_by: str = "", *,
     revision: str | None = None, sign_in: str | None = None,
+    signed_in_at: str | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(UTC)
     return {
         "revision": revision,
         "sign_in": sign_in,
+        "signed_in_at": signed_in_at,
         "access_token": token.access_token,
         "refresh_token": token.refresh_token,
         "expires_at": token.expires_at.isoformat() if token.expires_at else None,
@@ -53,6 +56,9 @@ def _deserialize_token(data: dict[str, Any]) -> OAuthToken:
     updated_at = None
     if data.get("updated_at"):
         updated_at = datetime.fromisoformat(data["updated_at"])
+    signed_in_at = None
+    if data.get("signed_in_at"):
+        signed_in_at = datetime.fromisoformat(data["signed_in_at"])
     return OAuthToken(
         access_token=data["access_token"],
         refresh_token=data.get("refresh_token"),
@@ -62,6 +68,7 @@ def _deserialize_token(data: dict[str, Any]) -> OAuthToken:
         updated_at=updated_at,
         revision=data.get("revision"),
         sign_in=data.get("sign_in"),
+        signed_in_at=signed_in_at,
     )
 
 
@@ -102,8 +109,10 @@ class FileConnectionStore(ConnectionStore):
             return {}
 
     def _write(self, data: dict[str, Any]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(data, indent=2))
+        # In one step: an in-place write cut short leaves half a JSON
+        # file, ``_read`` turns that into ``{}``, and the next save
+        # erases every stored sign-in.
+        write_text_atomic(self._path, json.dumps(data, indent=2))
 
     @staticmethod
     def _admin_key(upstream_id: str) -> str:
@@ -145,6 +154,7 @@ class FileConnectionStore(ConnectionStore):
             data = self._read()
             data[self._user_key(user_id, upstream_id)] = _serialize_token(
                 token, revision=saved.revision, sign_in=saved.sign_in,
+                signed_in_at=datetime.now(UTC).isoformat(),
             )
             self._write(data)
         return saved
@@ -160,8 +170,14 @@ class FileConnectionStore(ConnectionStore):
             entry = data.get(key)
             if entry is None or entry.get("sign_in") != expected_sign_in:
                 return None
+            # The sign-in's time, kept; a row saved before
+            # ``signed_in_at`` existed gets its last save's time, once.
+            sign_in_time = _deserialize_token(entry).sign_in_time
             data[key] = _serialize_token(
                 token, revision=revision, sign_in=expected_sign_in,
+                signed_in_at=(
+                    sign_in_time.isoformat() if sign_in_time is not None else None
+                ),
             )
             self._write(data)
         return revision

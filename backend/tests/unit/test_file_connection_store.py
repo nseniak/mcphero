@@ -161,3 +161,30 @@ async def test_persistence_across_instances(tmp_path: Path) -> None:
 
     assert result is not None
     assert result.access_token == "access-123"
+
+
+@pytest.mark.asyncio
+async def test_save_cut_short_keeps_the_previous_sign_ins(
+    tmp_path: Path,
+) -> None:
+    """A save that fails part way must leave the old file whole. Before
+    the temp-file-and-rename write, the file was overwritten in place:
+    half a JSON file read back as ``{}`` and the next save erased every
+    stored sign-in. Here the temp file can't be written (a folder sits
+    at its name), so the save fails before it reaches the real file."""
+    store = FileConnectionStore(tmp_path)
+    await store.put_admin_token(
+        DEFAULT_ORG_ID, "github", make_oauth_token(), authorized_by="a@co.com",
+    )
+    (saved,) = [p for p in tmp_path.rglob("*.json")]
+    saved.with_name(f"{saved.name}.tmp").mkdir()
+
+    with pytest.raises(OSError):
+        await store.put_admin_token(
+            DEFAULT_ORG_ID, "linear", make_oauth_token("access-789"),
+            authorized_by="a@co.com",
+        )
+
+    kept = await store.get_admin_token(DEFAULT_ORG_ID, "github")
+    assert kept is not None
+    assert kept.access_token == "access-123"

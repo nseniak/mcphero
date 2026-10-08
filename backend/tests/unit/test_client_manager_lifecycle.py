@@ -140,10 +140,9 @@ async def test_disconnect_upstream_closes_shared_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_disconnect_upstream_preserves_other_users_sessions() -> None:
-    """Admin disconnect must not touch per-user OAuth sessions for
-    other users — they hold independent tokens and their sessions are
-    the entire contract behind ``per_user_oauth``."""
+async def test_disconnect_upstream_closes_every_users_session() -> None:
+    """Admin Stop closes each user's session on the upstream, not only
+    the shared one: otherwise members keep calling a stopped server."""
     mgr = _make_manager()
     _seed_shared(mgr, "notion")
     alice_task = _seed_user(mgr, "notion", "alice@example.com")
@@ -151,10 +150,49 @@ async def test_disconnect_upstream_preserves_other_users_sessions() -> None:
 
     await mgr.disconnect_upstream("notion")
 
-    assert mgr.has_user_session("notion", "alice@example.com") is True
-    assert mgr.has_user_session("notion", "bob@example.com") is True
-    alice_task.close.assert_not_awaited()
-    bob_task.close.assert_not_awaited()
+    assert mgr.has_user_session("notion", "alice@example.com") is False
+    assert mgr.has_user_session("notion", "bob@example.com") is False
+    alice_task.close.assert_awaited_once()
+    bob_task.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_every_stop_closes_every_users_session() -> None:
+    """Every way an upstream becomes stopped closes users' sessions, not
+    only the admin's Stop. After a restart, a member's call can open a
+    session before startup re-applies the saved Stop; that session must
+    close when it does."""
+    mgr = _make_manager()
+    bob_task = _seed_user(mgr, "notion", "bob@example.com")
+
+    await mgr.transition_to_disabled("notion", reason="boot_skip_disabled")
+
+    assert mgr.has_user_session("notion", "bob@example.com") is False
+    bob_task.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_closes_users_sessions_in_parallel() -> None:
+    """Closing a session can take up to its close timeout. One by one,
+    a Stop with many members would outlast the request."""
+    mgr = _make_manager()
+
+    async def slow_close() -> None:
+        await asyncio.sleep(0.3)
+
+    tasks = [
+        _seed_user(mgr, "notion", f"user{i}@example.com") for i in range(5)
+    ]
+    for task in tasks:
+        task.close = AsyncMock(side_effect=slow_close)
+
+    started = asyncio.get_running_loop().time()
+    await mgr.disconnect_upstream("notion")
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 1.0, f"5 closes of 0.3 s took {elapsed:.2f} s: not parallel"
+    for task in tasks:
+        task.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
