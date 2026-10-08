@@ -28,6 +28,12 @@ Run with::
     MCPOLIS_PERSISTED_SANDBOX_IDS=sbx-a,sbx-b \
         bash backend/tests/integration/run-list-orphan-sandboxes.sh --delete-orphans
     bash backend/tests/integration/run-list-orphan-sandboxes.sh --json
+    bash backend/tests/integration/run-list-orphan-sandboxes.sh --run-id <id>
+
+``--run-id`` shows only the sandboxes one integration test run created
+(the id each run prints with its cleanup line), with the same rule the
+run's own cleanup uses (``_run_sandboxes.is_run_sandbox``): an empty
+list means the run left nothing behind.
 
 Reads ``MCPOLIS_E2B_API_KEY`` from env (the wrapper script falls
 back to the gitignored ``backend/.env``). For the persistence
@@ -51,12 +57,16 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.normpath(os.path.join(_HERE, "..", "src"))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+_BACKEND = os.path.normpath(os.path.join(_HERE, "..", ".."))
+if _BACKEND not in sys.path:
+    sys.path.insert(0, _BACKEND)
 
 from mcpolis.adapters.sandbox_e2b import RealE2BClient  # noqa: E402
 from mcpolis.adapters.sandbox_e2b.client import (  # noqa: E402
     E2BNotFoundError,
     E2BSDKError,
 )
+from tests.integration._run_sandboxes import is_run_sandbox  # noqa: E402
 
 API_KEY = os.environ.get("MCPOLIS_E2B_API_KEY") or os.environ.get("E2B_API_KEY")
 
@@ -68,6 +78,7 @@ class _Categorised:
     mcpolis_instance: str | None
     upstream_id: str | None
     org_id: str | None
+    test_run_id: str | None
     created_at: datetime
     age_hours: float
     category: str  # recognized | mine_orphan | foreign_instance | untagged
@@ -114,6 +125,7 @@ def _classify(
     tag = metadata.get("mcpolis_instance") or None
     upstream_id = metadata.get("mcpolis_upstream") or None
     org_id = metadata.get("mcpolis_org") or None
+    test_run_id = metadata.get("test_run_id") or None
     created_at: datetime = getattr(sandbox, "created_at", None) or datetime(
         1970, 1, 1, tzinfo=timezone.utc,
     )
@@ -148,6 +160,7 @@ def _classify(
         mcpolis_instance=tag,
         upstream_id=upstream_id,
         org_id=org_id,
+        test_run_id=test_run_id,
         created_at=created_at,
         age_hours=age_hours,
         category=category,
@@ -187,6 +200,7 @@ def _print_json(rows: list[_Categorised]) -> None:
             "mcpolis_instance": r.mcpolis_instance,
             "org_id": r.org_id,
             "upstream_id": r.upstream_id,
+            "test_run_id": r.test_run_id,
             "created_at": r.created_at.isoformat(),
         }
         for r in rows
@@ -276,9 +290,25 @@ async def main(argv: list[str] | None = None) -> int:
             "Requires MCPOLIS_PERSISTED_SANDBOX_IDS; refuses without it."
         ),
     )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help=(
+            "Show only the sandboxes this integration test run created "
+            "(read-only; cannot be combined with --delete-orphans)."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="JSON output.")
     args = parser.parse_args(argv)
     persisted_ids = _load_persisted_sandbox_ids()
+
+    if args.delete_orphans and args.run_id:
+        print(
+            "ERROR: --run-id is read-only; a run deletes its own "
+            "sandboxes when it ends.",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.delete_orphans:
         refusal = _delete_refusal(persisted_ids)
@@ -301,6 +331,8 @@ async def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: list_sandboxes failed: {exc}", file=sys.stderr)
         return 1
 
+    if args.run_id is not None:
+        sandboxes = [s for s in sandboxes if is_run_sandbox(s.metadata, args.run_id)]
     rows = [
         _classify(s, persisted_ids, args.mcpolis_instance, args.age_min_hours)
         for s in sandboxes

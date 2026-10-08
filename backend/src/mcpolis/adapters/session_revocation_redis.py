@@ -6,6 +6,7 @@ across every backend process hitting the same Redis instance.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 from urllib.parse import urlparse
 
@@ -15,6 +16,10 @@ import structlog
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 _KEY_PREFIX = "mcpolis:session-revoked"
+
+# A Redis that never answers must cost a bounded delay, not hang every
+# dashboard request (is_revoked) or a sign-out / org switch (revoke).
+_REDIS_TIMEOUT_SECONDS = 0.5
 
 
 def _client_from_url(url: str) -> coredis.Redis[str]:
@@ -43,9 +48,10 @@ class RedisSessionRevocationStore:
             return
         key = f"{_KEY_PREFIX}:{jti}"
         try:
-            await self._client.set(
-                key, "1", ex=max(1, math.ceil(ttl_seconds)),
-            )
+            async with asyncio.timeout(_REDIS_TIMEOUT_SECONDS):
+                await self._client.set(
+                    key, "1", ex=max(1, math.ceil(ttl_seconds)),
+                )
         except Exception:
             # Swallow revoke errors: the cookie is still signed + time-
             # bounded, and the user sees the client-side cookie deletion
@@ -59,7 +65,8 @@ class RedisSessionRevocationStore:
     async def is_revoked(self, jti: str) -> bool:
         key = f"{_KEY_PREFIX}:{jti}"
         try:
-            return (await self._client.exists([key])) > 0
+            async with asyncio.timeout(_REDIS_TIMEOUT_SECONDS):
+                return (await self._client.exists([key])) > 0
         except Exception:
             # Fail-open on the verify path — a Redis blip must never
             # log every user out. HMAC + exp remain in force.

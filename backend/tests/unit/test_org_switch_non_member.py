@@ -17,7 +17,7 @@ dashboard's "who is signed in" check.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import httpx
@@ -38,6 +38,9 @@ from mcpolis.adapters.repositories.mongo_organization_repository import (
 from mcpolis.adapters.repositories.mongo_upstream_config_repository import (
     MongoUpstreamConfigRepository,
 )
+from mcpolis.adapters.session_revocation_inprocess import (
+    InProcessSessionRevocationStore,
+)
 from mcpolis.domain.model.settings import UserDefinition
 from mcpolis.domain.services.org_service import OrgService
 from mcpolis.entrypoints.config import Settings
@@ -45,6 +48,7 @@ from mcpolis.entrypoints.routes.dashboard_auth import (
     COOKIE_NAME,
     build_session_cookie,
     get_session_payload,
+    is_session_revoked,
 )
 from mcpolis.entrypoints.routes.org_routes import create_org_router
 from tests.unit.mongo_fixture import mongo_available, temp_mongo_database
@@ -75,6 +79,7 @@ class OrgWorld:
     settings: Settings
     org_service: OrgService
     upstream_store: MongoUpstreamConfigRepository
+    session_revocation: InProcessSessionRevocationStore
 
 
 def make_settings() -> Settings:
@@ -115,18 +120,26 @@ async def make_org_world(db: MotorDatabase) -> OrgWorld:
             make_org_scoped_collection(db, COLL_UPSTREAMS),
             make_org_scoped_collection(db, COLL_CONFIG),
         ),
+        session_revocation=InProcessSessionRevocationStore(),
     )
 
 
-def make_signed_in_user_dependency(settings: Settings) -> Callable[..., str]:
+def make_signed_in_user_dependency(
+    settings: Settings, session_revocation: InProcessSessionRevocationStore,
+) -> Callable[..., Awaitable[str]]:
     """Stand-in for the dashboard's "who is signed in" dependency: the
-    email from a valid session cookie, else 401."""
+    email from a valid session cookie that is not deny-listed, else
+    401."""
 
-    def get_current_user(
+    async def get_current_user(
         mcpolis_session: str | None = Cookie(default=None),
     ) -> str:
         payload = get_session_payload(settings, mcpolis_session)
         email = payload.get("email") if payload is not None else None
+        if payload is not None and await is_session_revoked(
+            session_revocation, payload,
+        ):
+            raise HTTPException(status_code=401, detail="Session revoked")
         if not isinstance(email, str):
             raise HTTPException(status_code=401, detail="Not authenticated")
         return email
@@ -140,8 +153,11 @@ def make_app(world: OrgWorld) -> FastAPI:
         create_org_router(
             world.settings,
             world.org_service,
-            make_signed_in_user_dependency(world.settings),
+            make_signed_in_user_dependency(
+                world.settings, world.session_revocation,
+            ),
             upstream_config_store=world.upstream_store,
+            session_revocation=world.session_revocation,
         ),
     )
     return app

@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import uuid
 
 import pytest
 
@@ -36,10 +35,11 @@ from mcpolis.adapters.sandbox_e2b import (
     E2BSDKError,
     RealE2BClient,
 )
+from tests.integration._run_sandboxes import current_run_id
 
 
 E2B_API_KEY: str | None = os.environ.get("E2B_API_KEY") or None
-TEST_RUN_ID: str = uuid.uuid4().hex[:12]
+TEST_RUN_ID: str = current_run_id()
 
 
 pytestmark = pytest.mark.skipif(

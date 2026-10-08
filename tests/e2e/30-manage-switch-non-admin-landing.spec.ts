@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { BACKEND_URL, acceptInvitation, createOrg, loginAs } from "./helpers";
+import { BACKEND_URL, acceptInvitation, createOrg, loginAs, switchOrgAndSyncCookie } from "./helpers";
 
 /**
  * Sibling of 29-org-switcher-non-admin-landing.spec.ts. Same bug,
@@ -38,8 +38,7 @@ test("Manage-page Switch must not land a non-admin user on /admin/upstream", asy
     data: { slug: ORG2, display_name: "Org Two", created_via: "manage_page" },
   });
   expect([200, 201]).toContain(resp.status());
-  resp = await pageReq.post(`${BACKEND_URL}/api/orgs/${ORG2}/switch`);
-  expect(resp.status()).toBe(204);
+  await switchOrgAndSyncCookie(page, ORG2);
 
   // Open the manage page (cookie still on org2; user is admin here).
   await page.goto("/orgs/manage");

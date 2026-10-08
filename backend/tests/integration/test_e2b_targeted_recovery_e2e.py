@@ -42,7 +42,6 @@ import tempfile
 from pathlib import Path
 import os
 import time
-import uuid
 from datetime import UTC, datetime
 from io import StringIO
 from typing import cast
@@ -86,6 +85,7 @@ from tests.integration._e2b_log_capture import (
     events_since,
     stream_death_events_since,
 )
+from tests.integration._run_sandboxes import current_run_id
 from tests.unit.factories import make_upstream_definition
 
 
@@ -94,7 +94,7 @@ from tests.unit.factories import make_upstream_definition
 # integration file, so a per-file configure can't clobber a sibling's
 # capture list (the bug that left M4 empty under ``--dist loadfile``).
 E2B_API_KEY: str | None = os.environ.get("E2B_API_KEY") or None
-TEST_RUN_ID: str = uuid.uuid4().hex[:12]
+TEST_RUN_ID: str = current_run_id()
 
 pytestmark = pytest.mark.skipif(
     E2B_API_KEY is None,

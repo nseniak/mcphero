@@ -335,3 +335,29 @@ export async function addUserToOrg(
     }
   }
 }
+
+/** Switch the session to ``slug`` and re-copy the rotated cookie.
+ *
+ * ``POST /api/orgs/{slug}/switch`` rotates the session cookie, on the
+ * backend's host, to carry the new org slug. When the frontend runs on
+ * another host, the copy ``loginAs`` put there predates the switch, and
+ * the SPA would read a session with no current org (DefaultRedirect
+ * then sends it to /signup), and since the switch deny-lists the old
+ * cookie, every API call would answer 401. With one shared host, as
+ * under the orchestrator, the page already sees the rotated cookie and
+ * this copy just rewrites it. */
+export async function switchOrgAndSyncCookie(
+  page: Page, slug: string,
+): Promise<void> {
+  const context = page.context();
+  const resp = await context.request.post(
+    `${BACKEND_URL}/api/orgs/${slug}/switch`);
+  if (resp.status() !== 204) {
+    throw new Error(`switch to ${slug} answered ${resp.status()}`);
+  }
+
+  const cookies = await context.cookies(BACKEND_URL);
+  const session = cookies.find((c) => c.name === "mcpolis_session");
+  if (!session) throw new Error("switch did not leave a session cookie");
+  await context.addCookies([{ ...session, domain: frontendHost(), path: "/" }]);
+}

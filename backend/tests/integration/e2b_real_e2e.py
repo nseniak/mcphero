@@ -89,7 +89,6 @@ import os
 import sys
 import time
 import traceback
-import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from io import StringIO
@@ -108,6 +107,10 @@ if _SRC not in sys.path:
 _TESTS = os.path.normpath(os.path.join(_HERE, "..", "tests"))
 if _TESTS not in sys.path:
     sys.path.insert(0, _TESTS)
+# ``backend/``, so ``tests.integration._run_sandboxes`` imports as a package.
+_BACKEND = os.path.normpath(os.path.join(_HERE, "..", ".."))
+if _BACKEND not in sys.path:
+    sys.path.insert(0, _BACKEND)
 
 from mcp.client.session import ClientSession  # noqa: E402
 from mcp.types import CallToolResult  # noqa: E402
@@ -143,13 +146,19 @@ from mcpolis.domain.services.sandbox_service import SandboxResources  # noqa: E4
 from mcpolis.domain.services.upstream_connection_service import (  # noqa: E402
     acquire_upstream_session,
 )
+from tests.integration._run_sandboxes import (  # noqa: E402
+    cleanup_run_sandboxes,
+    new_run_id,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 API_KEY = os.environ.get("MCPOLIS_E2B_API_KEY") or os.environ.get("E2B_API_KEY")
-RUN_ID = uuid.uuid4().hex[:8]
+# Every sandbox this run creates carries the id in its ``mcpolis_instance``
+# tag (``e2e-<RUN_ID>...``); the run kills exactly those when it ends.
+RUN_ID = new_run_id()
 # Idle-pause override. Short enough that the wake scenarios take
 # seconds, not the production-default 5 min. Anything below ~10s
 # risks the box snapshotting mid-init on a slow cold-pull.
@@ -3687,5 +3696,19 @@ async def main() -> int:
     return 0
 
 
+def _run() -> int:
+    """Run the scenarios, then kill every sandbox this run created,
+    whether the scenarios passed, failed, raised or were interrupted
+    (Ctrl-C). The E2B account is shared with production, so only
+    sandboxes tagged with this run's id are touched."""
+    try:
+        return asyncio.run(main())
+    finally:
+        print(flush=True)
+        cleanup_run_sandboxes(
+            API_KEY, RUN_ID, lambda line: print(line, flush=True),
+        )
+
+
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(_run())

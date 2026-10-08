@@ -117,6 +117,14 @@ Both modes serve the same ports:
   default. Same JUnit/JSON outputs (`integration-junit.xml`,
   `integration-report.json`) in its results folder.
 - Standalone integration scripts: `bash backend/tests/integration/run-e2b-real-e2e.sh` (~$0.05, ~5 min) and `bash backend/tests/integration/run-list-orphan-sandboxes.sh`
+- The paid tests share their E2B account with production. Every pytest
+  session and every `e2b_real_e2e.py` run kills the sandboxes it
+  created when it ends (passed, failed or Ctrl-C), and only those: the
+  ones whose `mcpolis_instance` is `e2e-…` with the run's id as one
+  part, or whose `test_run_id` is the run's id
+  ([backend/tests/integration/_run_sandboxes.py](backend/tests/integration/_run_sandboxes.py)).
+  The run prints `E2B cleanup for test run <id>: ...`;
+  `run-list-orphan-sandboxes.sh --run-id <id>` lists what it left.
 - E2E tests (Playwright, full-stack):
   `bash tests/run-e2e-tests.sh [--shards N] [spec...]`. The script
   is a thin wrapper around [tests/run-e2e-tests.py](tests/run-e2e-tests.py),

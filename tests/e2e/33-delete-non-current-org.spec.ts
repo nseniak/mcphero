@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { BACKEND_URL, createOrg, loginAs } from "./helpers";
+import { BACKEND_URL, createOrg, loginAs, switchOrgAndSyncCookie } from "./helpers";
 
 /**
  * Deleting a non-current admin-org from /orgs/manage must:
@@ -34,11 +34,7 @@ test("deleting a non-current admin org keeps the current org selected", async ({
   await loginAs(page, ADMIN);
   // The page's request context inherits no cookies from `request`,
   // so explicitly switch its cookie to ORG_MAIN as well.
-  const pageReq = page.context().request;
-  const pageSwitch = await pageReq.post(
-    `${BACKEND_URL}/api/orgs/${ORG_MAIN}/switch`,
-  );
-  expect(pageSwitch.status()).toBe(204);
+  await switchOrgAndSyncCookie(page, ORG_MAIN);
 
   await page.goto("/orgs/manage");
   await expect(
@@ -77,6 +73,7 @@ test("deleting a non-current admin org keeps the current org selected", async ({
   ).toBeVisible();
 
   // /api/auth/me confirms the cookie was not rotated.
+  const pageReq = page.context().request;
   const meResp = await pageReq.get(`${BACKEND_URL}/api/auth/me`);
   expect(meResp.status()).toBe(200);
   const me = (await meResp.json()) as {

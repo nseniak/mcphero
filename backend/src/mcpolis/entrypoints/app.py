@@ -2193,6 +2193,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             org_service,
             dashboard_auth.get_session_user,
             upstream_config_store=storage.upstream_config_repo,
+            session_revocation=storage.session_revocation,
             on_org_created=_on_org_created,
         ),
     )

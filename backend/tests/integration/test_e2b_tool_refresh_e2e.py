@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import uuid
 
 import pytest
 
@@ -48,10 +47,11 @@ from mcpolis.domain.services.tool_registry import ToolRegistry
 from mcpolis.domain.services.upstream_connection_service import (
     acquire_upstream_session,
 )
+from tests.integration._run_sandboxes import current_run_id
 from tests.unit.factories import make_upstream_definition
 
 E2B_API_KEY: str | None = os.environ.get("E2B_API_KEY") or None
-TEST_RUN_ID: str = uuid.uuid4().hex[:12]
+TEST_RUN_ID: str = current_run_id()
 
 pytestmark = pytest.mark.skipif(
     E2B_API_KEY is None,

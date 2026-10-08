@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { BACKEND_URL, acceptInvitation, createOrg, loginAs } from "./helpers";
+import { BACKEND_URL, acceptInvitation, createOrg, loginAs, switchOrgAndSyncCookie } from "./helpers";
 
 /**
  * Regression: a user who is admin in org A and a plain ``user`` in
@@ -62,8 +62,7 @@ test("OrgSwitcher must not land a non-admin user on /admin/upstream", async ({
   expect([200, 201]).toContain(resp.status());
 
   // Switch the cookie to org2 so the page loads with org2 as current.
-  resp = await pageReq.post(`${BACKEND_URL}/api/orgs/${ORG2}/switch`);
-  expect(resp.status()).toBe(204);
+  await switchOrgAndSyncCookie(page, ORG2);
 
   // Sanity-check: as admin of org2 the admin page renders.
   await page.goto(`/orgs/${ORG2}/admin/upstream`);

@@ -6,11 +6,12 @@ Google sign-in that sets an HttpOnly cookie for the dashboard SPA.
 """
 from __future__ import annotations
 
+import math
 import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeGuard
 from urllib.parse import urlencode
 
 import structlog
@@ -124,8 +125,14 @@ def _sign_cookie(payload: dict[str, Any], key: bytes) -> str:
 
 
 def _verify_cookie(cookie_value: str, key: bytes) -> dict[str, Any] | None:
-    """Verify and decode a signed cookie. Returns None if invalid."""
+    """Verify and decode a signed cookie. Returns None if invalid.
+
+    A session cookie without an end (``exp``) is refused: the token
+    format would accept it for ever, and the server never mints one.
+    """
     result: dict[str, Any] | None = verify_token(cookie_value, key)
+    if result is None or not _is_time(result.get("exp")):
+        return None
     return result
 
 
@@ -158,7 +165,13 @@ def get_session_payload(
 
 
 def build_session_cookie(
-    settings: Settings, email: str, org_slug: str,
+    settings: Settings,
+    email: str,
+    org_slug: str,
+    *,
+    signed_in_at: float | None = None,
+    expires_at: float | None = None,
+    sign_in_id: str | None = None,
 ) -> str:
     """Create a session cookie payload.
 
@@ -166,21 +179,146 @@ def build_session_cookie(
     not yet belong to any org — the frontend reads that as "redirect to
     signup". In standalone mode the slug is always ``default``.
 
-    Each cookie carries a unique ``jti`` so ``/logout`` can deny-list
-    exactly this session without affecting the user's other devices.
+    Each cookie carries a unique ``jti`` (this cookie) and a ``sid``
+    (the Google sign-in it belongs to, kept across org switches), so
+    ``/logout`` can end exactly this sign-in, with every cookie an org
+    switch made from it, without affecting the user's other devices.
+
+    ``signed_in_at`` / ``expires_at`` / ``sign_in_id`` default to a
+    fresh sign-in (now, now + ``SESSION_TTL``, a new id). Only a Google
+    sign-in may use the defaults:
+    a cookie re-issued from an existing session must pass that
+    session's own times (``build_switched_session_cookie``), or the
+    re-issue would extend the sign-in without Google.
     """
     key = get_signing_key(settings)
-    now = time.time()
+    iat = time.time() if signed_in_at is None else signed_in_at
+    exp = iat + SESSION_TTL if expires_at is None else expires_at
     return _sign_cookie(
         {
             "email": email,
             "org_slug": org_slug,
             "jti": secrets.token_urlsafe(16),
-            "iat": now,
-            "exp": now + SESSION_TTL,
+            "sid": sign_in_id or secrets.token_urlsafe(16),
+            "iat": iat,
+            "exp": exp,
         },
         key,
     )
+
+
+def build_switched_session_cookie(
+    settings: Settings, payload: dict[str, Any], org_slug: str,
+) -> str | None:
+    """The cookie for the same sign-in, pointing at ``org_slug``.
+
+    Keeps the sign-in id, the sign-in time and the end of the original
+    Google sign-in (never later than sign-in + ``SESSION_TTL``), so
+    switching org can't make a sign-in last longer and ``/logout`` of
+    any cookie of the sign-in ends them all. ``None`` when ``payload``
+    lacks a usable email, sign-in time, end or id.
+    """
+    email = payload.get("email")
+    iat = payload.get("iat")
+    exp = payload.get("exp")
+    sign_in_id = _sign_in_id(payload)
+    if (
+        not isinstance(email, str)
+        or not _is_time(iat)
+        or not _is_time(exp)
+        or sign_in_id is None
+    ):
+        return None
+    return build_session_cookie(
+        settings,
+        email=email,
+        org_slug=org_slug,
+        signed_in_at=iat,
+        expires_at=min(exp, iat + SESSION_TTL),
+        sign_in_id=sign_in_id,
+    )
+
+
+def _sign_in_id(payload: dict[str, Any]) -> str | None:
+    """The Google sign-in a cookie belongs to. A cookie minted before
+    ``sid`` existed is its own sign-in: its ``jti``."""
+    for field in ("sid", "jti"):
+        value = payload.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+# The deny-list holds cookie ids (``jti``) and sign-in ids under this
+# prefix, so the two kinds of id can never collide.
+_SIGN_IN_KEY_PREFIX = "sign-in:"
+
+
+def _deny_list_keys(
+    payload: dict[str, Any], *, whole_sign_in: bool,
+) -> list[str]:
+    keys: list[str] = []
+    jti = payload.get("jti")
+    if isinstance(jti, str) and jti:
+        keys.append(jti)
+    sign_in_id = _sign_in_id(payload)
+    if whole_sign_in and sign_in_id is not None:
+        keys.append(_SIGN_IN_KEY_PREFIX + sign_in_id)
+    return keys
+
+
+def _is_time(value: object) -> TypeGuard[float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def set_session_cookie(
+    response: Response, settings: Settings, cookie_value: str,
+) -> None:
+    """Hand ``cookie_value`` to the browser, kept until its own end."""
+    payload = get_session_payload(settings, cookie_value)
+    exp = payload.get("exp") if payload is not None else None
+    seconds_left = math.ceil(exp - time.time()) if _is_time(exp) else 0
+    response.set_cookie(
+        COOKIE_NAME,
+        cookie_value,
+        httponly=True,
+        samesite="lax",
+        max_age=max(0, seconds_left),
+        path="/",
+    )
+
+
+async def revoke_session(
+    session_revocation: SessionRevocationStore | None,
+    payload: dict[str, Any],
+    *,
+    whole_sign_in: bool,
+) -> None:
+    """Deny-list the cookie ``payload`` came from until its own end.
+
+    ``whole_sign_in`` also deny-lists its sign-in id, which ends every
+    cookie org switches made from the same Google sign-in.
+    """
+    if session_revocation is None:
+        return
+    exp = payload.get("exp")
+    if not _is_time(exp):
+        return
+    for key in _deny_list_keys(payload, whole_sign_in=whole_sign_in):
+        await session_revocation.revoke(key, exp - time.time())
+
+
+async def is_session_revoked(
+    session_revocation: SessionRevocationStore | None,
+    payload: dict[str, Any],
+) -> bool:
+    """Whether the cookie, or the sign-in it belongs to, was ended."""
+    if session_revocation is None:
+        return False
+    for key in _deny_list_keys(payload, whole_sign_in=True):
+        if await session_revocation.is_revoked(key):
+            return True
+    return False
 
 
 async def _maybe_auto_admin_default_org(
@@ -275,14 +413,12 @@ def create_dashboard_auth(
         if payload is None:
             raise HTTPException(status_code=401, detail="Not authenticated")
         # Revocation check: ``/logout`` (and future role-revocation
-        # events) deny-list cookies by jti. Fail-open on backend
+        # events) deny-list cookies by jti and sign-in id. Fail-open on backend
         # errors — the cookie is still signed + time-bounded.
-        if session_revocation is not None:
-            jti = payload.get("jti")
-            if isinstance(jti, str) and await session_revocation.is_revoked(jti):
-                raise HTTPException(
-                    status_code=401, detail="Session revoked",
-                )
+        if await is_session_revoked(session_revocation, payload):
+            raise HTTPException(
+                status_code=401, detail="Session revoked",
+            )
         email = payload.get("email")
         if not isinstance(email, str):
             raise HTTPException(status_code=401, detail="Not authenticated")
@@ -456,14 +592,7 @@ def create_dashboard_auth(
             url=f"/orgs/{invited_slug}/join" if invited_slug else "/",
             status_code=302,
         )
-        response.set_cookie(
-            COOKIE_NAME,
-            cookie_value,
-            httponly=True,
-            samesite="lax",
-            max_age=SESSION_TTL,
-            path="/",
-        )
+        set_session_cookie(response, settings, cookie_value)
         get_analytics().track_async(
             email,
             "user_logged_in",
@@ -626,18 +755,17 @@ def create_dashboard_auth(
     async def logout(
         mcpolis_session: str | None = Cookie(default=None),
     ) -> Response:
-        # Deny-list the cookie's jti so the still-signed-and-unexpired
-        # token can't be replayed (stolen laptop, shared machine, etc.).
+        # Deny-list the cookie's jti and sign-in id so no
+        # still-signed-and-unexpired cookie of this sign-in (including
+        # those org switches made from it) can be replayed (stolen
+        # laptop, shared machine, etc.).
         # Only the owner of the cookie can revoke it — the HMAC sig is
         # verified before we ever look at the jti.
-        if session_revocation is not None:
-            payload = get_session_payload(settings, mcpolis_session)
-            if payload is not None:
-                jti = payload.get("jti")
-                exp = payload.get("exp")
-                if isinstance(jti, str) and isinstance(exp, (int, float)):
-                    ttl = float(exp) - time.time()
-                    await session_revocation.revoke(jti, ttl)
+        payload = get_session_payload(settings, mcpolis_session)
+        if payload is not None:
+            await revoke_session(
+                session_revocation, payload, whole_sign_in=True,
+            )
         response = Response(status_code=204)
         response.delete_cookie(COOKIE_NAME, path="/")
         return response

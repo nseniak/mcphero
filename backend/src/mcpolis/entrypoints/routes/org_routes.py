@@ -21,7 +21,7 @@ Security:
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Literal
 
 import structlog
@@ -32,6 +32,7 @@ from mcpolis.adapters.observability.analytics_client import get_analytics
 from mcpolis.adapters.repositories.upstream_config_store import UpstreamConfigStore
 from mcpolis.domain.model.upstream import TransportType
 from mcpolis.domain.ports.organization_repository import Organization
+from mcpolis.domain.ports.session_revocation import SessionRevocationStore
 from mcpolis.domain.services.org_service import (
     OrgNotFoundError,
     OrgService,
@@ -47,10 +48,10 @@ from mcpolis.domain.services.org_service import (
 OrgCreatedHook = Callable[[Organization], None]
 from mcpolis.entrypoints.config import Settings
 from mcpolis.entrypoints.routes.dashboard_auth import (
-    COOKIE_NAME,
-    SESSION_TTL,
-    build_session_cookie,
+    build_switched_session_cookie,
     get_session_payload,
+    revoke_session,
+    set_session_cookie,
 )
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
@@ -82,8 +83,9 @@ class ListOrgsResponse(BaseModel):
 def create_org_router(
     settings: Settings,
     org_service: OrgService,
-    get_current_user: Callable[..., str],
+    get_current_user: Callable[..., str] | Callable[..., Awaitable[str]],
     upstream_config_store: UpstreamConfigStore,
+    session_revocation: SessionRevocationStore,
     on_org_created: OrgCreatedHook | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/orgs", tags=["orgs"])
@@ -213,27 +215,35 @@ def create_org_router(
     async def switch_org(
         slug: str,
         email: str = Depends(get_current_user),
+        mcpolis_session: str | None = Cookie(default=None),
     ) -> Response:
         """Rotate the session cookie to point at a different org.
 
         Refuses to switch if the caller is not a member of the target
         org. Anti-enumeration: both "doesn't exist" and "not a member"
         return the same 401.
+
+        The new cookie is the same sign-in: it ends when the Google
+        sign-in it came from ends, so switching org can't keep a
+        session alive without Google. It keeps the sign-in id, so
+        ``/logout`` of any cookie of this sign-in ends them all. The old
+        cookie is deny-listed, so a copy of it dies with this switch.
         """
         org_id = await _resolve_slug_or_401(slug)
         await _require_member_role(org_id, email)
-        cookie_value = build_session_cookie(
-            settings, email=email, org_slug=slug,
+        # get_current_user has already checked this cookie (signature,
+        # end, deny-list) and that it is ``email``'s.
+        payload = get_session_payload(settings, mcpolis_session)
+        cookie_value = (
+            build_switched_session_cookie(settings, payload, org_slug=slug)
+            if payload is not None
+            else None
         )
+        if payload is None or cookie_value is None:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        await revoke_session(session_revocation, payload, whole_sign_in=False)
         response = Response(status_code=204)
-        response.set_cookie(
-            COOKIE_NAME,
-            cookie_value,
-            httponly=True,
-            samesite="lax",
-            max_age=SESSION_TTL,
-            path="/",
-        )
+        set_session_cookie(response, settings, cookie_value)
         return response
 
     @router.get("/{slug}/public")

@@ -31,3 +31,16 @@ async def test_main_refuses_delete_orphans_without_persisted_ids(
 
     assert code == 2
     assert "Refusing" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_main_refuses_delete_orphans_with_run_id(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--run-id`` is a read-only view; it never widens a delete."""
+    monkeypatch.setenv("MCPOLIS_PERSISTED_SANDBOX_IDS", "sbx-live")
+
+    code = await script.main(["--delete-orphans", "--run-id", "a1b2c3d4e5f6"])
+
+    assert code == 2
+    assert "read-only" in capsys.readouterr().err

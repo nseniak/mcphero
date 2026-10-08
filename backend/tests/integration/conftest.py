@@ -18,12 +18,27 @@ Loading rules:
   mirror the canonical value into it. Set only ``MCPOLIS_E2B_API_KEY``.
 - We read ``.env.test`` only, never prod secrets. Point at a different
   file with ``MCPOLIS_INTEGRATION_ENV=/path/to/file``.
+
+The tests share their E2B account with production, so each pytest session
+deletes the sandboxes it created, and only those, when it ends (passed,
+failed or interrupted): see ``pytest_sessionfinish`` and
+``_run_sandboxes.py``. The session's run id is chosen here, at import
+time, by the controller, and reaches the xdist workers through the
+environment they inherit.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+
+import pytest
+
+from tests.integration._run_sandboxes import (
+    cleanup_run_sandboxes,
+    current_run_id,
+    start_run,
+)
 
 _ENV_TEST_FILE = Path(
     os.environ.get(
@@ -66,3 +81,31 @@ def _mirror_e2b_key() -> None:
 
 _load_env_file(_ENV_TEST_FILE)
 _mirror_e2b_key()
+
+# An xdist worker inherits the controller's id; anything else starts a run.
+if os.environ.get("PYTEST_XDIST_WORKER") is None:
+    start_run()
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Kill every E2B sandbox this session's tests created.
+
+    Runs once, in the controller (or the only process without xdist),
+    after every test ended, also on failure and Ctrl-C. A failed kill is
+    reported, never fatal."""
+    del exitstatus
+    if hasattr(session.config, "workerinput"):
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.ensure_newline()
+
+    def log(line: str) -> None:
+        if reporter is not None:
+            reporter.write_line(line)
+        else:
+            print(line)
+
+    cleanup_run_sandboxes(
+        os.environ.get("E2B_API_KEY"), current_run_id(), log,
+    )
